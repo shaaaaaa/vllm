@@ -13,6 +13,7 @@ from vllm.v1.core.dsa_shared_pool import (
     DSASharedBundleAllocator,
     dsa_scratch_blocks_for_topk,
 )
+from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -25,6 +26,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
@@ -463,6 +466,169 @@ def test_dsa_shared_pool_reclaims_bundle_after_partial_frees(owner):
     pool.free_blocks(blocks[1:])
     assert allocator.free_bundle_count == 4
     assert all(block.ref_cnt == 0 for block in blocks)
+
+
+def test_dsa_compact_external_allocation_expands_on_prefill_fallback():
+    block_size = 4
+    attention_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=50, enable_caching=False, hash_block_size=block_size
+    )
+    manager = get_dsa_latent_manager(
+        attention_spec, block_pool, enable_caching=False
+    )
+    manager.scratch_blocks = 2
+    request_id = "compact"
+    prompt_tokens = 40
+
+    # Async external loading schedules no model work, so the main-model length
+    # equals the prompt length. The compact path reserves scratch plus the
+    # final-prompt bundle used by the DP collective shadow forward.
+    assert (
+        manager.get_num_blocks_to_allocate_compact_external(
+            request_id,
+            num_tokens=prompt_tokens,
+            new_computed_blocks=[],
+            total_computed_tokens=prompt_tokens,
+            num_tokens_main_model=prompt_tokens,
+        )
+        == 3
+    )
+    manager.allocate_new_computed_blocks_compact_external(
+        request_id,
+        [],
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=prompt_tokens,
+    )
+    assert len(
+        manager.allocate_new_blocks_compact_external(
+            request_id, prompt_tokens, prompt_tokens
+        )
+    ) == 1
+
+    blocks = manager.req_to_blocks[request_id]
+    assert len(blocks) == 10
+    assert sum(not block.is_null for block in blocks) == 3
+
+    # Bootstrap sampling followed by decode adds only the prompt-boundary tail.
+    new_blocks = manager.allocate_new_blocks(
+        request_id, prompt_tokens + 1, prompt_tokens + 1
+    )
+    assert len(new_blocks) == 1
+    assert sum(not block.is_null for block in blocks) == 4
+
+    # A failed external load resets computation inside the prompt. Dense
+    # prefill then fills the null holes up to each scheduled chunk.
+    assert manager.get_num_blocks_to_allocate(
+        request_id,
+        num_tokens=16,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_tokens_main_model=16,
+    ) == 2
+    assert len(manager.allocate_new_blocks(request_id, 16, 16)) == 2
+    assert all(not block.is_null for block in blocks[:4])
+
+    assert manager.get_num_blocks_to_allocate(
+        request_id,
+        num_tokens=prompt_tokens,
+        new_computed_blocks=[],
+        total_computed_tokens=16,
+        num_tokens_main_model=prompt_tokens,
+    ) == 5
+    assert len(
+        manager.allocate_new_blocks(request_id, prompt_tokens, prompt_tokens)
+    ) == 5
+    assert all(not block.is_null for block in blocks[:10])
+
+
+def test_dsa_compact_external_keeps_full_indexer_allocation(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "0")
+    monkeypatch.delenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", raising=False)
+    block_size = 4
+    latent_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=50,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["latent"], latent_spec),
+            KVCacheGroupSpec(["indexer"], indexer_spec),
+        ],
+        num_blocks_per_group=[50, 50],
+        dsa_index_topk=8,
+    )
+    coordinator = get_kv_cache_coordinator(
+        kv_cache_config=config,
+        max_model_len=128,
+        use_eagle=False,
+        enable_caching=False,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=block_size,
+    )
+    request_id = "two-groups"
+    prompt_tokens = 40
+    empty_computed_blocks = ([], [])
+
+    # Latent needs 2 scratch blocks plus the final-prompt shadow-forward block.
+    # The normal indexer path reserves the prompt and logical item.
+    assert coordinator.get_num_blocks_to_allocate_per_group(
+        request_id,
+        num_tokens=prompt_tokens + 1,
+        new_computed_blocks=empty_computed_blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=prompt_tokens,
+        num_tokens_main_model=prompt_tokens + 1,
+        dsa_compact_external_load=True,
+    ) == [3, 11]
+
+    coordinator.allocate_new_computed_blocks(
+        request_id,
+        empty_computed_blocks,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=prompt_tokens,
+        dsa_compact_external_load=True,
+    )
+    coordinator.allocate_new_blocks(
+        request_id,
+        num_tokens=prompt_tokens + 1,
+        num_tokens_main_model=prompt_tokens + 1,
+        dsa_compact_external_load=True,
+    )
+    latent_blocks, indexer_blocks = coordinator.get_blocks(request_id)
+    assert len(latent_blocks) == 10
+    assert len(indexer_blocks) == 11
+    assert sum(not block.is_null for block in latent_blocks) == 3
+    assert all(not block.is_null for block in indexer_blocks)
+
+    # On fallback the indexer remains resident while latent grows into holes.
+    assert coordinator.get_num_blocks_to_allocate_per_group(
+        request_id,
+        num_tokens=16,
+        new_computed_blocks=empty_computed_blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=0,
+        num_tokens_main_model=16,
+    ) == [2, 0]
 
 
 def test_get_num_blocks_to_allocate():

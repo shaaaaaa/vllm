@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -237,6 +237,23 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # P-side requests whose final prompt hidden state should be returned to the
+    # scheduler after this step.
+    capture_final_hidden_req_ids: set[str] | None = None
+
+    # D-side requests that sample directly from a transferred final hidden
+    # state instead of running a model forward for the last prompt token.
+    bootstrap_sample_req_ids: set[str] | None = None
+    bootstrap_final_hiddens: dict[str, dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.capture_final_hidden_req_ids is None:
+            self.capture_final_hidden_req_ids = set()
+        if self.bootstrap_sample_req_ids is None:
+            self.bootstrap_sample_req_ids = set()
+        if self.bootstrap_final_hiddens is None:
+            self.bootstrap_final_hiddens = {}
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
