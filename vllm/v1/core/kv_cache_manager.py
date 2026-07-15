@@ -226,6 +226,7 @@ class KVCacheManager:
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        dsa_compact_external_load: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -247,6 +248,9 @@ class KVCacheManager:
             num_encoder_tokens: The number of encoder tokens to allocate for
                 cross-attention in encoder-decoder models(e.g., Whisper).
                 For decoder-only models, this should be 0.
+            dsa_compact_external_load: Whether a complete external DSA hit can
+                use a compact latent allocation. The indexer group retains its
+                normal full-prompt allocation.
 
         Blocks layout:
         ```
@@ -346,6 +350,7 @@ class KVCacheManager:
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
+            dsa_compact_external_load=dsa_compact_external_load,
         ):
             # Cannot allocate new blocks (with per-group block pools, every
             # group's demand must fit its own pool).
@@ -362,6 +367,7 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                dsa_compact_external_load=dsa_compact_external_load,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
@@ -369,7 +375,10 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            dsa_compact_external_load=dsa_compact_external_load,
         )
+        if dsa_compact_external_load:
+            request.dsa_compact_allocated = True
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

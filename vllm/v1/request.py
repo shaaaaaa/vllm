@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import base64
+import binascii
 import enum
+import hashlib
+import hmac
+import sys
 import time
+from array import array
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -26,6 +32,58 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+_FINAL_HIDDEN_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
+_MAX_FINAL_HIDDEN_BYTES = 16 * 1024 * 1024
+_MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
+
+
+def validate_final_hidden_payload(
+    payload: object, expected_hidden_size: int | None = None
+) -> bool:
+    """Validate the bounded, bit-exact final-hidden transport payload."""
+    if not isinstance(payload, dict):
+        return False
+    dtype_size = _FINAL_HIDDEN_DTYPE_BYTES.get(payload.get("dtype"))
+    shape = payload.get("shape")
+    data = payload.get("data")
+    if (
+        payload.get("version") != 1
+        or payload.get("encoding") != "base64"
+        or dtype_size is None
+        or not isinstance(shape, list)
+        or len(shape) != 1
+        or type(shape[0]) is not int
+        or shape[0] <= 0
+        or (expected_hidden_size is not None and shape[0] != expected_hidden_size)
+        or not isinstance(data, str)
+        or len(data) > _MAX_FINAL_HIDDEN_BASE64_CHARS
+        or not isinstance(payload.get("data_sha256"), str)
+    ):
+        return False
+    expected_bytes = shape[0] * dtype_size
+    if expected_bytes > _MAX_FINAL_HIDDEN_BYTES:
+        return False
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    return len(raw) == expected_bytes and hmac.compare_digest(
+        hashlib.sha256(raw).hexdigest(), payload["data_sha256"]
+    )
+
+
+def compute_prompt_token_fingerprint(token_ids: list[int]) -> str:
+    """Return a stable hash binding a hidden-state artifact to its prompt."""
+    packed = array("q", token_ids)
+    if sys.byteorder != "little":
+        packed.byteswap()
+    digest = hashlib.sha256()
+    digest.update(b"vllm-final-hidden-prompt-v1\0")
+    digest.update(len(token_ids).to_bytes(8, "little"))
+    digest.update(packed.tobytes())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -93,6 +151,11 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.capture_final_hidden = False
+        self.bootstrap_final_hidden: dict[str, Any] | None = None
+        self.bootstrap_sample_pending = False
+        self.dsa_compact_allocated = False
+        self.captured_final_hidden: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -108,6 +171,15 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                if self.kv_transfer_params is not None:
+                    self.capture_final_hidden = bool(
+                        self.kv_transfer_params.get("ret_final_hidden", False)
+                    )
+                    final_hidden = self.kv_transfer_params.get(
+                        "bootstrap_final_hidden"
+                    )
+                    if validate_final_hidden_payload(final_hidden):
+                        self.bootstrap_final_hidden = final_hidden
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -119,6 +191,39 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        handoff_inputs_supported = (
+            prompt_token_ids is not None
+            and prompt_embeds is None
+            and not mm_features
+            and lora_request is None
+            and not resumable
+            and (
+                sampling_params is None
+                or sampling_params.prompt_logprobs is None
+            )
+        )
+        if not handoff_inputs_supported:
+            self.capture_final_hidden = False
+            self.bootstrap_final_hidden = None
+        self.final_hidden_prompt_fingerprint: str | None = None
+        if (
+            self.capture_final_hidden or self.bootstrap_final_hidden is not None
+        ) and prompt_token_ids is not None:
+            self.final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
+                prompt_token_ids
+            )
+        if self.bootstrap_final_hidden is not None:
+            payload_matches_prompt = (
+                self.final_hidden_prompt_fingerprint is not None
+                and self.bootstrap_final_hidden.get("prompt_length")
+                == self.num_prompt_tokens
+                and self.bootstrap_final_hidden.get("prompt_sha256")
+                == self.final_hidden_prompt_fingerprint
+            )
+            if payload_matches_prompt:
+                self.bootstrap_sample_pending = True
+            else:
+                self.bootstrap_final_hidden = None
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
