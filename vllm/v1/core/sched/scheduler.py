@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
 import itertools
 import json
 import os
@@ -62,7 +63,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    Request,
+    RequestStatus,
+    StreamingUpdate,
+    validate_final_hidden_payload,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -171,6 +177,21 @@ def _mtp_dw_cleanup_request(owner: Any, req_id: str) -> None:
             state.pop(req_id, None)
 
 
+def _model_fingerprint(vllm_config: VllmConfig) -> str:
+    model_config = vllm_config.model_config
+    identity = "\0".join(
+        str(getattr(model_config, name, None))
+        for name in (
+            "model",
+            "revision",
+            "dtype",
+            "quantization",
+            "runner_type",
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -198,6 +219,21 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self.final_hidden_model_fingerprint = _model_fingerprint(vllm_config)
+        self.final_hidden_size = vllm_config.model_config.get_hidden_size()
+        speculative_config = vllm_config.speculative_config
+        supported_speculative_config = speculative_config is None or (
+            speculative_config.method in ("mtp", "deepseek_mtp")
+            and speculative_config.num_speculative_tokens == 1
+        )
+        self.final_hidden_bootstrap_supported = (
+            not self.scheduler_config.async_scheduling
+            and not self.is_encoder_decoder
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
+            and self.parallel_config.decode_context_parallel_size == 1
+            and supported_speculative_config
+        )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -843,7 +879,19 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    dsa_compact_external_load=dsa_compact_external_load,
+                    dsa_compact_external_load=(
+                        dsa_compact_external_load
+                        or (
+                            bootstrap_full_hit
+                            and (
+                                request.dsa_compact_allocated
+                                or (
+                                    num_external_computed_tokens > 0
+                                    and num_new_local_computed_tokens == 0
+                                )
+                            )
+                        )
+                    ),
                 )
 
                 if new_blocks is None:

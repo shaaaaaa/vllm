@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import base64
 import dataclasses
+import hashlib
 from unittest.mock import Mock
 
 import pytest
@@ -33,12 +35,29 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import (
+    Request,
+    RequestStatus,
+    compute_prompt_token_fingerprint,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _make_final_hidden_artifact(scheduler: Scheduler) -> dict:
+    raw = b"\0" * (scheduler.final_hidden_size * 2)
+    return {
+        "version": 1,
+        "dtype": "bfloat16",
+        "shape": [scheduler.final_hidden_size],
+        "encoding": "base64",
+        "data": base64.b64encode(raw).decode("ascii"),
+        "data_sha256": hashlib.sha256(raw).hexdigest(),
+        "model_fingerprint": scheduler.final_hidden_model_fingerprint,
+    }
 
 
 def test_add_requests():
@@ -1557,6 +1576,293 @@ def test_kv_connector_basic(is_async: bool):
     assert (
         scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_TOTAL_BLOCKS
     )
+
+
+def test_final_hidden_full_hit_schedules_sampler_only_bootstrap():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_len, is_async=False),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.bootstrap_sample_req_ids == {request.request_id}
+    assert output.num_scheduled_tokens == {request.request_id: 1}
+    assert output.bootstrap_final_hiddens == {
+        request.request_id: request.bootstrap_final_hidden
+    }
+    assert request.num_computed_tokens == prompt_len
+
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert request.output_token_ids == [1000]
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+
+
+def test_captured_final_hidden_is_bound_to_prompt_and_model():
+    scheduler = create_scheduler(block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=1,
+        block_size=16,
+    )[0]
+    request.capture_final_hidden = True
+    assert request.prompt_token_ids is not None
+    request.final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
+        request.prompt_token_ids
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.capture_final_hidden_req_ids == {request.request_id}
+    payload = {
+        "version": 1,
+        "dtype": "bfloat16",
+        "shape": [4],
+        "encoding": "base64",
+        "data": "AAAAAAAAAAA=",
+        "data_sha256": "0" * 64,
+    }
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            final_hidden_states={request.request_id: payload},
+        ),
+    )
+
+    assert request.captured_final_hidden == {
+        **payload,
+        "prompt_length": request.num_prompt_tokens,
+        "prompt_sha256": request.final_hidden_prompt_fingerprint,
+        "model_fingerprint": scheduler.final_hidden_model_fingerprint,
+    }
+
+
+def test_async_final_hidden_bootstrap_waits_for_remote_load():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_len, is_async=True),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    load_output = scheduler.schedule()
+    assert load_output.bootstrap_sample_req_ids == set()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(
+        load_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    completion_output = scheduler.schedule()
+    scheduler.update_from_output(
+        completion_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id}
+            ),
+        ),
+    )
+
+    bootstrap_output = scheduler.schedule()
+    assert bootstrap_output.bootstrap_sample_req_ids == {request.request_id}
+    assert request.num_computed_tokens == prompt_len
+
+
+def test_partial_hit_discards_final_hidden_and_prefills_normally():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=16, is_async=False),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.bootstrap_sample_req_ids == set()
+    assert output.num_scheduled_tokens == {request.request_id: 16}
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+
+
+def test_ready_bootstrap_is_not_starved_by_running_decode():
+    prompt_hit = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_hit, is_async=False),
+        block_size=16,
+    )
+    normal_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        max_tokens=4,
+        block_size=16,
+        req_ids=["normal"],
+    )[0]
+    bootstrap_request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_hit,
+        max_tokens=4,
+        block_size=16,
+        req_ids=["bootstrap"],
+    )[0]
+    bootstrap_request.bootstrap_final_hidden = _make_final_hidden_artifact(
+        scheduler
+    )
+    bootstrap_request.bootstrap_sample_pending = True
+    scheduler.add_request(normal_request)
+    scheduler.add_request(bootstrap_request)
+
+    normal_output = scheduler.schedule()
+    assert set(normal_output.num_scheduled_tokens) == {normal_request.request_id}
+    assert normal_output.bootstrap_sample_req_ids == set()
+
+    scheduler.update_from_output(
+        normal_output,
+        ModelRunnerOutput(
+            req_ids=[normal_request.request_id],
+            req_id_to_index={normal_request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    bootstrap_output = scheduler.schedule()
+    assert bootstrap_output.bootstrap_sample_req_ids == {
+        bootstrap_request.request_id
+    }
+    assert set(bootstrap_output.num_scheduled_tokens) == {
+        bootstrap_request.request_id
+    }
+
+
+def test_two_group_invalid_bootstrap_load_clears_artifact():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "stale"}
+    request.bootstrap_sample_pending = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 2], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {12}, evict_blocks=True
+        )
+    )
+
+    assert affected == {request.request_id}
+    assert affected_tokens == 16
+    assert request.num_computed_tokens == 16
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+    assert blocks_to_evict == {2, 12}
+
+
+def test_compact_invalid_load_restarts_dense_prefill_from_zero():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "stale"}
+    request.bootstrap_sample_pending = True
+    request.dsa_compact_allocated = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 2], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {12}, evict_blocks=True
+        )
+    )
+
+    assert affected == {request.request_id}
+    assert affected_tokens == 32
+    assert request.num_computed_tokens == 0
+    assert request.num_cached_tokens == 0
+    assert request.num_external_computed_tokens == 0
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+    assert not request.dsa_compact_allocated
+    # The compact table was freed as a whole. Passing the same IDs to the
+    # generic eviction path would double-handle them and DSA shared pools do
+    # not implement prefix-cache eviction.
+    assert blocks_to_evict == set()
 
 
 @pytest.mark.parametrize("is_async", [False, True])

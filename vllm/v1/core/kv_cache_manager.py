@@ -374,6 +374,8 @@ class KVCacheManager:
             num_encoder_tokens,
             dsa_compact_external_load,
         )
+        if dsa_compact_external_load:
+            request.dsa_compact_allocated = True
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
