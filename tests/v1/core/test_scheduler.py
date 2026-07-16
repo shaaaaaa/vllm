@@ -1865,6 +1865,40 @@ def test_compact_invalid_load_restarts_dense_prefill_from_zero():
     assert blocks_to_evict == set()
 
 
+def test_compact_null_block_does_not_trigger_load_fallback():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "valid"}
+    request.bootstrap_sample_pending = True
+    request.dsa_compact_allocated = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 0], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {0}, evict_blocks=True
+        )
+    )
+
+    assert affected == set()
+    assert affected_tokens == 0
+    assert blocks_to_evict == set()
+    assert request.num_computed_tokens == 32
+    assert request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden == {"data": "valid"}
+    assert request.dsa_compact_allocated
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("local_cache_hits", [False, True])
 def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
