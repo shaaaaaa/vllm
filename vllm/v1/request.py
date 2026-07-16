@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -32,6 +33,8 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 
 _FINAL_HIDDEN_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
@@ -180,6 +183,22 @@ class Request:
                     )
                     if validate_final_hidden_payload(final_hidden):
                         self.bootstrap_final_hidden = final_hidden
+                        logger.info(
+                            "[FINAL_HIDDEN_REQUEST_ARTIFACT] req=%s "
+                            "basic_validation=ok dtype=%s shape=%s "
+                            "prompt_length=%s checksum=%s",
+                            request_id,
+                            final_hidden.get("dtype"),
+                            final_hidden.get("shape"),
+                            final_hidden.get("prompt_length"),
+                            str(final_hidden.get("data_sha256", ""))[:16],
+                        )
+                    elif final_hidden is not None:
+                        logger.warning(
+                            "[FINAL_HIDDEN_REQUEST_ARTIFACT] req=%s "
+                            "basic_validation=failed action=normal_path",
+                            request_id,
+                        )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -203,6 +222,22 @@ class Request:
             )
         )
         if not handoff_inputs_supported:
+            if self.capture_final_hidden or self.bootstrap_final_hidden is not None:
+                logger.warning(
+                    "[FINAL_HIDDEN_REQUEST_UNSUPPORTED] req=%s "
+                    "prompt_token_ids=%s prompt_embeds=%s multimodal=%s "
+                    "lora=%s resumable=%s prompt_logprobs=%s "
+                    "action=disable_handoff",
+                    request_id,
+                    prompt_token_ids is not None,
+                    prompt_embeds is not None,
+                    bool(mm_features),
+                    lora_request is not None,
+                    resumable,
+                    sampling_params.prompt_logprobs
+                    if sampling_params is not None
+                    else None,
+                )
             self.capture_final_hidden = False
             self.bootstrap_final_hidden = None
         self.final_hidden_prompt_fingerprint: str | None = None
@@ -222,7 +257,28 @@ class Request:
             )
             if payload_matches_prompt:
                 self.bootstrap_sample_pending = True
+                logger.info(
+                    "[FINAL_HIDDEN_REQUEST_ACCEPTED] req=%s prompt_tokens=%d "
+                    "prompt_hash=%s bootstrap_pending=true",
+                    request_id,
+                    self.num_prompt_tokens,
+                    self.final_hidden_prompt_fingerprint[:16]
+                    if self.final_hidden_prompt_fingerprint is not None
+                    else None,
+                )
             else:
+                logger.warning(
+                    "[FINAL_HIDDEN_REQUEST_REJECTED] req=%s reason=prompt_mismatch "
+                    "request_prompt_tokens=%d artifact_prompt_tokens=%s "
+                    "request_hash=%s artifact_hash=%s action=normal_prefill",
+                    request_id,
+                    self.num_prompt_tokens,
+                    self.bootstrap_final_hidden.get("prompt_length"),
+                    self.final_hidden_prompt_fingerprint[:16]
+                    if self.final_hidden_prompt_fingerprint is not None
+                    else None,
+                    str(self.bootstrap_final_hidden.get("prompt_sha256", ""))[:16],
+                )
                 self.bootstrap_final_hidden = None
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
