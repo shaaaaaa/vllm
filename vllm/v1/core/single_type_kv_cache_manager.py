@@ -652,6 +652,25 @@ class DSALatentManager(FullAttentionManager):
         req_blocks.extend(allocated_blocks)
         req_blocks.extend([self._null_block] * (logical_blocks - scratch_blocks))
         self.num_cached_block[request_id] = len(req_blocks)
+        logger.info(
+            "[DSA_COMPACT_TABLE_CREATED] req=%s prefix_tokens=%d "
+            "logical_blocks=%d resident_blocks=%d null_blocks=%d "
+            "scratch_blocks=%d blocks_per_bundle=%d resident_bundles=%d "
+            "free_blocks_after=%d resident_ids=%s",
+            request_id,
+            prefix_tokens,
+            len(req_blocks),
+            sum(not block.is_null for block in req_blocks),
+            sum(block.is_null for block in req_blocks),
+            scratch_blocks,
+            self._blocks_per_bundle(),
+            cdiv(
+                sum(not block.is_null for block in req_blocks),
+                self._blocks_per_bundle(),
+            ),
+            self.block_pool.get_num_free_blocks(),
+            [block.block_id for block in allocated_blocks],
+        )
 
     def _allocate_compact_request_blocks(
         self,
@@ -701,12 +720,25 @@ class DSALatentManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         logger.info(
             "[DSA_COMPACT_ALLOC] req=%s prompt_tokens=%d logical_blocks=%d "
-            "resident_blocks=%d scratch_blocks=%d",
+            "resident_blocks=%d null_blocks=%d scratch_blocks=%d "
+            "blocks_per_bundle=%d resident_bundles=%d free_blocks_after=%d "
+            "new_blocks=%d new_block_ids=%s head_ids=%s tail_ids=%s",
             request_id,
             self._compact_external_prefix_tokens[request_id],
             len(req_blocks),
             sum(not block.is_null for block in req_blocks),
+            sum(block.is_null for block in req_blocks),
             self._round_up_to_bundle(self.scratch_blocks),
+            self._blocks_per_bundle(),
+            cdiv(
+                sum(not block.is_null for block in req_blocks),
+                self._blocks_per_bundle(),
+            ),
+            self.block_pool.get_num_free_blocks(),
+            len(new_blocks),
+            [block.block_id for block in new_blocks],
+            [block.block_id for block in req_blocks[:4]],
+            [block.block_id for block in req_blocks[-4:]],
         )
         return new_blocks
 
@@ -734,10 +766,37 @@ class DSALatentManager(FullAttentionManager):
                     for block in self.req_to_blocks[request_id]
                 ),
             )
+        elif new_blocks:
+            req_blocks = self.req_to_blocks[request_id]
+            logger.info(
+                "[DSA_COMPACT_GROW] req=%s prompt_tokens=%d total_tokens=%d "
+                "main_model_tokens=%d new_blocks=%d new_block_ids=%s "
+                "logical_blocks=%d resident_blocks=%d null_blocks=%d",
+                request_id,
+                prefix_tokens,
+                num_tokens,
+                num_tokens_main_model,
+                len(new_blocks),
+                [block.block_id for block in new_blocks],
+                len(req_blocks),
+                sum(not block.is_null for block in req_blocks),
+                sum(block.is_null for block in req_blocks),
+            )
         return new_blocks
 
     def free(self, request_id: str) -> None:
-        self._compact_external_prefix_tokens.pop(request_id, None)
+        prefix_tokens = self._compact_external_prefix_tokens.pop(request_id, None)
+        if prefix_tokens is not None:
+            req_blocks = self.req_to_blocks.get(request_id, ())
+            logger.info(
+                "[DSA_COMPACT_FREE] req=%s prompt_tokens=%d logical_blocks=%d "
+                "resident_blocks=%d null_blocks=%d",
+                request_id,
+                prefix_tokens,
+                len(req_blocks),
+                sum(not block.is_null for block in req_blocks),
+                sum(block.is_null for block in req_blocks),
+            )
         super().free(request_id)
 
     def remove_skipped_blocks(
