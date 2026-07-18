@@ -117,6 +117,15 @@ class StreamingUpdate:
 
 
 class Request:
+    # Final-hidden handoff state is intentionally lazy. Ordinary requests use
+    # these immutable class defaults and do not grow their instance __dict__.
+    capture_final_hidden = False
+    bootstrap_final_hidden: dict[str, Any] | None = None
+    bootstrap_sample_pending = False
+    dsa_compact_allocated = False
+    captured_final_hidden: dict[str, Any] | None = None
+    final_hidden_prompt_fingerprint: str | None = None
+
     def __init__(
         self,
         request_id: str,
@@ -154,11 +163,8 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
-        self.capture_final_hidden = False
-        self.bootstrap_final_hidden: dict[str, Any] | None = None
-        self.bootstrap_sample_pending = False
-        self.dsa_compact_allocated = False
-        self.captured_final_hidden: dict[str, Any] | None = None
+        capture_final_hidden = False
+        bootstrap_final_hidden: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -175,23 +181,58 @@ class Request:
                     "kv_transfer_params"
                 )
                 if self.kv_transfer_params is not None:
-                    self.capture_final_hidden = bool(
+                    capture_final_hidden = bool(
                         self.kv_transfer_params.get("ret_final_hidden", False)
                     )
                     final_hidden = self.kv_transfer_params.get(
                         "bootstrap_final_hidden"
                     )
                     if validate_final_hidden_payload(final_hidden):
-                        self.bootstrap_final_hidden = final_hidden
+                        bootstrap_final_hidden = final_hidden
+                        decoder_engine_received_unix_ns = time.time_ns()
+                        producer_ready_unix_ns = final_hidden.get(
+                            "producer_ready_unix_ns"
+                        )
+                        proxy_decoder_send_unix_ns = final_hidden.get(
+                            "proxy_decoder_send_unix_ns"
+                        )
+                        final_hidden["decoder_engine_received_unix_ns"] = (
+                            decoder_engine_received_unix_ns
+                        )
+                        producer_to_engine_ms = (
+                            (decoder_engine_received_unix_ns - producer_ready_unix_ns)
+                            / 1e6
+                            if isinstance(producer_ready_unix_ns, int)
+                            else None
+                        )
+                        proxy_to_engine_ms = (
+                            (
+                                decoder_engine_received_unix_ns
+                                - proxy_decoder_send_unix_ns
+                            )
+                            / 1e6
+                            if isinstance(proxy_decoder_send_unix_ns, int)
+                            else None
+                        )
                         logger.info(
                             "[FINAL_HIDDEN_REQUEST_ARTIFACT] req=%s "
                             "basic_validation=ok dtype=%s shape=%s "
-                            "prompt_length=%s checksum=%s",
+                            "prompt_length=%s checksum=%s "
+                            "producer_to_engine_ms=%s proxy_to_engine_ms=%s "
+                            "clock_sync_required=true "
+                            "proxy_to_engine_includes=http_upload_json_"
+                            "tokenization_ipc",
                             request_id,
                             final_hidden.get("dtype"),
                             final_hidden.get("shape"),
                             final_hidden.get("prompt_length"),
                             str(final_hidden.get("data_sha256", ""))[:16],
+                            f"{producer_to_engine_ms:.3f}"
+                            if producer_to_engine_ms is not None
+                            else "unknown",
+                            f"{proxy_to_engine_ms:.3f}"
+                            if proxy_to_engine_ms is not None
+                            else "unknown",
                         )
                     elif final_hidden is not None:
                         logger.warning(
@@ -210,19 +251,22 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
-        handoff_inputs_supported = (
-            prompt_token_ids is not None
-            and prompt_embeds is None
-            and not mm_features
-            and lora_request is None
-            and not resumable
-            and (
-                sampling_params is None
-                or sampling_params.prompt_logprobs is None
-            )
+        handoff_requested = (
+            capture_final_hidden or bootstrap_final_hidden is not None
         )
-        if not handoff_inputs_supported:
-            if self.capture_final_hidden or self.bootstrap_final_hidden is not None:
+        if handoff_requested:
+            handoff_inputs_supported = (
+                prompt_token_ids is not None
+                and prompt_embeds is None
+                and not mm_features
+                and lora_request is None
+                and not resumable
+                and (
+                    sampling_params is None
+                    or sampling_params.prompt_logprobs is None
+                )
+            )
+            if not handoff_inputs_supported:
                 logger.warning(
                     "[FINAL_HIDDEN_REQUEST_UNSUPPORTED] req=%s "
                     "prompt_token_ids=%s prompt_embeds=%s multimodal=%s "
@@ -238,32 +282,51 @@ class Request:
                     if sampling_params is not None
                     else None,
                 )
-            self.capture_final_hidden = False
-            self.bootstrap_final_hidden = None
-        self.final_hidden_prompt_fingerprint: str | None = None
-        if (
-            self.capture_final_hidden or self.bootstrap_final_hidden is not None
-        ) and prompt_token_ids is not None:
-            self.final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
+                capture_final_hidden = False
+                bootstrap_final_hidden = None
+                handoff_requested = False
+
+        final_hidden_prompt_fingerprint: str | None = None
+        if handoff_requested and prompt_token_ids is not None:
+            final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
                 prompt_token_ids
             )
-        if self.bootstrap_final_hidden is not None:
+        if capture_final_hidden:
+            self.capture_final_hidden = True
+            self.final_hidden_prompt_fingerprint = final_hidden_prompt_fingerprint
+
+        if capture_final_hidden:
+            logger.info(
+                "[FINAL_HIDDEN_REQUEST_CAPTURE] req=%s enabled=true "
+                "prompt_tokens=%d prompt_hash=%s max_tokens=%d",
+                request_id,
+                self.num_prompt_tokens,
+                self.final_hidden_prompt_fingerprint[:16]
+                if self.final_hidden_prompt_fingerprint is not None
+                else None,
+                self.max_tokens,
+            )
+        if bootstrap_final_hidden is not None:
             payload_matches_prompt = (
-                self.final_hidden_prompt_fingerprint is not None
-                and self.bootstrap_final_hidden.get("prompt_length")
+                final_hidden_prompt_fingerprint is not None
+                and bootstrap_final_hidden.get("prompt_length")
                 == self.num_prompt_tokens
-                and self.bootstrap_final_hidden.get("prompt_sha256")
-                == self.final_hidden_prompt_fingerprint
+                and bootstrap_final_hidden.get("prompt_sha256")
+                == final_hidden_prompt_fingerprint
             )
             if payload_matches_prompt:
+                self.final_hidden_prompt_fingerprint = (
+                    final_hidden_prompt_fingerprint
+                )
+                self.bootstrap_final_hidden = bootstrap_final_hidden
                 self.bootstrap_sample_pending = True
                 logger.info(
                     "[FINAL_HIDDEN_REQUEST_ACCEPTED] req=%s prompt_tokens=%d "
                     "prompt_hash=%s bootstrap_pending=true",
                     request_id,
                     self.num_prompt_tokens,
-                    self.final_hidden_prompt_fingerprint[:16]
-                    if self.final_hidden_prompt_fingerprint is not None
+                    final_hidden_prompt_fingerprint[:16]
+                    if final_hidden_prompt_fingerprint is not None
                     else None,
                 )
             else:
@@ -273,13 +336,12 @@ class Request:
                     "request_hash=%s artifact_hash=%s action=normal_prefill",
                     request_id,
                     self.num_prompt_tokens,
-                    self.bootstrap_final_hidden.get("prompt_length"),
-                    self.final_hidden_prompt_fingerprint[:16]
-                    if self.final_hidden_prompt_fingerprint is not None
+                    bootstrap_final_hidden.get("prompt_length"),
+                    final_hidden_prompt_fingerprint[:16]
+                    if final_hidden_prompt_fingerprint is not None
                     else None,
-                    str(self.bootstrap_final_hidden.get("prompt_sha256", ""))[:16],
+                    str(bootstrap_final_hidden.get("prompt_sha256", ""))[:16],
                 )
-                self.bootstrap_final_hidden = None
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()

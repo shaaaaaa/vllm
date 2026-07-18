@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 import torch
@@ -268,7 +268,7 @@ class ModelRunnerOutput:
     # Final prompt hidden states requested by a KV producer. The payload is
     # serialized (rather than a torch.Tensor) because ModelRunnerOutput crosses
     # the worker/scheduler process boundary.
-    final_hidden_states: dict[str, dict[str, Any]] = field(default_factory=dict)
+    final_hidden_states: ClassVar[dict[str, dict[str, Any]] | None] = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.
