@@ -511,7 +511,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        bootstrap_sample_req_ids: set[str] = set()
+        bootstrap_sample_req_ids: set[str] | None = None
         bootstrap_only_step = self._bootstrap_sample_ready
         if bootstrap_only_step:
             self._bootstrap_sample_ready = False
@@ -864,7 +864,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 if bootstrap_full_hit and any(
-                    scheduled_req_id not in bootstrap_sample_req_ids
+                    scheduled_req_id not in (bootstrap_sample_req_ids or ())
                     for scheduled_req_id in num_scheduled_tokens
                 ):
                     # Do not mix a sampler-only bootstrap with target forwards
@@ -1085,6 +1085,8 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 if bootstrap_full_hit:
+                    if bootstrap_sample_req_ids is None:
+                        bootstrap_sample_req_ids = set()
                     bootstrap_sample_req_ids.add(request_id)
                     allocated_groups = self.kv_cache_manager.get_blocks(
                         request_id
@@ -1209,6 +1211,37 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        capture_final_hidden_req_ids: set[str] | None = None
+        capture_pending = getattr(self, "_capture_final_hidden_pending", None)
+        if capture_pending:
+            capture_pending.intersection_update(self.requests)
+        if capture_pending:
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                if req_id not in capture_pending:
+                    continue
+                request = self.requests[req_id]
+                computed_before = request.num_computed_tokens
+                computed_after = computed_before + num_tokens
+                if computed_before < request.num_prompt_tokens <= computed_after:
+                    capture_final_hidden_req_ids = capture_final_hidden_req_ids or set()
+                    capture_final_hidden_req_ids.add(req_id)
+                    capture_pending.discard(req_id)
+                    logger.info(
+                        "[FINAL_HIDDEN_SCHED_DECISION] req=%s "
+                        "computed_before=%d scheduled_tokens=%d "
+                        "computed_after=%d prompt_tokens=%d request_tokens=%d "
+                        "is_prefill_chunk=%s crosses_prompt_end=true capture=true",
+                        req_id,
+                        computed_before,
+                        num_tokens,
+                        computed_after,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        request.is_prefill_chunk,
+                    )
+            if not capture_pending:
+                del self._capture_final_hidden_pending
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1225,20 +1258,28 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            capture_final_hidden_req_ids={
-                req_id
-                for req_id, num_tokens in num_scheduled_tokens.items()
-                if (req := self.requests[req_id]).capture_final_hidden
-                and req.num_computed_tokens < req.num_prompt_tokens
-                <= req.num_computed_tokens + num_tokens
-            },
-            bootstrap_sample_req_ids=bootstrap_sample_req_ids,
-            bootstrap_final_hiddens={
-                req_id: self.requests[req_id].bootstrap_final_hidden
-                for req_id in bootstrap_sample_req_ids
-                if self.requests[req_id].bootstrap_final_hidden is not None
-            },
         )
+        if capture_final_hidden_req_ids:
+            setattr(
+                scheduler_output,
+                "capture_final_hidden_req_ids",
+                capture_final_hidden_req_ids,
+            )
+        if bootstrap_sample_req_ids:
+            setattr(
+                scheduler_output,
+                "bootstrap_sample_req_ids",
+                bootstrap_sample_req_ids,
+            )
+            setattr(
+                scheduler_output,
+                "bootstrap_final_hiddens",
+                {
+                    req_id: self.requests[req_id].bootstrap_final_hidden
+                    for req_id in bootstrap_sample_req_ids
+                    if self.requests[req_id].bootstrap_final_hidden is not None
+                },
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1302,7 +1343,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            if req_id not in scheduler_output.bootstrap_sample_req_ids:
+            if req_id not in (scheduler_output.bootstrap_sample_req_ids or ()):
                 request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
@@ -1628,9 +1669,12 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
-        for req_id, payload in model_runner_output.final_hidden_states.items():
-            request = self.requests.get(req_id)
-            if request is not None and request.capture_final_hidden:
+        final_hidden_states = model_runner_output.final_hidden_states
+        if final_hidden_states:
+            for req_id, payload in final_hidden_states.items():
+                request = self.requests.get(req_id)
+                if request is None or not request.capture_final_hidden:
+                    continue
                 if request.final_hidden_prompt_fingerprint is None:
                     logger.warning(
                         "Cannot return final hidden state for request %s "
@@ -1644,6 +1688,7 @@ class Scheduler(SchedulerInterface):
                         "prompt_length": request.num_prompt_tokens,
                         "prompt_sha256": request.final_hidden_prompt_fingerprint,
                         "model_fingerprint": self.final_hidden_model_fingerprint,
+                        "producer_ready_unix_ns": time.time_ns(),
                     }
                 )
                 request.captured_final_hidden = envelope
@@ -1709,7 +1754,7 @@ class Scheduler(SchedulerInterface):
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
             if (
-                req_id in scheduler_output.bootstrap_sample_req_ids
+                req_id in (scheduler_output.bootstrap_sample_req_ids or ())
                 and generated_token_ids
             ):
                 logger.info(
@@ -2198,6 +2243,14 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if request.capture_final_hidden:
+                capture_pending = getattr(
+                    self, "_capture_final_hidden_pending", None
+                )
+                if capture_pending is None:
+                    capture_pending = set()
+                    self._capture_final_hidden_pending = capture_pending
+                capture_pending.add(request.request_id)
             if request.bootstrap_sample_pending:
                 payload = request.bootstrap_final_hidden
                 payload_valid = payload is not None and validate_final_hidden_payload(
