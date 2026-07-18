@@ -393,6 +393,19 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
         assert scheduler.running[i] == request
 
 
+def test_waiting_admission_hook_can_pause_new_requests():
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler._should_stop_scheduling_waiting = Mock(return_value=True)  # type: ignore[method-assign]
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}
+    assert list(scheduler.waiting) == [request]
+    scheduler._should_stop_scheduling_waiting.assert_called_once()
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]

@@ -708,7 +708,7 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                if self._should_stop_scheduling_waiting():
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1291,6 +1291,10 @@ class Scheduler(SchedulerInterface):
             max_running_count=self.max_num_running_reqs,
         )
         return scheduler_output
+
+    def _should_stop_scheduling_waiting(self) -> bool:
+        """Return whether this step should stop admitting waiting requests."""
+        return len(self.running) == self.max_num_running_reqs
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
