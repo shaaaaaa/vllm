@@ -1666,6 +1666,39 @@ def test_captured_final_hidden_is_bound_to_prompt_and_model():
     }
 
 
+def test_capture_final_hidden_on_last_chunked_prefill_step():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=32,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        max_tokens=1,
+    )[0]
+    request.capture_final_hidden = True
+    scheduler.add_request(request)
+
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens == {request.request_id: 16}
+    assert first_output.capture_final_hidden_req_ids == set()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    final_output = scheduler.schedule()
+    assert final_output.num_scheduled_tokens == {request.request_id: 4}
+    assert final_output.capture_final_hidden_req_ids == {request.request_id}
+
+
 def test_async_final_hidden_bootstrap_waits_for_remote_load():
     prompt_len = 32
     scheduler = create_scheduler(

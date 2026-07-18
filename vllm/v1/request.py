@@ -247,6 +247,17 @@ class Request:
             self.final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
                 prompt_token_ids
             )
+        if self.capture_final_hidden:
+            logger.info(
+                "[FINAL_HIDDEN_REQUEST_CAPTURE] req=%s enabled=true "
+                "prompt_tokens=%d prompt_hash=%s max_tokens=%d",
+                request_id,
+                self.num_prompt_tokens,
+                self.final_hidden_prompt_fingerprint[:16]
+                if self.final_hidden_prompt_fingerprint is not None
+                else None,
+                self.max_tokens,
+            )
         if self.bootstrap_final_hidden is not None:
             payload_matches_prompt = (
                 self.final_hidden_prompt_fingerprint is not None
