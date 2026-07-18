@@ -25,6 +25,27 @@ def test_request_status_fmt_str():
     assert f"{RequestStatus.FINISHED_IGNORED}" == "FINISHED_IGNORED"
 
 
+def test_normal_request_does_not_allocate_final_hidden_state() -> None:
+    request = Request(
+        request_id="normal",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+    )
+
+    lazy_fields = {
+        "capture_final_hidden",
+        "bootstrap_final_hidden",
+        "bootstrap_sample_pending",
+        "dsa_compact_allocated",
+        "captured_final_hidden",
+        "final_hidden_prompt_fingerprint",
+    }
+    assert lazy_fields.isdisjoint(request.__dict__)
+    assert not request.capture_final_hidden
+    assert request.bootstrap_final_hidden is None
+
+
 def test_final_hidden_artifact_must_match_prompt() -> None:
     prompt_token_ids = [1, 2, 3, 4]
     raw_hidden = b"\0" * 4
@@ -37,6 +58,8 @@ def test_final_hidden_artifact_must_match_prompt() -> None:
         "data_sha256": hashlib.sha256(raw_hidden).hexdigest(),
         "prompt_length": len(prompt_token_ids),
         "prompt_sha256": compute_prompt_token_fingerprint(prompt_token_ids),
+        "producer_ready_unix_ns": 1,
+        "proxy_decoder_send_unix_ns": 2,
     }
     sampling_params = SamplingParams(
         max_tokens=2,
@@ -54,6 +77,7 @@ def test_final_hidden_artifact_must_match_prompt() -> None:
 
     assert request.bootstrap_sample_pending
     assert request.bootstrap_final_hidden == artifact
+    assert isinstance(artifact["decoder_engine_received_unix_ns"], int)
 
     mismatch = Request(
         request_id="mismatch",
@@ -64,6 +88,8 @@ def test_final_hidden_artifact_must_match_prompt() -> None:
 
     assert not mismatch.bootstrap_sample_pending
     assert mismatch.bootstrap_final_hidden is None
+    assert "final_hidden_prompt_fingerprint" not in mismatch.__dict__
+    assert "bootstrap_final_hidden" not in mismatch.__dict__
 
 
 def test_invalid_final_hidden_artifact_falls_back_to_prefill() -> None:

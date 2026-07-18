@@ -1645,20 +1645,25 @@ def test_captured_final_hidden_is_bound_to_prompt_and_model():
         "data": "AAAAAAAAAAA=",
         "data_sha256": "0" * 64,
     }
-    scheduler.update_from_output(
-        output,
-        ModelRunnerOutput(
-            req_ids=[request.request_id],
-            req_id_to_index={request.request_id: 0},
-            sampled_token_ids=[[1000]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-            final_hidden_states={request.request_id: payload},
-        ),
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
     )
+    setattr(model_output, "final_hidden_states", {request.request_id: payload})
+    scheduler.update_from_output(output, model_output)
 
-    assert request.captured_final_hidden == {
+    captured_final_hidden = request.captured_final_hidden
+    assert captured_final_hidden is not None
+    assert isinstance(captured_final_hidden["producer_ready_unix_ns"], int)
+    assert {
+        key: value
+        for key, value in captured_final_hidden.items()
+        if key != "producer_ready_unix_ns"
+    } == {
         **payload,
         "prompt_length": request.num_prompt_tokens,
         "prompt_sha256": request.final_hidden_prompt_fingerprint,
@@ -1681,7 +1686,8 @@ def test_capture_final_hidden_on_last_chunked_prefill_step():
 
     first_output = scheduler.schedule()
     assert first_output.num_scheduled_tokens == {request.request_id: 16}
-    assert first_output.capture_final_hidden_req_ids == set()
+    assert first_output.capture_final_hidden_req_ids is None
+    assert "capture_final_hidden_req_ids" not in first_output.__dict__
     scheduler.update_from_output(
         first_output,
         ModelRunnerOutput(
@@ -1716,7 +1722,7 @@ def test_async_final_hidden_bootstrap_waits_for_remote_load():
     scheduler.add_request(request)
 
     load_output = scheduler.schedule()
-    assert load_output.bootstrap_sample_req_ids == set()
+    assert load_output.bootstrap_sample_req_ids is None
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     scheduler.update_from_output(
         load_output,
@@ -1769,7 +1775,7 @@ def test_partial_hit_discards_final_hidden_and_prefills_normally():
 
     output = scheduler.schedule()
 
-    assert output.bootstrap_sample_req_ids == set()
+    assert output.bootstrap_sample_req_ids is None
     assert output.num_scheduled_tokens == {request.request_id: 16}
     assert not request.bootstrap_sample_pending
     assert request.bootstrap_final_hidden is None
@@ -1804,7 +1810,7 @@ def test_ready_bootstrap_is_not_starved_by_running_decode():
 
     normal_output = scheduler.schedule()
     assert set(normal_output.num_scheduled_tokens) == {normal_request.request_id}
-    assert normal_output.bootstrap_sample_req_ids == set()
+    assert normal_output.bootstrap_sample_req_ids is None
 
     scheduler.update_from_output(
         normal_output,
