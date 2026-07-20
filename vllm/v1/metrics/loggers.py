@@ -96,6 +96,7 @@ class LoggingStatLogger(StatLoggerBase):
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index
         self.vllm_config = vllm_config
+        self.last_output_time: float | None = None
         self._reset(time.monotonic())
 
         self.last_scheduler_stats = SchedulerStats()
@@ -131,6 +132,8 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
+        self.num_output_batches: int = 0
+        self.num_scheduler_updates: int = 0
 
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
@@ -164,8 +167,11 @@ class LoggingStatLogger(StatLoggerBase):
         """Log Stats to standard output."""
         if iteration_stats:
             self._track_iteration_stats(iteration_stats)
+            self.num_output_batches += 1
+            self.last_output_time = time.monotonic()
 
         if scheduler_stats is not None:
+            self.num_scheduler_updates += 1
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
@@ -193,6 +199,14 @@ class LoggingStatLogger(StatLoggerBase):
         now = time.monotonic()
         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
         generation_throughput = self._get_throughput(self.num_generation_tokens, now)
+        self.last_interval_generation_tokens = self.num_generation_tokens
+        self.last_interval_output_batches = self.num_output_batches
+        self.last_interval_scheduler_updates = self.num_scheduler_updates
+        self.last_output_age_s = (
+            now - self.last_output_time
+            if self.last_output_time is not None
+            else None
+        )
 
         self._reset(now)
         self.engine_is_idle = not any(
@@ -213,6 +227,25 @@ class LoggingStatLogger(StatLoggerBase):
     def log(self):
         self._update_stats()
         self.aggregate_scheduler_stats()
+        # A running or waiting request means the engine is not idle even when
+        # no output token was produced in the current and previous intervals.
+        self.engine_is_idle = self.engine_is_idle and not (
+            self.last_scheduler_stats.num_running_reqs
+            or self.last_scheduler_stats.num_waiting_reqs
+        )
+        if self.last_interval_generation_tokens:
+            engine_activity = "generated"
+        elif self.last_interval_output_batches:
+            engine_activity = "outputs_without_generation_tokens"
+        elif self.last_interval_scheduler_updates:
+            engine_activity = "scheduler_updates_without_outputs"
+        elif (
+            self.last_scheduler_stats.num_running_reqs
+            or self.last_scheduler_stats.num_waiting_reqs
+        ):
+            engine_activity = "no_engine_updates"
+        else:
+            engine_activity = "idle"
         # Avoid log noise on an idle production system
         log_fn = logger.debug if self.engine_is_idle else logger.info
         # Format and print output.
@@ -221,12 +254,26 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
+            "Generation tokens: %d",
+            "Output batches: %d",
+            "Scheduler updates: %d",
+            "Last output age: %s",
+            "Activity: %s",
         ]
         log_args: list[int | float | str] = [
             self.last_prompt_throughput,
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
+            self.last_interval_generation_tokens,
+            self.last_interval_output_batches,
+            self.last_interval_scheduler_updates,
+            (
+                f"{self.last_output_age_s:.1f}s"
+                if self.last_output_age_s is not None
+                else "never"
+            ),
+            engine_activity,
         ]
 
         if self.num_preemptions > 0:
