@@ -1658,12 +1658,7 @@ def test_captured_final_hidden_is_bound_to_prompt_and_model():
 
     captured_final_hidden = request.captured_final_hidden
     assert captured_final_hidden is not None
-    assert isinstance(captured_final_hidden["producer_ready_unix_ns"], int)
-    assert {
-        key: value
-        for key, value in captured_final_hidden.items()
-        if key != "producer_ready_unix_ns"
-    } == {
+    assert captured_final_hidden == {
         **payload,
         "prompt_length": request.num_prompt_tokens,
         "prompt_sha256": request.final_hidden_prompt_fingerprint,

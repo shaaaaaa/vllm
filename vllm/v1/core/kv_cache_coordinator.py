@@ -7,7 +7,6 @@ from collections.abc import Sequence
 from math import lcm
 
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
 from vllm.v1.core.dsa_shared_pool import (
     DSASharedBlockLayout,
@@ -544,48 +543,6 @@ class KVCacheCoordinator(ABC):
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        if dsa_compact_external_load:
-            logger.info(
-                "[DSA_COMPACT_GROUPS_AFTER_EXTERNAL] req=%s "
-                "local_tokens=%d external_tokens=%d groups=%s",
-                request_id,
-                num_local_computed_tokens,
-                num_external_computed_tokens,
-                [
-                    {
-                        "group": group_index,
-                        "manager": manager.__class__.__name__,
-                        "logical": len(manager.req_to_blocks.get(request_id, ())),
-                        "resident": sum(
-                            not block.is_null
-                            for block in manager.req_to_blocks.get(request_id, ())
-                        ),
-                        "blocks_per_bundle": getattr(
-                            manager.block_pool, "blocks_per_bundle", 1
-                        ),
-                        "resident_bundles": cdiv(
-                            sum(
-                                not block.is_null
-                                for block in manager.req_to_blocks.get(
-                                    request_id, ()
-                                )
-                            ),
-                            getattr(
-                                manager.block_pool, "blocks_per_bundle", 1
-                            ),
-                        ),
-                        "null": sum(
-                            block.is_null
-                            for block in manager.req_to_blocks.get(request_id, ())
-                        ),
-                        "free": manager.block_pool.get_num_free_blocks(),
-                    }
-                    for group_index, manager in enumerate(
-                        self.single_type_managers
-                    )
-                ],
-            )
-
     def allocate_new_blocks(
         self,
         request_id: str,
@@ -626,51 +583,6 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                 )
             new_blocks.append(blocks)
-        if dsa_compact_external_load:
-            logger.info(
-                "[DSA_COMPACT_GROUPS_AFTER_SLOTS] req=%s num_tokens=%d "
-                "main_model_tokens=%d groups=%s",
-                request_id,
-                num_tokens,
-                num_tokens_main_model,
-                [
-                    {
-                        "group": group_index,
-                        "manager": manager.__class__.__name__,
-                        "new": len(group_new_blocks),
-                        "new_ids": [
-                            block.block_id for block in group_new_blocks
-                        ],
-                        "logical": len(manager.req_to_blocks.get(request_id, ())),
-                        "resident": sum(
-                            not block.is_null
-                            for block in manager.req_to_blocks.get(request_id, ())
-                        ),
-                        "blocks_per_bundle": getattr(
-                            manager.block_pool, "blocks_per_bundle", 1
-                        ),
-                        "resident_bundles": cdiv(
-                            sum(
-                                not block.is_null
-                                for block in manager.req_to_blocks.get(
-                                    request_id, ()
-                                )
-                            ),
-                            getattr(
-                                manager.block_pool, "blocks_per_bundle", 1
-                            ),
-                        ),
-                        "null": sum(
-                            block.is_null
-                            for block in manager.req_to_blocks.get(request_id, ())
-                        ),
-                        "free": manager.block_pool.get_num_free_blocks(),
-                    }
-                    for group_index, (manager, group_new_blocks) in enumerate(
-                        zip(self.single_type_managers, new_blocks)
-                    )
-                ],
-            )
         return tuple(new_blocks)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:

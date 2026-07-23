@@ -58,8 +58,6 @@ def test_final_hidden_artifact_must_match_prompt() -> None:
         "data_sha256": hashlib.sha256(raw_hidden).hexdigest(),
         "prompt_length": len(prompt_token_ids),
         "prompt_sha256": compute_prompt_token_fingerprint(prompt_token_ids),
-        "producer_ready_unix_ns": 1,
-        "proxy_decoder_send_unix_ns": 2,
     }
     sampling_params = SamplingParams(
         max_tokens=2,
@@ -77,7 +75,6 @@ def test_final_hidden_artifact_must_match_prompt() -> None:
 
     assert request.bootstrap_sample_pending
     assert request.bootstrap_final_hidden == artifact
-    assert isinstance(artifact["decoder_engine_received_unix_ns"], int)
 
     mismatch = Request(
         request_id="mismatch",
