@@ -1620,6 +1620,39 @@ def test_final_hidden_full_hit_schedules_sampler_only_bootstrap():
     assert request.bootstrap_final_hidden is None
 
 
+def test_compact_cached_request_separates_incremental_and_table_update():
+    scheduler = Mock()
+    scheduler.use_pp = False
+    scheduler.scheduler_config.async_scheduling = False
+    scheduler.prev_step_scheduled_req_ids = {"compact"}
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 4],
+        [10, 11, 12],
+    )
+    request = Mock()
+    request.request_id = "compact"
+    request.num_computed_tokens = 32
+    request.num_output_tokens = 0
+    request.num_output_placeholders = 0
+    request.dsa_compact_allocated = True
+    new_blocks = Mock()
+    new_blocks.get_block_ids.return_value = ([2], [])
+
+    cached = Scheduler._make_cached_request_data(
+        scheduler,
+        running_reqs=[request],
+        resumed_reqs=[],
+        num_scheduled_tokens={"compact": 1},
+        spec_decode_tokens={},
+        req_to_new_blocks={"compact": new_blocks},
+    )
+
+    assert cached.new_block_ids == [([2], [])]
+    assert cached.block_table_updates == {
+        "compact": ([1, 2, 4], [10, 11, 12])
+    }
+
+
 def test_captured_final_hidden_is_bound_to_prompt_and_model():
     scheduler = create_scheduler(block_size=16)
     request = create_requests(

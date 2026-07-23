@@ -1317,6 +1317,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        block_table_updates: dict[str, tuple[list[int], ...]] | None = None
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1345,9 +1346,21 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+            request_new_block_ids = req_to_new_blocks[req_id].get_block_ids(
+                allow_none=True
             )
+            new_block_ids.append(request_new_block_ids)
+            if req.dsa_compact_allocated and request_new_block_ids is not None:
+                # Compact DSA allocation fills null entries at logical prompt
+                # or decode-tail positions. Those are replacements, not
+                # append-only allocations, so provide the model runner with an
+                # authoritative table snapshot while preserving incremental
+                # new_block_ids for KV connectors.
+                if block_table_updates is None:
+                    block_table_updates = {}
+                block_table_updates[req_id] = (
+                    self.kv_cache_manager.get_block_ids(req_id)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1361,6 +1374,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            block_table_updates=block_table_updates,
         )
 
     def _try_schedule_encoder_inputs(

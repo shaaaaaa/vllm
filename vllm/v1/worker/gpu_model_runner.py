@@ -1172,10 +1172,16 @@ class GPUModelRunner(
         # then use it to update actual num_computed_tokens of each request.
         valid_sampled_token_count = self._get_valid_sampled_token_count()
 
+        block_table_updates = req_data.block_table_updates
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
+            block_table_update = (
+                None
+                if block_table_updates is None
+                else block_table_updates.get(req_id)
+            )
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -1244,7 +1250,9 @@ class GPUModelRunner(
 
             # Update the block IDs.
             if not resumed_from_preemption:
-                if new_block_ids is not None:
+                if block_table_update is not None:
+                    req_state.block_ids = block_table_update
+                elif new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
@@ -1274,7 +1282,11 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
+            if block_table_update is not None:
+                self.input_batch.block_table.add_row(
+                    block_table_update, req_index
+                )
+            elif new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
