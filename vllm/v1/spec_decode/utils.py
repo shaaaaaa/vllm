@@ -191,7 +191,7 @@ def eagle_prepare_next_token_padded_kernel(
 
     if is_discarded:
         backup_token = tl.load(backup_next_token_ids_ptr + req_idx)
-        valid_count = tl.full((), 0, dtype=tl.uint32)
+        valid_count = tl.full((), 0, dtype=tl.int32)
         tl.store(next_token_ids_ptr + req_idx, backup_token)
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)
     else:
@@ -204,7 +204,7 @@ def eagle_prepare_next_token_padded_kernel(
 
         # Rejected tokens are -1, valid tokens are in [0, vocab_size)
         is_valid_mask = (token_ids != -1) & (token_ids < vocab_size) & token_mask
-        valid_count = tl.sum(is_valid_mask)
+        valid_count = tl.sum(is_valid_mask.to(tl.int32))
 
         if valid_count > 0:
             # Guaranteed to be well-defined since
