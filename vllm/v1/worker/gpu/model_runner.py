@@ -619,11 +619,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
+        block_table_updates = reqs.block_table_updates
         for req_new_block_ids, req_id in zip(reqs.new_block_ids, reqs.req_ids):
-            if req_new_block_ids is not None:
+            block_table_update = (
+                None
+                if block_table_updates is None
+                else block_table_updates.get(req_id)
+            )
+            block_ids = (
+                block_table_update
+                if block_table_update is not None
+                else req_new_block_ids
+            )
+            if block_ids is not None:
                 req_index = self.req_states.req_id_to_index[req_id]
                 self.block_tables.append_block_ids(
-                    req_index, req_new_block_ids, overwrite=False
+                    req_index,
+                    block_ids,
+                    overwrite=block_table_update is not None,
                 )
 
     def prepare_inputs(

@@ -122,6 +122,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Full logical block-table snapshots for requests whose scheduler-side
+    # table was updated in place rather than extended. Keep this separate from
+    # new_block_ids so KV connectors retain their incremental allocation
+    # contract.
+    block_table_updates: dict[str, tuple[list[int], ...]] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -137,7 +142,9 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            "block_table_update_req_ids="
+            f"{set(self.block_table_updates or ())}"
             f")"
         )
 

@@ -326,6 +326,47 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_update_states_overwrites_in_place_block_table_update(
+    model_runner, dist_init
+):
+    req_id = "req_0"
+    scheduler_output = _schedule_new_request(req_id)
+    scheduler_output.scheduled_new_reqs[0].block_ids = ([1, 0, 4],)
+    model_runner._update_states(scheduler_output)
+
+    cached_req_data = CachedRequestData(
+        req_ids=[req_id],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        # Connectors still receive the incremental physical allocation.
+        new_block_ids=[([2],)],
+        num_computed_tokens=[3],
+        num_output_tokens=[0],
+        # The model runner receives the authoritative logical table.
+        block_table_updates={req_id: ([1, 2, 4],)},
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached_req_data,
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(scheduler_output)
+
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    block_table = model_runner.input_batch.block_table[0]
+    assert block_table.num_blocks_per_row[req_index] == 3
+    assert block_table.block_table.np[req_index, :3].tolist() == [1, 2, 4]
+    assert model_runner.requests[req_id].block_ids == ([1, 2, 4],)
+
+
 def test_get_nans_in_logits(model_runner, dist_init):
     req_ids = ("req_0", "req_1")
 
