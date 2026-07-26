@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -93,6 +94,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsPP,
 )
+from .deepseek_v2_diagnostics import (
+    record_tensor as record_deepseek_v2_tensor,
+    record_value as record_deepseek_v2_value,
+    trace_is_active as deepseek_v2_trace_is_active,
+)
 from .utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
@@ -102,6 +108,10 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_GL51_DEEP_DIAG_ENABLED = os.getenv(
+    "VLLM_ASCEND_GL51_DEEP_DIAG", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class DeepseekAttention(nn.Module):
@@ -197,6 +207,7 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._deep_diag_prefix = prefix
 
         # If is_sequence_parallel, the input and output tensors are sharded
         # across the ranks within the tp_group. In this case the weights are
@@ -226,9 +237,25 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.input", x
+            )
         gate_up, _ = self.gate_up_proj(x)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.gate_up", gate_up
+            )
         x = self.act_fn(gate_up)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.activation", x
+            )
         x, _ = self.down_proj(x)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.output", x
+            )
         return x
 
 
@@ -241,6 +268,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self._deep_diag_prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -347,6 +375,10 @@ class DeepseekV2MoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        if _GL51_DEEP_DIAG_ENABLED and deepseek_v2_trace_is_active():
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.input", hidden_states
+            )
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
@@ -355,20 +387,47 @@ class DeepseekV2MoE(nn.Module):
         # reduce_scatter instead of chunking here.
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+            if _GL51_DEEP_DIAG_ENABLED:
+                record_deepseek_v2_tensor(
+                    f"{self._deep_diag_prefix}.sequence_parallel_input",
+                    hidden_states,
+                )
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
+            if _GL51_DEEP_DIAG_ENABLED:
+                record_deepseek_v2_value(
+                    f"{self._deep_diag_prefix}.router_mode", "internal"
+                )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            if _GL51_DEEP_DIAG_ENABLED:
+                record_deepseek_v2_tensor(
+                    f"{self._deep_diag_prefix}.router_logits",
+                    router_logits,
+                )
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
+            if _GL51_DEEP_DIAG_ENABLED:
+                record_deepseek_v2_value(
+                    f"{self._deep_diag_prefix}.router_mode", "external"
+                )
 
         shared_output, final_hidden_states = fused_moe_out
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.shared_output.raw",
+                shared_output,
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.routed_output.raw",
+                final_hidden_states,
+            )
         if self.shared_experts is None:
             assert shared_output is None
 
@@ -384,6 +443,11 @@ class DeepseekV2MoE(nn.Module):
         if self.shared_experts is not None:
             assert shared_output is not None
             final_hidden_states += shared_output
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.output.before_tp_collective",
+                final_hidden_states,
+            )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -395,6 +459,11 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states
             )
 
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.output.after_tp_collective",
+                final_hidden_states,
+            )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -1088,6 +1157,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self._deep_diag_prefix = prefix
 
     def forward(
         self,
@@ -1096,12 +1166,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.input.hidden", hidden_states
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.input.residual", residual
+            )
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.attention.input",
+                hidden_states,
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.attention.residual", residual
+            )
 
         attn_kwargs = {
             "positions": positions,
@@ -1110,6 +1195,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.attention.output.raw",
+                hidden_states,
+            )
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1123,10 +1213,30 @@ class DeepseekV2DecoderLayer(nn.Module):
                 # The residual is shared by all layers, we only scale it on
                 # first layer.
                 residual *= 1.0 / self.routed_scaling_factor
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.attention.output.scaled",
+                hidden_states,
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.attention.residual.scaled",
+                residual,
+            )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.mlp.input", hidden_states
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.mlp.residual", residual
+            )
         hidden_states = self.mlp(hidden_states)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.mlp.output.raw", hidden_states
+            )
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -1135,6 +1245,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.output.hidden", hidden_states
+            )
+            record_deepseek_v2_tensor(
+                f"{self._deep_diag_prefix}.output.residual", residual
+            )
 
         return hidden_states, residual
 
@@ -1212,6 +1329,10 @@ class DeepseekV2Model(nn.Module):
                     )
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            if _GL51_DEEP_DIAG_ENABLED:
+                record_deepseek_v2_tensor(
+                    "model.embedding.output", hidden_states
+                )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1247,7 +1368,18 @@ class DeepseekV2Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                "model.final_norm.input.hidden", hidden_states
+            )
+            record_deepseek_v2_tensor(
+                "model.final_norm.input.residual", residual
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if _GL51_DEEP_DIAG_ENABLED:
+            record_deepseek_v2_tensor(
+                "model.final_norm.output", hidden_states
+            )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
