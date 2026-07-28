@@ -1200,11 +1200,13 @@ class GPUModelRunner(
                 # the spec tokens length, but in third step it contains the
                 # spec tokens length. we only need to update num_computed_tokens
                 # when prev_num_draft_len > 0.
-                if req_index is None:
+                # A discarded previous row is intentionally absent from this map.
+                prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+                assert prev_req_id_to_index is not None
+                prev_req_index = prev_req_id_to_index.get(req_id)
+                if req_index is None or prev_req_index is None:
                     req_state.prev_num_draft_len = 0
                 else:
-                    assert self.input_batch.prev_req_id_to_index is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     num_rejected = req_state.prev_num_draft_len - num_accepted
                     num_computed_tokens -= num_rejected

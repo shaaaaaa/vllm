@@ -326,6 +326,47 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_update_states_async_discarded_previous_spec_row(
+    model_runner, dist_init, monkeypatch
+):
+    req_id = "req_0"
+    model_runner._update_states(_schedule_new_request(req_id))
+    req_state = model_runner.requests[req_id]
+    req_state.prev_num_draft_len = 1
+    model_runner.use_async_scheduling = True
+    model_runner.input_batch.prev_req_id_to_index = {}
+    monkeypatch.setattr(
+        model_runner,
+        "_get_valid_sampled_token_count",
+        lambda: np.array([], dtype=np.int32),
+    )
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=[req_id],
+            resumed_req_ids=set(),
+            new_token_ids=[[]],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[3],
+            num_output_tokens=[0],
+        ),
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(scheduler_output)
+
+    assert req_state.prev_num_draft_len == 0
+    assert req_state.num_computed_tokens == 3
+
+
 def test_update_states_overwrites_in_place_block_table_update(
     model_runner, dist_init
 ):
