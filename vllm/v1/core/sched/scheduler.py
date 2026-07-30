@@ -736,6 +736,27 @@ class Scheduler(SchedulerInterface):
                                 False,
                             )
                         )
+                        if load_kv_async:
+                            logger.info(
+                                "[DSA_COLD_DIAG] scheduler_admission "
+                                "scheduler=%s req=%s request_tokens=%d "
+                                "local_tokens=%d external_tokens=%d "
+                                "connector_compact_capable=%s "
+                                "compact_forwarded=%s",
+                                type(self).__name__,
+                                request_id,
+                                request.num_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                bool(
+                                    getattr(
+                                        self.connector,
+                                        "supports_dsa_compact_external_load",
+                                        False,
+                                    )
+                                ),
+                                dsa_compact_external_load,
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens

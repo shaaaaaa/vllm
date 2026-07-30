@@ -622,6 +622,18 @@ class DSALatentManager(FullAttentionManager):
         req_blocks.extend(allocated_blocks)
         req_blocks.extend([self._null_block] * (logical_blocks - scratch_blocks))
         self.num_cached_block[request_id] = len(req_blocks)
+        logger.info(
+            "[DSA_COLD_DIAG] latent_compact_init req=%s prefix_tokens=%d "
+            "block_size=%d scratch_blocks=%d logical_blocks=%d "
+            "real_blocks=%d null_blocks=%d",
+            request_id,
+            prefix_tokens,
+            self.block_size,
+            scratch_blocks,
+            logical_blocks,
+            sum(block != self._null_block for block in req_blocks),
+            sum(block == self._null_block for block in req_blocks),
+        )
 
     def _allocate_compact_request_blocks(
         self,
@@ -644,6 +656,21 @@ class DSALatentManager(FullAttentionManager):
         missing_indices = [
             idx for idx in required_indices if req_blocks[idx] == self._null_block
         ]
+        logger.info(
+            "[DSA_COLD_DIAG] latent_compact_extend req=%s prefix_tokens=%d "
+            "request_tokens=%d main_model_tokens=%d required_indices=%d "
+            "missing_blocks=%d logical_blocks=%d real_blocks_before=%d "
+            "null_blocks_before=%d",
+            request_id,
+            prefix_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            len(required_indices),
+            len(missing_indices),
+            len(req_blocks),
+            sum(block != self._null_block for block in req_blocks),
+            sum(block == self._null_block for block in req_blocks),
+        )
         if not missing_indices:
             return []
         new_blocks = self.block_pool.get_new_blocks(len(missing_indices))
@@ -719,6 +746,24 @@ class DSALatentManager(FullAttentionManager):
         end = min(committed_end // self.block_size, len(blocks))
         window_size = _decode_window_save_window_size()
         window_start = max(0, committed_end - window_size) if window_size else None
+        release_range = blocks[start:end]
+        logger.info(
+            "[DSA_COLD_DIAG] latent_release_plan req=%s committed_end=%d "
+            "block_size=%d compact_external=%s logical_blocks=%d "
+            "real_blocks=%d null_blocks=%d keep_blocks=%d release_blocks=%d "
+            "release_real_blocks=%d release_null_blocks=%d",
+            request_id,
+            committed_end,
+            self.block_size,
+            self.is_compact_external(request_id),
+            len(blocks),
+            sum(block != self._null_block for block in blocks),
+            sum(block == self._null_block for block in blocks),
+            start,
+            end,
+            sum(block != self._null_block for block in release_range),
+            sum(block == self._null_block for block in release_range),
+        )
         if end <= start:
             _mtp_dw_event(
                 "release",
