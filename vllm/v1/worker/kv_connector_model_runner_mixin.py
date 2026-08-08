@@ -78,7 +78,7 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> dict[str, int]:
+    def finalize_kv_connector() -> KVConnectorOutput:
         """Finalize the KV connector: wait_for_save and clear metadata.
 
         Call after draft model forward when defer_finalize=True was used.
@@ -87,17 +87,29 @@ class KVConnectorModelRunnerMixin:
             kv_connector = get_kv_transfer_group()
             try:
                 kv_connector.wait_for_save()
-                get_completed_decode_window_saves = getattr(
-                    kv_connector, "get_completed_decode_window_saves", None
-                )
-                return (
-                    get_completed_decode_window_saves()
-                    if get_completed_decode_window_saves is not None
-                    else {}
+                return KVConnectorModelRunnerMixin._collect_decode_save_output(
+                    kv_connector
                 )
             finally:
                 kv_connector.clear_connector_metadata()
-        return {}
+        return KVConnectorOutput()
+
+    @staticmethod
+    def _collect_decode_save_output(kv_connector: KVConnectorBase) -> KVConnectorOutput:
+        output = KVConnectorOutput()
+        get_completed_decode_window_saves = getattr(
+            kv_connector, "get_completed_decode_window_saves", None
+        )
+        if get_completed_decode_window_saves is not None:
+            output.completed_decode_window_saves = (
+                get_completed_decode_window_saves()
+            )
+        get_decode_save_completions = getattr(
+            kv_connector, "get_decode_save_completions", None
+        )
+        if get_decode_save_completions is not None:
+            output.decode_save_completions = get_decode_save_completions()
+        return output
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -133,13 +145,17 @@ class KVConnectorModelRunnerMixin:
                     kv_connector.get_finished(scheduler_output.finished_req_ids)
                 )
                 output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
-                get_completed_decode_window_saves = getattr(
-                    kv_connector, "get_completed_decode_window_saves", None
-                )
-                if get_completed_decode_window_saves is not None:
-                    output.completed_decode_window_saves = (
-                        get_completed_decode_window_saves()
+                decode_save_output = (
+                    KVConnectorModelRunnerMixin._collect_decode_save_output(
+                        kv_connector
                     )
+                )
+                output.completed_decode_window_saves = (
+                    decode_save_output.completed_decode_window_saves
+                )
+                output.decode_save_completions = (
+                    decode_save_output.decode_save_completions
+                )
 
                 output.kv_connector_stats = kv_connector.get_kv_connector_stats()
                 output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()

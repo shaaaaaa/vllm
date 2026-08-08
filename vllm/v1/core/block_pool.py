@@ -121,6 +121,18 @@ class DSASharedLogicalBlockPool:
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         raise NotImplementedError("DSA shared pool does not support prefix caching")
 
+    def pin_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Add non-cache ownership references to live logical blocks."""
+        for block in blocks:
+            if block.is_null:
+                continue
+            if block.ref_cnt <= 0:
+                raise ValueError(
+                    f"Cannot pin free DSA {self.owner.value} block "
+                    f"{block.block_id}"
+                )
+            block.ref_cnt += 1
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         raise NotImplementedError("DSA shared pool does not support prefix caching")
 
@@ -506,6 +518,10 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+    def pin_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Add connector ownership references to live blocks."""
+        self.touch(blocks)
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their

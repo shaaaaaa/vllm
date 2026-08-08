@@ -5,6 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
@@ -37,6 +38,11 @@ from vllm.v1.kv_cache_interface import (
     dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorBlockLease,
+    )
 
 logger = init_logger(__name__)
 
@@ -655,6 +661,75 @@ class KVCacheCoordinator(ABC):
                     request_id, committed_end
                 )
         return removed_blocks
+
+    def acquire_connector_block_lease(
+        self, lease: "KVConnectorBlockLease"
+    ) -> None:
+        """Add one connector-owned reference to every block in ``lease``."""
+        leases = getattr(self, "_connector_block_leases", None)
+        if leases is None:
+            leases = {}
+            self._connector_block_leases = leases
+        existing = leases.get(lease.lease_key)
+        if existing is not None:
+            existing_ids, _ = existing
+            if existing_ids != lease.block_ids:
+                raise ValueError(
+                    "connector block lease identity was reused with different "
+                    f"blocks: key={lease.lease_key}"
+                )
+            return
+        if len(lease.block_ids) > len(self.single_type_managers):
+            raise ValueError(
+                "connector block lease has more KV groups than the cache "
+                f"manager: lease_groups={len(lease.block_ids)}, "
+                f"manager_groups={len(self.single_type_managers)}"
+            )
+
+        acquired: list[tuple[BlockPool, tuple[KVCacheBlock, ...]]] = []
+        try:
+            for group_id, block_ids in enumerate(lease.block_ids):
+                if not block_ids:
+                    continue
+                manager = self.single_type_managers[group_id]
+                request_blocks = manager.req_to_blocks.get(lease.request_id, ())
+                request_block_ids = {
+                    block.block_id for block in request_blocks if not block.is_null
+                }
+                missing = set(block_ids).difference(request_block_ids)
+                if missing:
+                    raise ValueError(
+                        "connector block lease references blocks not owned by "
+                        f"request {lease.request_id} in group {group_id}: "
+                        f"missing={sorted(missing)}"
+                    )
+                blocks = tuple(
+                    manager.block_pool.blocks[block_id] for block_id in block_ids
+                )
+                manager.block_pool.pin_blocks(blocks)
+                acquired.append((manager.block_pool, blocks))
+        except BaseException:
+            for block_pool, blocks in reversed(acquired):
+                block_pool.free_blocks(reversed(blocks))
+            raise
+        leases[lease.lease_key] = (lease.block_ids, tuple(acquired))
+
+    def release_connector_block_lease(
+        self, lease_key: tuple[str, str, int, int]
+    ) -> bool:
+        """Release a connector job lease after all saver workers complete."""
+        leases = getattr(self, "_connector_block_leases", None)
+        if not leases:
+            return False
+        lease_state = leases.pop(lease_key, None)
+        if lease_state is None:
+            return False
+        _, acquired = lease_state
+        for block_pool, blocks in reversed(acquired):
+            block_pool.free_blocks(reversed(blocks))
+        if not leases:
+            del self._connector_block_leases
+        return True
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """

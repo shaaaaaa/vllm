@@ -140,6 +140,40 @@ def _combine_non_none(f: Callable[[T, T], T], items: list[T | None]) -> T | None
 
 
 @dataclass
+class KVConnectorSaveCompletion:
+    """One physical connector save completed on one worker.
+
+    The executor aggregates these events by job identity and only forwards an
+    event after every required saver worker has reported it. ``worker_id`` is
+    therefore meaningful on worker outputs and set to ``-1`` on the aggregated
+    scheduler-facing event.
+    """
+
+    source: str
+    request_id: str
+    generation: int
+    job_id: int
+    start: int
+    end: int
+    is_final: bool
+    worker_id: int
+    expected_count: int
+
+    @property
+    def job_key(self) -> tuple[str, str, int, int, int, int, bool]:
+        """Return the cross-worker identity of this save job."""
+        return (
+            self.source,
+            self.request_id,
+            self.generation,
+            self.job_id,
+            self.start,
+            self.end,
+            self.is_final,
+        )
+
+
+@dataclass
 class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
@@ -153,6 +187,12 @@ class KVConnectorOutput:
     # req_id -> token end offset for decode windows that were saved to the
     # external KV connector and can be evicted from the local latent KV cache.
     completed_decode_window_saves: dict[str, int] = field(default_factory=dict)
+    # Physical decode-save completions. Unlike the legacy frontier mapping,
+    # these retain job identity so block leases can be released for B even
+    # when an earlier A job has not completed yet.
+    decode_save_completions: list[KVConnectorSaveCompletion] = field(
+        default_factory=list
+    )
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -168,6 +208,7 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.completed_decode_window_saves
+            and not self.decode_save_completions
             and not self.kv_connector_worker_meta
         )
 
@@ -193,12 +234,22 @@ class KVConnectorOutput:
         )
         assert invalid_block_ids is not None
         completed_decode_window_saves: dict[str, int] = {}
+        decode_save_completions: list[KVConnectorSaveCompletion] = []
+        seen_decode_save_completions: set[
+            tuple[tuple[str, str, int, int, int, int, bool], int]
+        ] = set()
         for output in outputs:
             for req_id, window_end in output.completed_decode_window_saves.items():
                 completed_decode_window_saves[req_id] = max(
                     completed_decode_window_saves.get(req_id, 0),
                     window_end,
                 )
+            for completion in output.decode_save_completions:
+                completion_key = (completion.job_key, completion.worker_id)
+                if completion_key in seen_decode_save_completions:
+                    continue
+                seen_decode_save_completions.add(completion_key)
+                decode_save_completions.append(completion)
 
         assert all(
             output.expected_finished_count == outputs[0].expected_finished_count
@@ -213,6 +264,7 @@ class KVConnectorOutput:
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
+            decode_save_completions=decode_save_completions,
             expected_finished_count=expected_finished_count,
         )
 

@@ -4,6 +4,7 @@
 KV cache helper for store.
 """
 
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -17,7 +18,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    KVConnectorOutput,
+    KVConnectorSaveCompletion,
+    ModelRunnerOutput,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
@@ -57,6 +62,18 @@ class KVOutputAggregator:
         self._recv_remaining_count = dict[str, int]()
         self._send_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
+        self._decode_save_workers: dict[
+            tuple[str, str, int, int, int, int, bool], set[int]
+        ] = {}
+        self._decode_save_expected_counts: dict[
+            tuple[str, str, int, int, int, int, bool], int
+        ] = {}
+        self._reported_decode_save_jobs: set[
+            tuple[str, str, int, int, int, int, bool]
+        ] = set()
+        self._reported_decode_save_job_order: deque[
+            tuple[str, str, int, int, int, int, bool]
+        ] = deque()
 
     @classmethod
     def from_connector(cls, connector: "KVConnectorBase", world_size: int):
@@ -91,6 +108,7 @@ class KVOutputAggregator:
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
         completed_decode_window_saves: dict[str, int] = {}
+        completed_decode_save_jobs: list[KVConnectorSaveCompletion] = []
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -161,6 +179,47 @@ class KVOutputAggregator:
                     completed_decode_window_saves.get(req_id, 0),
                     window_end,
                 )
+            for completion in kv_output.decode_save_completions:
+                if completion.expected_count <= 0:
+                    raise ValueError(
+                        "decode save completion expected_count must be positive"
+                    )
+                key = completion.job_key
+                if key in self._reported_decode_save_jobs:
+                    continue
+                expected_count = self._decode_save_expected_counts.setdefault(
+                    key, completion.expected_count
+                )
+                if expected_count != completion.expected_count:
+                    raise ValueError(
+                        "workers disagree on decode save expected_count: "
+                        f"job={key}, first={expected_count}, "
+                        f"current={completion.expected_count}"
+                    )
+                workers = self._decode_save_workers.setdefault(key, set())
+                workers.add(completion.worker_id)
+                if len(workers) < expected_count:
+                    continue
+                completed_decode_save_jobs.append(
+                    KVConnectorSaveCompletion(
+                        source=completion.source,
+                        request_id=completion.request_id,
+                        generation=completion.generation,
+                        job_id=completion.job_id,
+                        start=completion.start,
+                        end=completion.end,
+                        is_final=completion.is_final,
+                        worker_id=-1,
+                        expected_count=expected_count,
+                    )
+                )
+                self._decode_save_workers.pop(key, None)
+                self._decode_save_expected_counts.pop(key, None)
+                self._reported_decode_save_jobs.add(key)
+                self._reported_decode_save_job_order.append(key)
+                if len(self._reported_decode_save_job_order) > 4096:
+                    expired_key = self._reported_decode_save_job_order.popleft()
+                    self._reported_decode_save_jobs.discard(expired_key)
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
@@ -174,6 +233,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
+            decode_save_completions=completed_decode_save_jobs,
             expected_finished_count=self._expected_finished_count,
         )
 

@@ -28,7 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, KVConnectorSaveCompletion
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
@@ -319,6 +319,16 @@ class MultiConnector(KVConnectorBase_V1):
             for req_id, window_end in get_completed().items():
                 completed[req_id] = max(completed.get(req_id, 0), window_end)
         return completed
+
+    def get_decode_save_completions(self) -> list[KVConnectorSaveCompletion]:
+        completions: list[KVConnectorSaveCompletion] = []
+        for connector in self._connectors:
+            get_completions = getattr(
+                connector, "get_decode_save_completions", None
+            )
+            if get_completions is not None:
+                completions.extend(get_completions())
+        return completions
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""

@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -14,6 +14,11 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorBlockLease,
+    )
 
 logger = init_logger(__name__)
 
@@ -425,6 +430,18 @@ class KVCacheManager:
         return self.coordinator.remove_saved_decode_window_blocks(
             request_id, committed_end
         )
+
+    def acquire_connector_block_lease(
+        self, lease: "KVConnectorBlockLease"
+    ) -> None:
+        """Keep connector-owned source blocks alive across request release."""
+        self.coordinator.acquire_connector_block_lease(lease)
+
+    def release_connector_block_lease(
+        self, lease_key: tuple[str, str, int, int]
+    ) -> bool:
+        """Drop one completed connector save job's block references."""
+        return self.coordinator.release_connector_block_lease(lease_key)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

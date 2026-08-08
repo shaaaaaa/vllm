@@ -43,6 +43,7 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -144,6 +145,23 @@ class KVConnectorMetadata(ABC):  # noqa: B024
     """
 
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class KVConnectorBlockLease:
+    """Blocks a connector save job must keep alive after request release."""
+
+    source: str
+    request_id: str
+    generation: int
+    job_id: int
+    # One block-id tuple per KV cache group, in scheduler group order.
+    block_ids: tuple[tuple[int, ...], ...]
+
+    @property
+    def lease_key(self) -> tuple[str, str, int, int]:
+        """Return the scheduler-unique identity of this block lease."""
+        return self.source, self.request_id, self.generation, self.job_id
 
 
 class KVConnectorWorkerMetadata(ABC):

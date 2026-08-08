@@ -1037,6 +1037,8 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.kv_connector_metadata = meta
+            for lease in getattr(meta, "block_leases", ()):
+                self.kv_cache_manager.acquire_connector_block_lease(lease)
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -2398,6 +2400,16 @@ class Scheduler(SchedulerInterface):
         # if finished_recving: add to state so we can
             schedule the request during the next step.
         """
+
+        for completion in kv_connector_output.decode_save_completions:
+            self.kv_cache_manager.release_connector_block_lease(
+                (
+                    completion.source,
+                    completion.request_id,
+                    completion.generation,
+                    completion.job_id,
+                )
+            )
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)

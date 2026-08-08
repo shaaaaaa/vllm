@@ -4,7 +4,11 @@
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    KVConnectorOutput,
+    KVConnectorSaveCompletion,
+    ModelRunnerOutput,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -15,12 +19,14 @@ class DummyModelRunnerOutput(ModelRunnerOutput):
         finished_sending: set[str] | None = None,
         finished_recving: set[str] | None = None,
         invalid_block_ids: set[int] | None = None,
+        decode_save_completions: list[KVConnectorSaveCompletion] | None = None,
         expected_finished_count: int = 0,
     ):
         self.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             invalid_block_ids=invalid_block_ids or set(),
+            decode_save_completions=decode_save_completions or [],
             expected_finished_count=expected_finished_count,
         )
 
@@ -120,3 +126,120 @@ def test_aggregate_workers_output_with_expected_finished_count():
     # NOTE: This is to showcase dynamic update. Workers are responsible for
     # ensuring "req1" termination in this case
     assert aggregator._send_remaining_count["req1"] == 2
+
+
+def _decode_save_completion(
+    *, worker_id: int, job_id: int, start: int, end: int, expected_count: int = 2
+) -> KVConnectorSaveCompletion:
+    return KVConnectorSaveCompletion(
+        source="lmcache",
+        request_id="req",
+        generation=3,
+        job_id=job_id,
+        start=start,
+        end=end,
+        is_final=False,
+        worker_id=worker_id,
+        expected_count=expected_count,
+    )
+
+
+def test_decode_save_completion_waits_for_every_required_worker():
+    aggregator = KVOutputAggregator(expected_finished_count=8)
+    first_rank = DummyModelRunnerOutput(
+        decode_save_completions=[
+            _decode_save_completion(worker_id=0, job_id=2, start=256, end=512)
+        ]
+    )
+
+    aggregated = aggregator.aggregate([first_rank])
+    assert aggregated is not None
+    assert aggregated.kv_connector_output.decode_save_completions == []
+
+    second_rank = DummyModelRunnerOutput(
+        decode_save_completions=[
+            _decode_save_completion(worker_id=1, job_id=2, start=256, end=512)
+        ]
+    )
+    aggregated = aggregator.aggregate([second_rank])
+    assert aggregated is not None
+    assert aggregated.kv_connector_output.decode_save_completions == [
+        _decode_save_completion(
+            worker_id=-1,
+            job_id=2,
+            start=256,
+            end=512,
+        )
+    ]
+
+
+def test_decode_save_completion_supports_single_saver_rank():
+    aggregator = KVOutputAggregator(expected_finished_count=8)
+    output = DummyModelRunnerOutput(
+        decode_save_completions=[
+            _decode_save_completion(
+                worker_id=0,
+                job_id=1,
+                start=0,
+                end=256,
+                expected_count=1,
+            )
+        ]
+    )
+
+    aggregated = aggregator.aggregate([output])
+    assert aggregated is not None
+    [completion] = aggregated.kv_connector_output.decode_save_completions
+    assert completion.worker_id == -1
+    assert completion.expected_count == 1
+
+
+def test_decode_save_completion_duplicate_is_idempotent():
+    aggregator = KVOutputAggregator(expected_finished_count=8)
+    completion = _decode_save_completion(
+        worker_id=0,
+        job_id=9,
+        start=512,
+        end=768,
+        expected_count=1,
+    )
+
+    first = aggregator.aggregate(
+        [DummyModelRunnerOutput(decode_save_completions=[completion, completion])]
+    )
+    assert first is not None
+    assert len(first.kv_connector_output.decode_save_completions) == 1
+
+    repeated = aggregator.aggregate(
+        [DummyModelRunnerOutput(decode_save_completions=[completion])]
+    )
+    assert repeated is not None
+    assert repeated.kv_connector_output.decode_save_completions == []
+
+
+def test_kv_connector_output_merge_preserves_save_and_finish_outputs():
+    completion = _decode_save_completion(
+        worker_id=0,
+        job_id=10,
+        start=768,
+        end=1024,
+        expected_count=1,
+    )
+    merged = KVConnectorOutput.merge(
+        KVConnectorOutput(
+            finished_sending={"finished"},
+            completed_decode_window_saves={"legacy": 512},
+            decode_save_completions=[completion],
+        ),
+        KVConnectorOutput(
+            finished_recving={"received"},
+            invalid_block_ids={7},
+            decode_save_completions=[completion],
+        ),
+    )
+
+    assert merged.finished_sending == {"finished"}
+    assert merged.finished_recving == {"received"}
+    assert merged.invalid_block_ids == {7}
+    assert merged.completed_decode_window_saves == {"legacy": 512}
+    assert merged.decode_save_completions == [completion]
