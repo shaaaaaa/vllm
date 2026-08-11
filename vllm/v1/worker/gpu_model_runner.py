@@ -216,6 +216,91 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _update_request_kv_block_state(
+    req_id: str,
+    req_state: CachedRequestState,
+    new_block_ids: tuple[list[int], ...] | None,
+    new_block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None,
+    new_block_allocation_mode: DSABlockAllocationMode | None,
+    *,
+    resumed_from_preemption: bool,
+) -> None:
+    """Append or replace one request's KV block allocation metadata."""
+    if resumed_from_preemption:
+        assert new_block_ids is not None
+        req_state.block_ids = new_block_ids
+        req_state.block_ids_by_bank = new_block_ids_by_bank
+        req_state.block_allocation_mode = new_block_allocation_mode
+        return
+
+    if (
+        new_block_allocation_mode is not None
+        and req_state.block_allocation_mode != new_block_allocation_mode
+    ):
+        raise RuntimeError(
+            "KV block allocation mode changed during request: "
+            f"request_id={req_id}, "
+            f"current={req_state.block_allocation_mode}, "
+            f"new={new_block_allocation_mode}"
+        )
+    if new_block_ids_by_bank is not None:
+        current_banks = req_state.block_ids_by_bank
+        if current_banks is None:
+            raise RuntimeError(
+                "received banked KV block delta for an ordinary request"
+            )
+        if len(current_banks) != len(new_block_ids_by_bank):
+            raise RuntimeError(
+                "KV block bank count changed during request: "
+                f"request_id={req_id}"
+            )
+        if not current_banks:
+            raise RuntimeError(
+                "banked request has no KV block banks: "
+                f"request_id={req_id}"
+            )
+        expected_group_count = len(current_banks[0])
+        if any(
+            len(bank) != expected_group_count for bank in current_banks
+        ) or any(
+            len(bank) != expected_group_count
+            for bank in new_block_ids_by_bank
+        ):
+            raise RuntimeError(
+                "KV block group count changed during request: "
+                f"request_id={req_id}"
+            )
+        if (
+            new_block_ids is not None
+            and new_block_ids_by_bank[0] != new_block_ids
+        ):
+            raise RuntimeError(
+                "primary KV block delta differs from bank 0: "
+                f"request_id={req_id}"
+            )
+    elif (
+        new_block_ids is not None
+        and req_state.block_allocation_mode
+        == DSABlockAllocationMode.PREFILL_CHILD
+    ):
+        raise RuntimeError(
+            "banked request is missing its KV block bank delta: "
+            f"request_id={req_id}"
+        )
+
+    if new_block_ids is not None:
+        for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+            block_ids.extend(new_ids)
+    if new_block_ids_by_bank is not None:
+        assert req_state.block_ids_by_bank is not None
+        for bank_groups, new_bank_groups in zip(
+            req_state.block_ids_by_bank,
+            new_block_ids_by_bank,
+        ):
+            for block_ids, new_ids in zip(bank_groups, new_bank_groups):
+                block_ids.extend(new_ids)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -1256,88 +1341,16 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
-                if (
-                    new_block_allocation_mode is not None
-                    and req_state.block_allocation_mode
-                    != new_block_allocation_mode
-                ):
-                    raise RuntimeError(
-                        "KV block allocation mode changed during request: "
-                        f"request_id={req_id}, "
-                        f"current={req_state.block_allocation_mode}, "
-                        f"new={new_block_allocation_mode}"
-                    )
-                if new_block_ids_by_bank is not None:
-                    current_banks = req_state.block_ids_by_bank
-                    if current_banks is None:
-                        raise RuntimeError(
-                            "received banked KV block delta for an ordinary request"
-                        )
-                    if len(current_banks) != len(new_block_ids_by_bank):
-                        raise RuntimeError(
-                            "KV block bank count changed during request: "
-                            f"request_id={req_id}"
-                        )
-                    if not current_banks:
-                        raise RuntimeError(
-                            "banked request has no KV block banks: "
-                            f"request_id={req_id}"
-                        )
-                    expected_group_count = len(current_banks[0])
-                    if any(
-                        len(bank) != expected_group_count
-                        for bank in current_banks
-                    ) or any(
-                        len(bank) != expected_group_count
-                        for bank in new_block_ids_by_bank
-                    ):
-                        raise RuntimeError(
-                            "KV block group count changed during request: "
-                            f"request_id={req_id}"
-                        )
-                    if (
-                        new_block_ids is not None
-                        and new_block_ids_by_bank[0] != new_block_ids
-                    ):
-                        raise RuntimeError(
-                            "primary KV block delta differs from bank 0: "
-                            f"request_id={req_id}"
-                        )
-                elif (
-                    new_block_ids is not None
-                    and req_state.block_allocation_mode
-                    == DSABlockAllocationMode.PREFILL_CHILD
-                ):
-                    raise RuntimeError(
-                        "banked request is missing its KV block bank delta: "
-                        f"request_id={req_id}"
-                    )
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
-                if new_block_ids_by_bank is not None:
-                    if req_state.block_ids_by_bank is None:
-                        raise RuntimeError(
-                            "received banked KV block delta for an ordinary request"
-                        )
-                    for bank_groups, new_bank_groups in zip(
-                        req_state.block_ids_by_bank,
-                        new_block_ids_by_bank,
-                    ):
-                        for block_ids, new_ids in zip(
-                            bank_groups, new_bank_groups
-                        ):
-                            block_ids.extend(new_ids)
-            else:
+            if resumed_from_preemption:
                 assert req_index is None
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
-                req_state.block_ids_by_bank = new_block_ids_by_bank
-                req_state.block_allocation_mode = new_block_allocation_mode
+            _update_request_kv_block_state(
+                req_id,
+                req_state,
+                new_block_ids,
+                new_block_ids_by_bank,
+                new_block_allocation_mode,
+                resumed_from_preemption=resumed_from_preemption,
+            )
 
             if req_index is None:
                 # The request is not in the persistent batch.

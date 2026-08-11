@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -38,7 +40,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
+    _update_request_kv_block_state,
+)
 from vllm.v1.worker.utils import select_common_block_size
 
 BLOCK_SIZE = 16
@@ -239,62 +244,30 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
-def test_update_states_preserves_layerwise_prefill_bank_identity(
-    model_runner, dist_init
-):
+def test_update_states_preserves_layerwise_prefill_bank_identity():
     req_id = "req_0"
-    scheduler_output = _schedule_new_request(req_id)
-    new_req = scheduler_output.scheduled_new_reqs[0]
-    new_req.block_ids_by_bank = (
-        ([0],),
-        ([10],),
-        ([20],),
-    )
-    new_req.block_allocation_mode = DSABlockAllocationMode.PREFILL_CHILD
-
-    model_runner._update_states(scheduler_output)
-    req_state = model_runner.requests[req_id]
-    assert req_state.block_ids_by_bank == (
-        ([0],),
-        ([10],),
-        ([20],),
-    )
-    assert (
-        req_state.block_allocation_mode
-        == DSABlockAllocationMode.PREFILL_CHILD
+    req_state = SimpleNamespace(
+        block_ids=([0],),
+        block_ids_by_bank=(
+            ([0],),
+            ([10],),
+            ([20],),
+        ),
+        block_allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
     )
 
-    cached_req_data = CachedRequestData(
-        req_ids=[req_id],
-        resumed_req_ids=set(),
-        new_token_ids=[[]],
-        all_token_ids={},
-        new_block_ids=[([1],)],
-        num_computed_tokens=[3],
-        num_output_tokens=[0],
-        new_block_ids_by_bank=[
-            (
-                ([1],),
-                ([11],),
-                ([21],),
-            )
-        ],
-        new_block_allocation_modes=[
-            DSABlockAllocationMode.PREFILL_CHILD
-        ],
+    _update_request_kv_block_state(
+        req_id,
+        req_state,
+        ([1],),
+        (
+            ([1],),
+            ([11],),
+            ([21],),
+        ),
+        DSABlockAllocationMode.PREFILL_CHILD,
+        resumed_from_preemption=False,
     )
-    scheduler_output = SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=cached_req_data,
-        num_scheduled_tokens={req_id: 1},
-        total_num_scheduled_tokens=1,
-        scheduled_spec_decode_tokens={},
-        scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
-        finished_req_ids=set(),
-        free_encoder_mm_hashes=[],
-    )
-    model_runner._update_states(scheduler_output)
 
     assert req_state.block_ids == ([0, 1],)
     assert req_state.block_ids_by_bank == (
@@ -303,19 +276,19 @@ def test_update_states_preserves_layerwise_prefill_bank_identity(
         ([20, 21],),
     )
 
-    cached_req_data.new_block_ids = [([2],)]
-    cached_req_data.new_block_ids_by_bank = [
-        (
-            ([2],),
-            ([12],),
-            ([22],),
-        )
-    ]
-    cached_req_data.new_block_allocation_modes = [
-        DSABlockAllocationMode.FULL_PARENT
-    ]
     with pytest.raises(RuntimeError, match="allocation mode changed"):
-        model_runner._update_states(scheduler_output)
+        _update_request_kv_block_state(
+            req_id,
+            req_state,
+            ([2],),
+            (
+                ([2],),
+                ([12],),
+                ([22],),
+            ),
+            DSABlockAllocationMode.FULL_PARENT,
+            resumed_from_preemption=False,
+        )
 
     assert req_state.block_ids == ([0, 1],)
     assert req_state.block_ids_by_bank == (
@@ -324,24 +297,44 @@ def test_update_states_preserves_layerwise_prefill_bank_identity(
         ([20, 21],),
     )
 
-    cached_req_data.new_block_allocation_modes = [
-        DSABlockAllocationMode.PREFILL_CHILD
-    ]
-    cached_req_data.new_block_ids_by_bank = [
-        (
-            ([99],),
-            ([12],),
-            ([22],),
-        )
-    ]
     with pytest.raises(RuntimeError, match="differs from bank 0"):
-        model_runner._update_states(scheduler_output)
+        _update_request_kv_block_state(
+            req_id,
+            req_state,
+            ([2],),
+            (
+                ([99],),
+                ([12],),
+                ([22],),
+            ),
+            DSABlockAllocationMode.PREFILL_CHILD,
+            resumed_from_preemption=False,
+        )
 
     assert req_state.block_ids == ([0, 1],)
     assert req_state.block_ids_by_bank == (
         ([0, 1],),
         ([10, 11],),
         ([20, 21],),
+    )
+
+    _update_request_kv_block_state(
+        req_id,
+        req_state,
+        ([3],),
+        (
+            ([3],),
+            ([13],),
+            ([23],),
+        ),
+        DSABlockAllocationMode.PREFILL_CHILD,
+        resumed_from_preemption=True,
+    )
+    assert req_state.block_ids == ([3],)
+    assert req_state.block_ids_by_bank == (
+        ([3],),
+        ([13],),
+        ([23],),
     )
 
 
