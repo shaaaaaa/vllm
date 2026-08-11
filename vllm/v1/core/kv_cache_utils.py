@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -31,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     dsa_shared_pool_enabled,
     dsa_shrink_stage,
     dsa_two_groups_enabled,
+    layerwise_prefill_p_node_enabled,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
@@ -130,6 +132,13 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+
+    # Layerwise-prefill physical IDs for the same logical token block, one
+    # entry per resident bank. None on the ordinary full-parent path.
+    bank_block_ids: tuple[int, ...] | None = None
+
+    # Explicit DSA allocation identity. It is never inferred from numeric IDs.
+    allocation_mode: DSABlockAllocationMode | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -864,6 +873,11 @@ def get_max_concurrency_for_kv_cache_config(
             max_blocks_per_req,
             bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
         )
+        if layerwise_prefill_p_node_enabled():
+            child_capacity = kv_cache_config.num_blocks * len(
+                latent_group.layer_names
+            )
+            return child_capacity / (3 * bundles_per_req)
         return kv_cache_config.num_blocks / bundles_per_req
 
     num_layer_per_group = max(
@@ -1217,8 +1231,18 @@ def get_kv_cache_config_from_groups(
             latent_blocks_per_bundle = bundle_page // latent_page
             indexer_blocks_per_bundle = bundle_page // indexer_page
             num_layer_pairs = len(latent_group.layer_names)
-            slot_count = available_memory // (num_layer_pairs * bundle_page)
-            natural_bundles = slot_count - 1
+            if layerwise_prefill_p_node_enabled():
+                # The global slab has one null bundle total, followed by L*C
+                # dense child bundles.
+                total_bundle_slots = available_memory // bundle_page
+                natural_bundles = (
+                    total_bundle_slots - 1
+                ) // num_layer_pairs
+            else:
+                slot_count = available_memory // (
+                    num_layer_pairs * bundle_page
+                )
+                natural_bundles = slot_count - 1
             num_bundles = may_override_num_blocks(
                 vllm_config,
                 natural_bundles,
@@ -1263,7 +1287,13 @@ def get_kv_cache_config_from_groups(
                 natural_nonshared_blocks,
             )
             tensor_size = (num_bundles + 1) * bundle_page
-            shared_pool_bytes = num_layer_pairs * tensor_size
+            if layerwise_prefill_p_node_enabled():
+                # One global null bundle plus L*C allocatable child bundles.
+                shared_pool_bytes = (
+                    num_layer_pairs * num_bundles + 1
+                ) * bundle_page
+            else:
+                shared_pool_bytes = num_layer_pairs * tensor_size
             max_model_len = vllm_config.model_config.max_model_len
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             latent_ctx_blocks = cdiv(
@@ -1360,10 +1390,25 @@ def get_kv_cache_config_from_groups(
                 num_layer_pairs,
                 num_bundles + 1,
             )
-            kv_cache_tensors = [
-                KVCacheTensor(size=tensor_size, shared_by=[latent, indexer])
-                for latent, indexer in pairs
-            ]
+            if layerwise_prefill_p_node_enabled():
+                kv_cache_tensors = [
+                    KVCacheTensor(
+                        size=shared_pool_bytes,
+                        shared_by=[
+                            layer_name
+                            for pair in pairs
+                            for layer_name in pair
+                        ],
+                    )
+                ]
+            else:
+                kv_cache_tensors = [
+                    KVCacheTensor(
+                        size=tensor_size,
+                        shared_by=[latent, indexer],
+                    )
+                    for latent, indexer in pairs
+                ]
             return KVCacheConfig(
                 num_blocks=num_bundles,
                 kv_cache_tensors=kv_cache_tensors,
@@ -1723,11 +1768,35 @@ def _report_kv_cache_config(
         latent_blocks_per_bundle = (
             bundle_page // latent_group.kv_cache_spec.page_size_bytes
         )
-        num_tokens = (
-            kv_cache_config.num_blocks
-            * latent_blocks_per_bundle
-            * min_block_size
-        )
+        if layerwise_prefill_p_node_enabled():
+            indexer_group = min(
+                kv_cache_config.kv_cache_groups,
+                key=lambda g: g.kv_cache_spec.page_size_bytes,
+            )
+            indexer_blocks_per_bundle = (
+                bundle_page // indexer_group.kv_cache_spec.page_size_bytes
+            )
+            child_capacity = kv_cache_config.num_blocks * len(
+                latent_group.layer_names
+            )
+            low, high = 0, child_capacity * latent_blocks_per_bundle
+            while low < high:
+                mid = (low + high + 1) // 2
+                required = 3 * (
+                    cdiv(mid, latent_blocks_per_bundle)
+                    + cdiv(mid, indexer_blocks_per_bundle)
+                )
+                if required <= child_capacity:
+                    low = mid
+                else:
+                    high = mid - 1
+            num_tokens = low * min_block_size
+        else:
+            num_tokens = (
+                kv_cache_config.num_blocks
+                * latent_blocks_per_bundle
+                * min_block_size
+            )
     else:
         num_tokens = (
             kv_cache_config.num_blocks
@@ -1811,6 +1880,8 @@ def _max_memory_usage_bytes_from_groups(
                 blocks,
                 bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
             )
+            if layerwise_prefill_p_node_enabled():
+                return (3 * bundles + 1) * bundle_page
             return len(latent_group.layer_names) * (bundles + 1) * bundle_page
 
         total = 0

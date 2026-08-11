@@ -126,6 +126,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -1120,6 +1121,8 @@ class GPUModelRunner(
                 pooling_params=pooling_params,
                 generator=generator,
                 block_ids=new_req_data.block_ids,
+                block_ids_by_bank=new_req_data.block_ids_by_bank,
+                block_allocation_mode=new_req_data.block_allocation_mode,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -1176,6 +1179,16 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
+            new_block_ids_by_bank = (
+                req_data.new_block_ids_by_bank[i]
+                if req_data.new_block_ids_by_bank is not None
+                else None
+            )
+            new_block_allocation_mode = (
+                req_data.new_block_allocation_modes[i]
+                if req_data.new_block_allocation_modes is not None
+                else None
+            )
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -1244,16 +1257,87 @@ class GPUModelRunner(
 
             # Update the block IDs.
             if not resumed_from_preemption:
+                if (
+                    new_block_allocation_mode is not None
+                    and req_state.block_allocation_mode
+                    != new_block_allocation_mode
+                ):
+                    raise RuntimeError(
+                        "KV block allocation mode changed during request: "
+                        f"request_id={req_id}, "
+                        f"current={req_state.block_allocation_mode}, "
+                        f"new={new_block_allocation_mode}"
+                    )
+                if new_block_ids_by_bank is not None:
+                    current_banks = req_state.block_ids_by_bank
+                    if current_banks is None:
+                        raise RuntimeError(
+                            "received banked KV block delta for an ordinary request"
+                        )
+                    if len(current_banks) != len(new_block_ids_by_bank):
+                        raise RuntimeError(
+                            "KV block bank count changed during request: "
+                            f"request_id={req_id}"
+                        )
+                    if not current_banks:
+                        raise RuntimeError(
+                            "banked request has no KV block banks: "
+                            f"request_id={req_id}"
+                        )
+                    expected_group_count = len(current_banks[0])
+                    if any(
+                        len(bank) != expected_group_count
+                        for bank in current_banks
+                    ) or any(
+                        len(bank) != expected_group_count
+                        for bank in new_block_ids_by_bank
+                    ):
+                        raise RuntimeError(
+                            "KV block group count changed during request: "
+                            f"request_id={req_id}"
+                        )
+                    if (
+                        new_block_ids is not None
+                        and new_block_ids_by_bank[0] != new_block_ids
+                    ):
+                        raise RuntimeError(
+                            "primary KV block delta differs from bank 0: "
+                            f"request_id={req_id}"
+                        )
+                elif (
+                    new_block_ids is not None
+                    and req_state.block_allocation_mode
+                    == DSABlockAllocationMode.PREFILL_CHILD
+                ):
+                    raise RuntimeError(
+                        "banked request is missing its KV block bank delta: "
+                        f"request_id={req_id}"
+                    )
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
+                if new_block_ids_by_bank is not None:
+                    if req_state.block_ids_by_bank is None:
+                        raise RuntimeError(
+                            "received banked KV block delta for an ordinary request"
+                        )
+                    for bank_groups, new_bank_groups in zip(
+                        req_state.block_ids_by_bank,
+                        new_block_ids_by_bank,
+                    ):
+                        for block_ids, new_ids in zip(
+                            bank_groups, new_bank_groups
+                        ):
+                            block_ids.extend(new_ids)
             else:
                 assert req_index is None
                 assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                req_state.block_ids_by_bank = new_block_ids_by_bank
+                req_state.block_allocation_mode = new_block_allocation_mode
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1399,6 +1483,8 @@ class GPUModelRunner(
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
+        req_state.block_ids_by_bank = new_req_data.block_ids_by_bank
+        req_state.block_allocation_mode = new_req_data.block_allocation_mode
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds

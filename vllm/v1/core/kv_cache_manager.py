@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -100,6 +101,89 @@ class KVCacheBlocks:
             ]
             for group in self.blocks
         ]
+
+    def get_block_ids_by_bank(
+        self,
+        *,
+        allow_none: bool = False,
+    ) -> tuple[tuple[list[int], ...], ...] | None:
+        """Return physical block IDs for each layerwise-prefill bank.
+
+        The outer tuple is bank-major and each inner tuple follows KV-cache
+        group order. Ordinary blocks do not carry bank identities and return
+        ``None``.
+        """
+        allocation_mode = self.get_allocation_mode()
+        if allocation_mode != DSABlockAllocationMode.PREFILL_CHILD:
+            return None
+
+        bank_count: int | None = None
+        for group in self.blocks:
+            for block in group:
+                if block.is_null:
+                    continue
+                if block.bank_block_ids is None:
+                    if bank_count is not None:
+                        raise ValueError(
+                            "KV allocation mixes banked and ordinary blocks"
+                        )
+                    continue
+                current_count = len(block.bank_block_ids)
+                if bank_count is None:
+                    bank_count = current_count
+                elif bank_count != current_count:
+                    raise ValueError(
+                        "KV allocation contains inconsistent bank counts"
+                    )
+        if bank_count is None:
+            return None
+        if allow_none and all(len(group) == 0 for group in self.blocks):
+            return None
+
+        result: list[tuple[list[int], ...]] = []
+        for bank in range(bank_count):
+            bank_groups: list[list[int]] = []
+            for group in self.blocks:
+                ids: list[int] = []
+                for block in group:
+                    if block.is_null:
+                        ids.append(0)
+                    elif block.bank_block_ids is None:
+                        raise ValueError(
+                            "KV allocation mixes banked and ordinary blocks"
+                        )
+                    else:
+                        ids.append(block.bank_block_ids[bank])
+                bank_groups.append(ids)
+            result.append(tuple(bank_groups))
+        return tuple(result)
+
+    def get_allocation_mode(self) -> DSABlockAllocationMode | None:
+        allocation_mode: DSABlockAllocationMode | None = None
+        saw_untyped = False
+        for group in self.blocks:
+            for block in group:
+                if block.is_null:
+                    continue
+                current_mode = block.allocation_mode
+                if current_mode is None:
+                    if allocation_mode is not None:
+                        raise ValueError(
+                            "KV allocation mixes typed and untyped blocks"
+                        )
+                    saw_untyped = True
+                    continue
+                if allocation_mode is None:
+                    if saw_untyped:
+                        raise ValueError(
+                            "KV allocation mixes typed and untyped blocks"
+                        )
+                    allocation_mode = current_mode
+                elif allocation_mode != current_mode:
+                    raise ValueError(
+                        "KV allocation contains mixed allocation modes"
+                    )
+        return allocation_mode
 
     def new_empty(self) -> "KVCacheBlocks":
         """

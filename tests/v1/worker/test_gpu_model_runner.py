@@ -27,6 +27,7 @@ from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -236,6 +237,112 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+
+
+def test_update_states_preserves_layerwise_prefill_bank_identity(
+    model_runner, dist_init
+):
+    req_id = "req_0"
+    scheduler_output = _schedule_new_request(req_id)
+    new_req = scheduler_output.scheduled_new_reqs[0]
+    new_req.block_ids_by_bank = (
+        ([0],),
+        ([10],),
+        ([20],),
+    )
+    new_req.block_allocation_mode = DSABlockAllocationMode.PREFILL_CHILD
+
+    model_runner._update_states(scheduler_output)
+    req_state = model_runner.requests[req_id]
+    assert req_state.block_ids_by_bank == (
+        ([0],),
+        ([10],),
+        ([20],),
+    )
+    assert (
+        req_state.block_allocation_mode
+        == DSABlockAllocationMode.PREFILL_CHILD
+    )
+
+    cached_req_data = CachedRequestData(
+        req_ids=[req_id],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[([1],)],
+        num_computed_tokens=[3],
+        num_output_tokens=[0],
+        new_block_ids_by_bank=[
+            (
+                ([1],),
+                ([11],),
+                ([21],),
+            )
+        ],
+        new_block_allocation_modes=[
+            DSABlockAllocationMode.PREFILL_CHILD
+        ],
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached_req_data,
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner._update_states(scheduler_output)
+
+    assert req_state.block_ids == ([0, 1],)
+    assert req_state.block_ids_by_bank == (
+        ([0, 1],),
+        ([10, 11],),
+        ([20, 21],),
+    )
+
+    cached_req_data.new_block_ids = [([2],)]
+    cached_req_data.new_block_ids_by_bank = [
+        (
+            ([2],),
+            ([12],),
+            ([22],),
+        )
+    ]
+    cached_req_data.new_block_allocation_modes = [
+        DSABlockAllocationMode.FULL_PARENT
+    ]
+    with pytest.raises(RuntimeError, match="allocation mode changed"):
+        model_runner._update_states(scheduler_output)
+
+    assert req_state.block_ids == ([0, 1],)
+    assert req_state.block_ids_by_bank == (
+        ([0, 1],),
+        ([10, 11],),
+        ([20, 21],),
+    )
+
+    cached_req_data.new_block_allocation_modes = [
+        DSABlockAllocationMode.PREFILL_CHILD
+    ]
+    cached_req_data.new_block_ids_by_bank = [
+        (
+            ([99],),
+            ([12],),
+            ([22],),
+        )
+    ]
+    with pytest.raises(RuntimeError, match="differs from bank 0"):
+        model_runner._update_states(scheduler_output)
+
+    assert req_state.block_ids == ([0, 1],)
+    assert req_state.block_ids_by_bank == (
+        ([0, 1],),
+        ([10, 11],),
+        ([20, 21],),
+    )
 
 
 def test_update_states_request_finished(model_runner, dist_init):

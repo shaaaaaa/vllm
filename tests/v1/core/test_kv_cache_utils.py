@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -195,6 +196,51 @@ def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
             groups,
             available_memory=0,
         )
+
+
+def test_layerwise_prefill_uses_one_dense_global_slab(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=4,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+    latent_spec = new_kv_cache_spec(head_size=64)
+    indexer_spec = new_kv_cache_spec(head_size=32)
+    groups = [
+        KVCacheGroupSpec(["latent.0", "latent.1"], latent_spec),
+        KVCacheGroupSpec(["indexer.0", "indexer.1"], indexer_spec),
+    ]
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        groups,
+        available_memory=0,
+    )
+
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+    assert result.num_blocks == 4
+    assert len(result.kv_cache_tensors) == 1
+    assert result.kv_cache_tensors[0].size == (2 * 4 + 1) * bundle_page
+    assert result.kv_cache_tensors[0].shared_by == [
+        "latent.0",
+        "indexer.0",
+        "latent.1",
+        "indexer.1",
+    ]
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

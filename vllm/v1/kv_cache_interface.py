@@ -17,6 +17,25 @@ from vllm.utils.torch_utils import get_dtype_size
 logger = init_logger(__name__)
 
 
+def layerwise_prefill_p_node_enabled() -> bool:
+    """Whether this process is a layerwise-prefill P node.
+
+    This is an explicit node marker.  Do not infer it from ``kv_role`` or
+    ``kv_rank``: those values describe connector behavior and are ambiguous
+    for ``kv_both`` deployments.
+    """
+    raw = os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE must be 'true' or 'false', "
+        f"got {raw!r}"
+    )
+
+
 def dsa_two_groups_enabled() -> bool:
     """vllm-ascend DSA un-bundled latent/indexer (two-group mode).
 

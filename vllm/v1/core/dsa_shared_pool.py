@@ -53,6 +53,12 @@ def dsa_scratch_blocks_for_topk(
 class DSASharedBlockOwner(str, Enum):
     LATENT = "latent"
     INDEXER = "indexer"
+    PREFILL_RESERVED = "prefill_reserved"
+
+
+class DSABlockAllocationMode(str, Enum):
+    FULL_PARENT = "full_parent"
+    PREFILL_CHILD = "prefill_child"
 
 
 @dataclass(frozen=True)
@@ -278,3 +284,212 @@ class DSASharedBundleAllocator:
                 prev_start, prev_end = merged[-1]
                 merged[-1] = (prev_start, max(prev_end, end))
         self._free_ranges = merged
+
+
+class PrefillLayerBundlePool:
+    """Layer-agnostic child allocator backed by reserved DSA parents.
+
+    A legacy parent represents the same bundle position in every local DSA
+    layer.  Reserving one parent therefore materializes ``num_physical_slots``
+    independently allocatable child bundles in the global slab.  Child bundle
+    zero stays reserved for block-table padding.
+
+    The pool exposes the subset of :class:`DSASharedBundleAllocator` used by
+    ``DSASharedLogicalBlockPool``.  ``free_bundle_count`` includes children
+    that can be materialized from currently free parents, so scheduler
+    admission does not depend on eager parent reservation.
+    """
+
+    def __init__(
+        self,
+        parent_allocator: DSASharedBundleAllocator,
+        num_physical_slots: int,
+        *,
+        bank_count: int = 3,
+    ) -> None:
+        if num_physical_slots <= 0:
+            raise ValueError("num_physical_slots must be positive")
+        if bank_count <= 0:
+            raise ValueError("bank_count must be positive")
+        self.parent_allocator = parent_allocator
+        self.num_physical_slots = num_physical_slots
+        self.bank_count = bank_count
+        parent_layout = parent_allocator.layout
+        self.parent_capacity = parent_layout.capacity_bundles
+        self.layout = DSASharedBlockLayout(
+            latent_page_size_bytes=parent_layout.latent_page_size_bytes,
+            indexer_page_size_bytes=parent_layout.indexer_page_size_bytes,
+            capacity_bundles=self.parent_capacity * num_physical_slots,
+            k_nope_dim=parent_layout.k_nope_dim,
+            k_pe_dim=parent_layout.k_pe_dim,
+            indexer_dim=parent_layout.indexer_dim,
+        )
+        self._owners: dict[int, DSASharedBlockOwner] = {}
+        self._reserved_parents: set[int] = set()
+
+    def child_bundle_id(self, physical_slot: int, parent_bundle_id: int) -> int:
+        if physical_slot < 0 or physical_slot >= self.num_physical_slots:
+            raise ValueError(f"invalid physical slot {physical_slot}")
+        if parent_bundle_id <= 0 or parent_bundle_id > self.parent_capacity:
+            raise ValueError(f"invalid parent bundle id {parent_bundle_id}")
+        return physical_slot * self.parent_capacity + parent_bundle_id
+
+    def parent_bundle_id(self, child_bundle_id: int) -> int:
+        if child_bundle_id <= 0 or child_bundle_id > self.layout.capacity_bundles:
+            raise ValueError(f"invalid child bundle id {child_bundle_id}")
+        return (child_bundle_id - 1) % self.parent_capacity + 1
+
+    def physical_slot(self, child_bundle_id: int) -> int:
+        if child_bundle_id <= 0 or child_bundle_id > self.layout.capacity_bundles:
+            raise ValueError(f"invalid child bundle id {child_bundle_id}")
+        return (child_bundle_id - 1) // self.parent_capacity
+
+    @property
+    def reserved_parent_count(self) -> int:
+        return len(self._reserved_parents)
+
+    @property
+    def materialized_free_bundle_count(self) -> int:
+        return self.reserved_parent_count * self.num_physical_slots - len(
+            self._owners
+        )
+
+    @property
+    def free_bundle_count(self) -> int:
+        return self.materialized_free_bundle_count + (
+            self.parent_allocator.free_bundle_count * self.num_physical_slots
+        )
+
+    @property
+    def free_range_count(self) -> int:
+        # Child allocation is parent-packed rather than range based.  Expose a
+        # stable metric-compatible value for existing shared-pool logging.
+        return self.reserved_parent_count
+
+    @property
+    def largest_free_range(self) -> int:
+        if not self.free_bundle_count:
+            return 0
+        return max(
+            self.num_physical_slots,
+            self.materialized_free_bundle_count,
+        )
+
+    def owner_bundle_counts(self) -> Counter[DSASharedBlockOwner]:
+        return Counter(self._owners.values())
+
+    def logical_bundle_count_for_blocks(
+        self,
+        owner: DSASharedBlockOwner,
+        num_blocks: int,
+    ) -> int:
+        return _cdiv(num_blocks, self.layout.blocks_per_bundle(owner))
+
+    def bundle_count_for_blocks(
+        self,
+        owner: DSASharedBlockOwner,
+        num_blocks: int,
+    ) -> int:
+        """Return physical child bundles charged for a logical allocation."""
+        return self.bank_count * self.logical_bundle_count_for_blocks(
+            owner, num_blocks
+        )
+
+    def allocate_banks(
+        self,
+        owner: DSASharedBlockOwner,
+        num_logical_bundles: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        if owner == DSASharedBlockOwner.PREFILL_RESERVED:
+            raise ValueError("PREFILL_RESERVED is not a child owner")
+        if num_logical_bundles <= 0:
+            return tuple(() for _ in range(self.bank_count))
+        child_ids = self.allocate(owner, num_logical_bundles * self.bank_count)
+        return tuple(
+            child_ids[
+                bank * num_logical_bundles : (bank + 1) * num_logical_bundles
+            ]
+            for bank in range(self.bank_count)
+        )
+
+    def allocate(
+        self,
+        owner: DSASharedBlockOwner,
+        num_bundles: int,
+    ) -> tuple[int, ...]:
+        if owner == DSASharedBlockOwner.PREFILL_RESERVED:
+            raise ValueError("PREFILL_RESERVED is not a child owner")
+        if num_bundles <= 0:
+            return ()
+        if num_bundles > self.free_bundle_count:
+            raise ValueError(
+                f"Cannot get {num_bundles} DSA child bundles from the "
+                "layerwise prefill pool"
+            )
+
+        free_children = self._materialized_free_children()
+        missing = num_bundles - len(free_children)
+        if missing > 0:
+            parents_needed = _cdiv(missing, self.num_physical_slots)
+            parent_ids = self.parent_allocator.allocate(
+                DSASharedBlockOwner.PREFILL_RESERVED,
+                parents_needed,
+            )
+            self._reserved_parents.update(parent_ids)
+            free_children = self._materialized_free_children()
+
+        chosen = tuple(free_children[:num_bundles])
+        if len(chosen) != num_bundles:
+            raise AssertionError(
+                "materialized DSA child capacity disagrees with admission"
+            )
+        for child_id in chosen:
+            self._owners[child_id] = owner
+        return chosen
+
+    def free(
+        self,
+        owner: DSASharedBlockOwner,
+        bundle_ids: Iterable[int],
+    ) -> None:
+        ids = tuple(bundle_ids)
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"duplicate DSA child bundle ids in free: {ids}")
+        for child_id in ids:
+            actual = self._owners.get(child_id)
+            if actual != owner:
+                raise ValueError(
+                    f"DSA child bundle {child_id} is owned by {actual}, "
+                    f"not {owner}"
+                )
+        affected_parents = {self.parent_bundle_id(child_id) for child_id in ids}
+        for child_id in ids:
+            del self._owners[child_id]
+
+        releasable = tuple(
+            parent_id
+            for parent_id in sorted(affected_parents)
+            if not self._parent_has_live_children(parent_id)
+        )
+        if releasable:
+            self.parent_allocator.free(
+                DSASharedBlockOwner.PREFILL_RESERVED,
+                releasable,
+            )
+            self._reserved_parents.difference_update(releasable)
+
+    def _materialized_free_children(self) -> list[int]:
+        # Sort by parent first so allocations fill an existing reservation
+        # before spreading into another parent.
+        return [
+            self.child_bundle_id(slot, parent_id)
+            for parent_id in sorted(self._reserved_parents)
+            for slot in range(self.num_physical_slots)
+            if self.child_bundle_id(slot, parent_id) not in self._owners
+        ]
+
+    def _parent_has_live_children(self, parent_bundle_id: int) -> bool:
+        return any(
+            self.child_bundle_id(slot, parent_bundle_id) in self._owners
+            for slot in range(self.num_physical_slots)
+        )
