@@ -2200,11 +2200,41 @@ def get_kv_cache_configs(
             num_blocks_old = kv_cache_config.num_blocks
             if num_blocks_old != min_num_blocks:
                 kv_cache_config.num_blocks = min_num_blocks
-                for tensor in kv_cache_config.kv_cache_tensors:
-                    assert tensor.size % (num_blocks_old + 1) == 0
-                    tensor.size = tensor.size // (num_blocks_old + 1) * (
-                        min_num_blocks + 1
+                if layerwise_prefill_p_node_enabled():
+                    # Layerwise prefill uses one global slab containing one
+                    # null bundle plus one child-bundle range per layer pair:
+                    #   (num_layer_pairs * num_bundles + 1) * bundle_page
+                    # It therefore cannot be shrunk using the regular
+                    # per-layer (num_bundles + 1) tensor layout below.
+                    assert len(kv_cache_config.kv_cache_tensors) == 1
+                    latent_group = max(
+                        kv_cache_config.kv_cache_groups,
+                        key=lambda g: g.kv_cache_spec.page_size_bytes,
                     )
+                    indexer_group = min(
+                        kv_cache_config.kv_cache_groups,
+                        key=lambda g: g.kv_cache_spec.page_size_bytes,
+                    )
+                    num_layer_pairs = len(latent_group.layer_names)
+                    assert num_layer_pairs == len(indexer_group.layer_names)
+                    bundle_page = lcm(
+                        latent_group.kv_cache_spec.page_size_bytes,
+                        indexer_group.kv_cache_spec.page_size_bytes,
+                    )
+                    tensor = kv_cache_config.kv_cache_tensors[0]
+                    expected_old_size = (
+                        num_layer_pairs * num_blocks_old + 1
+                    ) * bundle_page
+                    assert tensor.size == expected_old_size
+                    tensor.size = (
+                        num_layer_pairs * min_num_blocks + 1
+                    ) * bundle_page
+                else:
+                    for tensor in kv_cache_config.kv_cache_tensors:
+                        assert tensor.size % (num_blocks_old + 1) == 0
+                        tensor.size = tensor.size // (num_blocks_old + 1) * (
+                            min_num_blocks + 1
+                        )
         else:
             num_blocks_old = kv_cache_config.num_blocks
             # Only shrink when this rank actually computed more blocks than the

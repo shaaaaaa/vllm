@@ -243,6 +243,40 @@ def test_layerwise_prefill_uses_one_dense_global_slab(monkeypatch):
     ]
 
 
+def test_layerwise_prefill_reconciles_global_slab_across_workers(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    latent_spec = new_kv_cache_spec(head_size=64)
+    indexer_spec = new_kv_cache_spec(head_size=32)
+    worker_spec = {
+        "latent.0": latent_spec,
+        "latent.1": latent_spec,
+        "indexer.0": indexer_spec,
+        "indexer.1": indexer_spec,
+    }
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+
+    # Two layer pairs yield 5 and 4 bundles respectively. Reconciliation must
+    # shrink both global slabs to: one null bundle + 2 * 4 child bundles.
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [worker_spec, worker_spec],
+        [11 * bundle_page, 9 * bundle_page],
+    )
+
+    assert [config.num_blocks for config in configs] == [4, 4]
+    assert all(len(config.kv_cache_tensors) == 1 for config in configs)
+    assert [config.kv_cache_tensors[0].size for config in configs] == [
+        9 * bundle_page,
+        9 * bundle_page,
+    ]
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
