@@ -247,9 +247,39 @@ def test_layerwise_prefill_reconciles_global_slab_across_workers(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
     monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
-    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
-    latent_spec = new_kv_cache_spec(head_size=64)
-    indexer_spec = new_kv_cache_spec(head_size=32)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=16,
+            original_max_model_len=16,
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_seqs=1,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        num_speculative_tokens=0,
+    )
+    latent_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.float32,
+    )
     worker_spec = {
         "latent.0": latent_spec,
         "latent.1": latent_spec,
