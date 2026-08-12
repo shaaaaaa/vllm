@@ -1438,6 +1438,20 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids
             )
 
+        if (
+            kv_connector_output
+            and kv_connector_output.kv_connector_worker_meta is not None
+            and self.connector
+        ):
+            self.connector.update_connector_worker_metadata(
+                kv_connector_output.kv_connector_worker_meta,
+                {
+                    req_id
+                    for req_id, request in self.requests.items()
+                    if not request.is_finished()
+                },
+            )
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.

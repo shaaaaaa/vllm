@@ -918,3 +918,13 @@ def test_multi_connector_worker_metadata(mc):
     mc.update_connector_output(kv_connector_output)
     assert_update_connector_output_called(mc)
     assert kv_connector_output.kv_connector_worker_meta == mc_worker_meta_01a_01b
+
+    # Same-step worker metadata is sliced without delivering the full output.
+    active_req_ids = {"request"}
+    mc.update_connector_worker_metadata(mc_worker_meta_01a_01b, active_req_ids)
+    mc._connectors[0].update_connector_worker_metadata.assert_called_once_with(
+        connector0_md, active_req_ids
+    )
+    mc._connectors[1].update_connector_worker_metadata.assert_called_once_with(
+        connector1_md, active_req_ids
+    )

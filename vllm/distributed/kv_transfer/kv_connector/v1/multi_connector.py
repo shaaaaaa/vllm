@@ -424,6 +424,18 @@ class MultiConnector(KVConnectorBase_V1):
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
 
+    def update_connector_worker_metadata(
+        self,
+        worker_metadata: KVConnectorWorkerMetadata,
+        active_req_ids: set[str],
+    ) -> None:
+        assert isinstance(worker_metadata, MultiKVConnectorWorkerMetadata)
+        for connector, metadata in zip(
+            self._connectors, worker_metadata.metadata, strict=True
+        ):
+            if metadata is not None:
+                connector.update_connector_worker_metadata(metadata, active_req_ids)
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
         Get the KVConnector handshake metadata from sub-connectors.

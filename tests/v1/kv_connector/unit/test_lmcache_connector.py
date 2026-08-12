@@ -200,6 +200,16 @@ class TestGetKVConnectorKVCacheEvents:
 class TestUpdateConnectorOutput:
     """Test update_connector_output method."""
 
+    def test_forwards_same_step_worker_metadata(self, mock_connector):
+        metadata = MagicMock()
+        active_req_ids = {"request"}
+
+        mock_connector.update_connector_worker_metadata(metadata, active_req_ids)
+
+        mock_connector._lmcache_engine.update_connector_worker_metadata.assert_called_once_with(
+            metadata, active_req_ids
+        )
+
     def test_does_nothing_when_kv_cache_events_is_none(self, mock_connector):
         """Test that method returns early when kv_cache_events is None."""
         connector_output = KVConnectorOutput(kv_cache_events=None)

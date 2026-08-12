@@ -1388,6 +1388,51 @@ def _num_waiting_requests(scheduler: Scheduler) -> int:
     return len(scheduler.waiting) + len(scheduler.skipped_waiting)
 
 
+def test_worker_metadata_precedes_same_step_finish_and_late_update() -> None:
+    scheduler = create_scheduler(max_num_seqs=1, use_kv_connector=True)
+    request = create_requests(num_requests=1, max_tokens=1)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    connector = scheduler.connector = Mock()
+    calls = []
+    connector.update_connector_worker_metadata.side_effect = (
+        lambda *_args: calls.append("metadata")
+    )
+    connector.request_finished.side_effect = (
+        lambda *_args: calls.append("finished") or (False, None)
+    )
+    connector.update_connector_output.side_effect = (
+        lambda *_args: calls.append("output")
+    )
+    connector.take_events.return_value = None
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorWorkerMetadata,
+    )
+
+    class WorkerMetadata(KVConnectorWorkerMetadata):
+        def aggregate(self, other):
+            return self
+
+    worker_metadata = WorkerMetadata()
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(
+            kv_connector_worker_meta=worker_metadata
+        ),
+    )
+
+    scheduler.update_from_output(output, model_output)
+
+    assert calls == ["metadata", "finished", "output"]
+    connector.update_connector_worker_metadata.assert_called_once()
+    connector.update_connector_output.assert_called_once()
+
+
 def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     """Cycle requests through a KV transfer cycle."""
 

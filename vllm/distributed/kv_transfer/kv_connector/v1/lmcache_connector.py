@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -321,6 +322,17 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 kv_cache_events.get_number_of_workers()
             )
         return
+
+    def update_connector_worker_metadata(
+        self,
+        worker_metadata: KVConnectorWorkerMetadata,
+        active_req_ids: set[str],
+    ) -> None:
+        update = getattr(
+            self._lmcache_engine, "update_connector_worker_metadata", None
+        )
+        if callable(update):
+            update(worker_metadata, active_req_ids)
 
     def request_finished(
         self,

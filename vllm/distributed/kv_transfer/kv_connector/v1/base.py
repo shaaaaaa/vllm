@@ -527,6 +527,18 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def update_connector_worker_metadata(
+        self,
+        worker_metadata: KVConnectorWorkerMetadata,
+        active_req_ids: set[str],
+    ) -> None:
+        """Consume worker metadata needed by same-step request completion.
+
+        The full connector output is still delivered exactly once through
+        :meth:`update_connector_output` after request processing.
+        """
+        return
+
     def request_finished(
         self,
         request: "Request",
