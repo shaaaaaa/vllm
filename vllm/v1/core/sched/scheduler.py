@@ -20,6 +20,10 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_transfer.diagnostics import (
+    forget_cold_perf_request,
+    log_cold_perf_event,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -918,6 +922,13 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                log_cold_perf_event(
+                    "decoder_first_schedule",
+                    request_id=request_id,
+                    once=True,
+                    num_scheduled_tokens=num_new_tokens,
+                    num_computed_tokens=num_computed_tokens,
+                )
                 # Count the number of prefix cached tokens.
                 num_cached_tokens = min(
                     num_computed_tokens, request.num_prompt_tokens
@@ -1566,6 +1577,14 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                log_cold_perf_event(
+                    "decoder_first_output",
+                    request_id=req_id,
+                    once=True,
+                    output_token_count=len(new_token_ids),
+                    stopped=stopped,
+                )
+                forget_cold_perf_request(req_id)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2290,18 +2309,6 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
-        from vllm.distributed.kv_transfer.diagnostics import (
-            log_live_source_handoff,
-        )
-
-        log_live_source_handoff(
-            "live_source_scheduler_dispatch_entry",
-            request.request_id,
-            request.kv_transfer_params,
-            connector=self.connector.__class__.__name__,
-            supports_hma=isinstance(self.connector, SupportsHMA),
-        )
-
         # Free any out-of-window prefix blocks before we hand the block table to
         # the connector.
         self.kv_cache_manager.remove_skipped_blocks(
@@ -2396,6 +2403,13 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            log_cold_perf_event(
+                "decoder_request_promote",
+                request_id=request.request_id,
+                once=True,
+                status=request.status.name,
+                num_computed_tokens=request.num_computed_tokens,
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_FSM:
@@ -2499,6 +2513,12 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+                log_cold_perf_event(
+                    "decoder_kv_ready_ingest",
+                    request_id=req_id,
+                    once=True,
+                    num_computed_tokens=req.num_computed_tokens,
+                )
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])
