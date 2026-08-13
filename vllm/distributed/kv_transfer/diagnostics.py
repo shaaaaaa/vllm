@@ -47,6 +47,16 @@ def log_live_source_handoff(
                     for item in descriptors
                     if isinstance(item, dict)
                 ),
+                "compact_layer_count": sum(
+                    len(item.get("compact_layout", {}).get("layers", ()))
+                    for item in descriptors
+                    if isinstance(item, dict)
+                ),
+                "compact_run_count": sum(
+                    len(item.get("compact_layout", {}).get("runs", ()))
+                    for item in descriptors
+                    if isinstance(item, dict)
+                ),
                 "transfer_param_keys": sorted(params),
                 **fields,
             },
