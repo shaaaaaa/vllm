@@ -21,6 +21,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.diagnostics import (
+    cold_perf_enabled,
     forget_cold_perf_request,
     log_cold_perf_event,
 )
@@ -922,13 +923,6 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                log_cold_perf_event(
-                    "decoder_first_schedule",
-                    request_id=request_id,
-                    once=True,
-                    num_scheduled_tokens=num_new_tokens,
-                    num_computed_tokens=num_computed_tokens,
-                )
                 # Count the number of prefix cached tokens.
                 num_cached_tokens = min(
                     num_computed_tokens, request.num_prompt_tokens
@@ -1099,6 +1093,7 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        self._log_cold_perf_first_schedules(num_scheduled_tokens)
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
@@ -2427,6 +2422,24 @@ class Scheduler(SchedulerInterface):
             "Unexpected blocked waiting status in promotion: "
             f"{request.status.name} for request {request.request_id}"
         )
+
+    def _log_cold_perf_first_schedules(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> None:
+        if not cold_perf_enabled():
+            return
+        for req_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            log_cold_perf_event(
+                "decoder_first_schedule",
+                request_id=req_id,
+                once=True,
+                num_scheduled_tokens=scheduled_tokens,
+                num_computed_tokens=request.num_computed_tokens,
+                status=request.status.name,
+            )
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """

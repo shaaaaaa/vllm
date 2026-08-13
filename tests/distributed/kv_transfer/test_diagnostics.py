@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from vllm.distributed.kv_transfer import diagnostics
+from vllm.v1.core.sched.scheduler import Scheduler
 
 
 def test_cold_perf_events_are_request_scoped_and_one_shot(monkeypatch):
@@ -34,3 +36,32 @@ def test_cold_perf_events_are_request_scoped_and_one_shot(monkeypatch):
         "decoder_first_schedule", request_id="cold", once=True
     )
     assert log.call_count == 2
+
+
+def test_schedule_diagnostic_covers_resumed_remote_kv_request(monkeypatch):
+    log = Mock()
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.cold_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.log_cold_perf_event", log
+    )
+    scheduler = SimpleNamespace(
+        requests={
+            "cold": SimpleNamespace(
+                num_computed_tokens=131613,
+                status=SimpleNamespace(name="RUNNING"),
+            )
+        }
+    )
+
+    Scheduler._log_cold_perf_first_schedules(scheduler, {"cold": 1})
+
+    log.assert_called_once_with(
+        "decoder_first_schedule",
+        request_id="cold",
+        once=True,
+        num_scheduled_tokens=1,
+        num_computed_tokens=131613,
+        status="RUNNING",
+    )
