@@ -462,10 +462,40 @@ class MultiConnector(KVConnectorBase_V1):
         request: "Request",
         blocks: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        from vllm.distributed.kv_transfer.diagnostics import (
+            log_live_source_handoff,
+        )
+
+        log_live_source_handoff(
+            "live_source_multi_entry",
+            request.request_id,
+            request.kv_transfer_params,
+            connector=self.__class__.__name__,
+            children=[c.__class__.__name__ for c in self._connectors],
+        )
         async_saves = 0
         kv_txfer_params = None
-        for c in self._connectors:
+        for index, c in enumerate(self._connectors):
+            log_live_source_handoff(
+                "live_source_multi_child_entry",
+                request.request_id,
+                request.kv_transfer_params,
+                child_index=index,
+                child=c.__class__.__name__,
+            )
             async_save, txfer_params = c.request_finished(request, blocks)
+            log_live_source_handoff(
+                "live_source_multi_child_exit",
+                request.request_id,
+                request.kv_transfer_params,
+                child_index=index,
+                child=c.__class__.__name__,
+                child_source_present=isinstance(txfer_params, dict)
+                and "ascend_live_split_source_v1" in txfer_params,
+                child_param_keys=(
+                    sorted(txfer_params) if isinstance(txfer_params, dict) else []
+                ),
+            )
             if async_save:
                 async_saves += 1
             if txfer_params is not None:

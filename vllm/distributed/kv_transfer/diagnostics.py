@@ -12,7 +12,10 @@ _SOURCE_KEY = "ascend_live_split_source_v1"
 
 
 def log_live_source_handoff(
-    event: str, request_id: str, params: dict[str, Any] | None
+    event: str,
+    request_id: str,
+    params: dict[str, Any] | None,
+    **fields: Any,
 ) -> None:
     if os.environ.get("LMCACHE_COLD_START_PERF", "0").lower() in (
         "", "0", "false", "no", "off"
@@ -20,7 +23,12 @@ def log_live_source_handoff(
         return
     source = params.get(_SOURCE_KEY)
     capabilities = params.get("live_split_capabilities", ())
-    if source is None and not capabilities:
+    if (
+        source is None
+        and not capabilities
+        and not params.get("do_remote_decode")
+        and not params.get("request_live_split")
+    ):
         return
     descriptors = source.get("descriptors", ()) if isinstance(source, dict) else ()
     logger.info(
@@ -40,6 +48,7 @@ def log_live_source_handoff(
                     if isinstance(item, dict)
                 ),
                 "transfer_param_keys": sorted(params),
+                **fields,
             },
             separators=(",", ":"),
         ),

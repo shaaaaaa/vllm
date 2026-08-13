@@ -2290,6 +2290,18 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
+        from vllm.distributed.kv_transfer.diagnostics import (
+            log_live_source_handoff,
+        )
+
+        log_live_source_handoff(
+            "live_source_scheduler_dispatch_entry",
+            request.request_id,
+            request.kv_transfer_params,
+            connector=self.connector.__class__.__name__,
+            supports_hma=isinstance(self.connector, SupportsHMA),
+        )
+
         # Free any out-of-window prefix blocks before we hand the block table to
         # the connector.
         self.kv_cache_manager.remove_skipped_blocks(
