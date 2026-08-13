@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import Request
 
+from vllm.distributed.kv_transfer.diagnostics import log_live_source_handoff
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.completion.protocol import (
@@ -558,6 +559,9 @@ class OpenAIServingCompletion(OpenAIServing):
         request_metadata.final_usage_info = usage
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
+        log_live_source_handoff(
+            "live_source_api_egress", request_id, kv_transfer_params
+        )
         return CompletionResponse(
             id=request_id,
             created=created_time,

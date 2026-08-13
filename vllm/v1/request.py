@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.distributed.kv_transfer.diagnostics import log_live_source_handoff
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -107,6 +108,11 @@ class Request:
             if sampling_params.extra_args is not None:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
+                )
+                log_live_source_handoff(
+                    "live_source_request_admission",
+                    request_id,
+                    self.kv_transfer_params,
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
