@@ -37,6 +37,9 @@ from vllm.inputs.data import ProcessorInputs
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
+from vllm.prefill_trace import point_at as prefill_trace_point_at
+from vllm.prefill_trace import points_at as prefill_trace_points_at
+from vllm.prefill_trace import timestamp_ns as prefill_trace_timestamp_ns
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
@@ -124,7 +127,30 @@ class OpenAIServingCompletion(OpenAIServing):
                 "Streaming is not currently supported with beam search"
             )
 
+        header_request_id = (
+            raw_request.headers.get("X-Request-Id") if raw_request is not None else None
+        )
+        trace_request_id = (
+            f"cmpl-{header_request_id}" if header_request_id is not None else ""
+        )
+        render_start_ns = prefill_trace_timestamp_ns()
         result = await self.render_completion_request(request)
+        prefill_trace_points_at(
+            (
+                (
+                    "serving_render_start",
+                    trace_request_id,
+                    render_start_ns,
+                    {},
+                ),
+                (
+                    "serving_render_done",
+                    trace_request_id,
+                    prefill_trace_timestamp_ns(),
+                    {},
+                ),
+            )
+        )
         if isinstance(result, ErrorResponse):
             return result
 
@@ -284,6 +310,10 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        first_sse = True
+        first_engine_output = True
+        first_engine_output_ns: int | None = None
+        first_engine_request: str | None = None
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -292,6 +322,10 @@ class OpenAIServingCompletion(OpenAIServing):
 
         try:
             async for prompt_idx, res in result_generator:
+                if first_engine_output:
+                    first_engine_output_ns = prefill_trace_timestamp_ns()
+                    first_engine_request = res.request_id
+                    first_engine_output = False
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
@@ -413,7 +447,25 @@ class OpenAIServingCompletion(OpenAIServing):
                         )
 
                     response_json = chunk.model_dump_json(exclude_unset=False)
+                    first_sse_ns = None
+                    if first_sse:
+                        first_sse_ns = prefill_trace_timestamp_ns()
+                        first_sse = False
                     yield f"data: {response_json}\n\n"
+                    if first_engine_output_ns is not None:
+                        prefill_trace_point_at(
+                            "serving_engine_output_received",
+                            request_id,
+                            first_engine_output_ns,
+                            engine_request=first_engine_request,
+                        )
+                        first_engine_output_ns = None
+                    if first_sse_ns is not None:
+                        prefill_trace_point_at(
+                            "serving_first_sse_ready",
+                            request_id,
+                            first_sse_ns,
+                        )
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)

@@ -26,6 +26,20 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.prefill_trace import (
+    PrefillStep,
+    prefill_steps,
+    step_fields,
+)
+from vllm.prefill_trace import (
+    enabled as prefill_trace_enabled,
+)
+from vllm.prefill_trace import (
+    points_at as prefill_trace_points_at,
+)
+from vllm.prefill_trace import (
+    timestamp_ns as prefill_trace_timestamp_ns,
+)
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -288,12 +302,90 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def _record_prefill_schedule(
+        self,
+        scheduler_output: SchedulerOutput,
+        schedule_start_ns: int | None,
+        schedule_done_ns: int | None,
+    ) -> tuple[PrefillStep, ...]:
+        if not prefill_trace_enabled():
+            return ()
+        prompt_lens = getattr(self, "_prefill_trace_prompt_lens", None)
+        if prompt_lens is None:
+            prompt_lens = self._prefill_trace_prompt_lens = {}
+        steps = prefill_steps(scheduler_output, prompt_lens)
+        batches = getattr(self, "_prefill_trace_batches", None)
+        if batches is None:
+            batches = self._prefill_trace_batches = {}
+        batches[id(scheduler_output)] = steps
+        times = getattr(self, "_prefill_trace_batch_times", None)
+        if times is None:
+            times = self._prefill_trace_batch_times = {}
+        times[id(scheduler_output)] = {
+            "core_schedule_start": schedule_start_ns,
+            "core_chunk_scheduled": schedule_done_ns,
+        }
+        return steps
+
+    def _capture_prefill_batch(
+        self,
+        event: str,
+        scheduler_output: SchedulerOutput,
+        unix_ns: int | None,
+    ) -> None:
+        if unix_ns is None:
+            return
+        times = getattr(self, "_prefill_trace_batch_times", None)
+        if times is not None and id(scheduler_output) in times:
+            times[id(scheduler_output)][event] = unix_ns
+
+    def _flush_prefill_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        finish: bool = False,
+    ) -> None:
+        batches = getattr(self, "_prefill_trace_batches", None)
+        times = getattr(self, "_prefill_trace_batch_times", None)
+        if not batches or not times:
+            return
+        batch_id = id(scheduler_output)
+        steps = batches.get(batch_id, ())
+        event_times = times.get(batch_id, {})
+        chunk_size = int(self.vllm_config.scheduler_config.max_num_batched_tokens)
+        points = []
+        for step in steps:
+            fields = step_fields(step, chunk_size)
+            for event, unix_ns in event_times.items():
+                if unix_ns is not None:
+                    points.append(
+                        (
+                            event,
+                            step.request_id,
+                            unix_ns,
+                            fields,
+                        )
+                    )
+            if (
+                finish
+                and step.computed_tokens + step.scheduled_tokens >= step.prompt_tokens
+            ):
+                self._prefill_trace_prompt_lens.pop(step.request_id, None)
+        prefill_trace_points_at(points)
+        if finish:
+            batches.pop(batch_id, None)
+            times.pop(batch_id, None)
+        else:
+            event_times.clear()
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        request_received_ns = prefill_trace_timestamp_ns()
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -320,6 +412,22 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
+        prefill_trace_points_at(
+            (
+                (
+                    "core_request_received",
+                    request.request_id,
+                    request_received_ns,
+                    {},
+                ),
+                (
+                    "core_request_queued",
+                    request.request_id,
+                    prefill_trace_timestamp_ns(),
+                    {},
+                ),
+            )
+        )
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -386,8 +494,26 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        schedule_start_ns = prefill_trace_timestamp_ns()
         scheduler_output = self.scheduler.schedule()
+        schedule_done_ns = prefill_trace_timestamp_ns()
+        self._record_prefill_schedule(
+            scheduler_output,
+            schedule_start_ns,
+            schedule_done_ns,
+        )
+        dispatch_start_ns = prefill_trace_timestamp_ns()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        self._capture_prefill_batch(
+            "core_model_dispatch_start",
+            scheduler_output,
+            dispatch_start_ns,
+        )
+        self._capture_prefill_batch(
+            "core_model_dispatched",
+            scheduler_output,
+            prefill_trace_timestamp_ns(),
+        )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -395,13 +521,45 @@ class EngineCore:
         ):
             model_output = future.result()
             if model_output is None:
+                sampling_start_ns = prefill_trace_timestamp_ns()
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                self._capture_prefill_batch(
+                    "core_sampling_start",
+                    scheduler_output,
+                    sampling_start_ns,
+                )
+                self._capture_prefill_batch(
+                    "core_sampling_return",
+                    scheduler_output,
+                    prefill_trace_timestamp_ns(),
+                )
+
+        self._capture_prefill_batch(
+            "core_model_result_ready",
+            scheduler_output,
+            prefill_trace_timestamp_ns(),
+        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        update_start_ns = prefill_trace_timestamp_ns()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._capture_prefill_batch(
+            "core_scheduler_update_start",
+            scheduler_output,
+            update_start_ns,
+        )
+        self._capture_prefill_batch(
+            "core_scheduler_update_done",
+            scheduler_output,
+            prefill_trace_timestamp_ns(),
+        )
+        self._flush_prefill_batch(
+            scheduler_output,
+            finish=True,
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -444,11 +602,29 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            schedule_start_ns = prefill_trace_timestamp_ns()
             scheduler_output = self.scheduler.schedule()
+            schedule_done_ns = prefill_trace_timestamp_ns()
+            self._record_prefill_schedule(
+                scheduler_output,
+                schedule_start_ns,
+                schedule_done_ns,
+            )
+            dispatch_start_ns = prefill_trace_timestamp_ns()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            self._capture_prefill_batch(
+                "core_model_dispatch_start",
+                scheduler_output,
+                dispatch_start_ns,
+            )
+            self._capture_prefill_batch(
+                "core_model_dispatched",
+                scheduler_output,
+                prefill_trace_timestamp_ns(),
+            )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -462,8 +638,19 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    sampling_start_ns = prefill_trace_timestamp_ns()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
+                    )
+                    self._capture_prefill_batch(
+                        "core_sampling_start",
+                        scheduler_output,
+                        sampling_start_ns,
+                    )
+                    self._capture_prefill_batch(
+                        "core_sampling_dispatched",
+                        scheduler_output,
+                        prefill_trace_timestamp_ns(),
                     )
                 else:
                     # We need to defer sampling until we have processed the model output
@@ -501,11 +688,32 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        self._capture_prefill_batch(
+            "core_model_result_ready",
+            scheduler_output,
+            prefill_trace_timestamp_ns(),
+        )
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        update_start_ns = prefill_trace_timestamp_ns()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._capture_prefill_batch(
+            "core_scheduler_update_start",
+            scheduler_output,
+            update_start_ns,
+        )
+        self._capture_prefill_batch(
+            "core_scheduler_update_done",
+            scheduler_output,
+            prefill_trace_timestamp_ns(),
+        )
+        self._flush_prefill_batch(
+            scheduler_output,
+            finish=True,
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -529,7 +737,18 @@ class EngineCore:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
+            sampling_start_ns = prefill_trace_timestamp_ns()
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            self._capture_prefill_batch(
+                "core_sampling_start",
+                deferred_scheduler_output,
+                sampling_start_ns,
+            )
+            self._capture_prefill_batch(
+                "core_sampling_dispatched",
+                deferred_scheduler_output,
+                prefill_trace_timestamp_ns(),
+            )
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
@@ -1173,6 +1392,16 @@ class EngineCoreProc(EngineCore):
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
+            output_enqueued_ns = prefill_trace_timestamp_ns()
+            prefill_trace_points_at(
+                (
+                    "core_output_enqueued",
+                    request_output.request_id,
+                    output_enqueued_ns,
+                    {},
+                )
+                for request_output in output[1].outputs
+            )
         # Post-step hook.
         self.post_step(model_executed)
 

@@ -28,6 +28,9 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.prefill_trace import point_at as prefill_trace_point_at
+from vllm.prefill_trace import points_at as prefill_trace_points_at
+from vllm.prefill_trace import timestamp_ns as prefill_trace_timestamp_ns
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -371,6 +374,12 @@ class AsyncLLM(EngineClient):
             request.reasoning_ended = reasoning_ended
 
         self.input_processor.assign_request_id(request)
+        assigned_ns = prefill_trace_timestamp_ns()
+        if assigned_ns is not None:
+            assigned_times = getattr(self, "_prefill_trace_assigned_times", None)
+            if assigned_times is None:
+                assigned_times = self._prefill_trace_assigned_times = {}
+            assigned_times[request.request_id] = assigned_ns
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
@@ -414,7 +423,34 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        submit_start_ns = prefill_trace_timestamp_ns()
         await self.engine_core.add_request_async(request)
+        submit_return_ns = prefill_trace_timestamp_ns()
+        assigned_times = getattr(self, "_prefill_trace_assigned_times", {})
+        assigned_ns = assigned_times.pop(request.request_id, None)
+        fields = {"external_request": request.external_req_id}
+        prefill_trace_points_at(
+            (
+                (
+                    "frontend_request_id_assigned",
+                    request.request_id,
+                    assigned_ns,
+                    fields,
+                ),
+                (
+                    "frontend_core_submit_start",
+                    request.request_id,
+                    submit_start_ns,
+                    fields,
+                ),
+                (
+                    "frontend_core_submit_return",
+                    request.request_id,
+                    submit_return_ns,
+                    fields,
+                ),
+            )
+        )
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -584,9 +620,17 @@ class AsyncLLM(EngineClient):
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
                 assert isinstance(out, RequestOutput)
+                output_ready_ns = prefill_trace_timestamp_ns()
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
+                    if output_ready_ns is not None:
+                        prefill_trace_point_at(
+                            "frontend_request_output_ready",
+                            q.request_id,
+                            output_ready_ns,
+                            external_request=out.request_id,
+                        )
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
@@ -662,6 +706,16 @@ class AsyncLLM(EngineClient):
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
+                    output_received_points = []
+                    for output in outputs.outputs:
+                        output_received_points.append(
+                            (
+                                "frontend_engine_output_received",
+                                output.request_id,
+                                prefill_trace_timestamp_ns(),
+                                {},
+                            )
+                        )
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -692,6 +746,11 @@ class AsyncLLM(EngineClient):
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
+                    if output_received_points:
+                        asyncio.get_running_loop().call_soon(
+                            prefill_trace_points_at,
+                            tuple(output_received_points),
+                        )
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
