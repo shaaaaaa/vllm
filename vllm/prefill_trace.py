@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -27,6 +29,10 @@ TRACE_ENV = "VLLM_PREFILL_TRACE"
 TRACE_PREFIX_ENV = "VLLM_PREFILL_TRACE_REQUEST_PREFIXES"
 DEFAULT_TRACE_PREFIXES = ("prefill-", "cmpl-prefill-")
 LOG_PREFIX = "[PREFILL_TRACE] "
+
+_LogPayload = dict[str, Any] | list[dict[str, Any]]
+_log_queue: queue.SimpleQueue[_LogPayload] | None = None
+_log_thread_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -91,9 +97,7 @@ def _emit(
         "pid": os.getpid(),
         **fields,
     }
-    logger.info(
-        "%s%s", LOG_PREFIX, json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    )
+    _enqueue(payload)
     return unix_ns
 
 
@@ -115,12 +119,36 @@ def points_at(
             }
         )
     if payloads:
+        _enqueue(payloads)
+    return len(payloads)
+
+
+def _enqueue(payload: _LogPayload) -> None:
+    global _log_queue
+    log_queue = _log_queue
+    if log_queue is None:
+        with _log_thread_lock:
+            log_queue = _log_queue
+            if log_queue is None:
+                log_queue = queue.SimpleQueue()
+                _log_queue = log_queue
+                threading.Thread(
+                    target=_log_writer,
+                    args=(log_queue,),
+                    name="prefill-trace-writer",
+                    daemon=True,
+                ).start()
+    log_queue.put(payload)
+
+
+def _log_writer(log_queue: queue.SimpleQueue[_LogPayload]) -> None:
+    while True:
+        payload = log_queue.get()
         logger.info(
             "%s%s",
             LOG_PREFIX,
-            json.dumps(payloads, separators=(",", ":"), sort_keys=True),
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
         )
-    return len(payloads)
 
 
 def timestamp_ns() -> int | None:

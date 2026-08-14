@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -34,12 +33,23 @@ def test_point_records_one_json_timestamp(
 ) -> None:
     monkeypatch.setenv(prefill_trace.TRACE_ENV, "true")
     prefill_trace.enabled.cache_clear()
+    with (
+        patch.object(prefill_trace.time, "time_ns", return_value=123),
+        patch.object(prefill_trace, "_enqueue") as enqueue,
+    ):
+        assert prefill_trace.point("core_request_received", "cmpl-prefill-test") == 123
+
+    payload = enqueue.call_args.args[0]
+    assert payload["event"] == "core_request_received"
+    assert payload["unix_ns"] == 123
+    assert payload["request"] == "cmpl-prefill-test"
+    prefill_trace.enabled.cache_clear()
 
 
 def test_points_at_batches_log_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(prefill_trace.TRACE_ENV, "true")
     prefill_trace.enabled.cache_clear()
-    with patch.object(prefill_trace.logger, "info") as info:
+    with patch.object(prefill_trace, "_enqueue") as enqueue:
         count = prefill_trace.points_at(
             [
                 ("worker_execute_start", "cmpl-prefill-test", 10, {"rank": 0}),
@@ -48,22 +58,11 @@ def test_points_at_batches_log_writes(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     assert count == 2
-    payload = json.loads(info.call_args.args[2])
+    payload = enqueue.call_args.args[0]
     assert [item["event"] for item in payload] == [
         "worker_execute_start",
         "worker_execute_return",
     ]
-    prefill_trace.enabled.cache_clear()
-    with (
-        patch.object(prefill_trace.time, "time_ns", return_value=123),
-        patch.object(prefill_trace.logger, "info") as info,
-    ):
-        assert prefill_trace.point("core_request_received", "cmpl-prefill-test") == 123
-
-    payload = json.loads(info.call_args.args[2])
-    assert payload["event"] == "core_request_received"
-    assert payload["unix_ns"] == 123
-    assert payload["request"] == "cmpl-prefill-test"
     prefill_trace.enabled.cache_clear()
 
 
