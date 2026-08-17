@@ -1599,7 +1599,13 @@ def test_layerwise_prefill_max_memory_charges_two_banks(monkeypatch):
         KVCacheGroupSpec(["latent.0"], latent_spec),
         KVCacheGroupSpec(["indexer.0"], indexer_spec),
     ]
-    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
 
     # Two context blocks require two latent bundles plus one indexer bundle.
     # The global slab reserves two rotating copies and one null bundle.
