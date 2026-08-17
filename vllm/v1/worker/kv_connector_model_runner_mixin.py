@@ -78,7 +78,9 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> dict[str, int]:
+    def finalize_kv_connector(
+        finished_req_ids: set[str] | None = None,
+    ) -> KVConnectorOutput:
         """Finalize the KV connector: wait_for_save and clear metadata.
 
         Call after draft model forward when defer_finalize=True was used.
@@ -90,14 +92,49 @@ class KVConnectorModelRunnerMixin:
                 get_completed_decode_window_saves = getattr(
                     kv_connector, "get_completed_decode_window_saves", None
                 )
-                return (
+                output = KVConnectorOutput()
+                output.finished_sending, output.finished_recving = (
+                    kv_connector.get_finished(finished_req_ids or set())
+                )
+                output.invalid_block_ids = (
+                    kv_connector.get_block_ids_with_load_errors()
+                )
+                output.completed_decode_window_saves = (
                     get_completed_decode_window_saves()
                     if get_completed_decode_window_saves is not None
                     else {}
                 )
+                output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+                output.kv_cache_events = (
+                    kv_connector.get_kv_connector_kv_cache_events()
+                )
+                output.kv_connector_worker_meta = (
+                    kv_connector.build_connector_worker_meta()
+                )
+                return output
             finally:
                 kv_connector.clear_connector_metadata()
-        return {}
+        return KVConnectorOutput()
+
+    @staticmethod
+    def abort_kv_connector_finalize() -> None:
+        """Clear connector metadata after a deferred sampling failure.
+
+        Deferred finalization intentionally keeps the per-step metadata bound
+        while the draft model runs. If sampling or drafting raises, there is no
+        valid output to publish and waiting for the save path can obscure the
+        original inference error. Clear the binding so a later request can
+        never observe stale request metadata.
+        """
+        if not has_kv_transfer_group():
+            return
+        try:
+            get_kv_transfer_group().clear_connector_metadata()
+        except Exception:
+            # Preserve the original sampling exception. A connector whose
+            # cleanup fails is already unusable, but masking the causal error
+            # makes diagnosis and retry handling substantially less reliable.
+            logger.exception("Failed to abort deferred KV connector metadata")
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -143,9 +180,10 @@ class KVConnectorModelRunnerMixin:
 
                 output.kv_connector_stats = kv_connector.get_kv_connector_stats()
                 output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
-                output.kv_connector_worker_meta = (
-                    kv_connector.build_connector_worker_meta()
-                )
+                if not defer_finalize:
+                    output.kv_connector_worker_meta = (
+                        kv_connector.build_connector_worker_meta()
+                    )
         except BaseException:
             defer_clear = False
             raise

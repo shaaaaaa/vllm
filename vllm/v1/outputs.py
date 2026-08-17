@@ -188,6 +188,10 @@ class KVConnectorOutput:
             lambda x, y: x.merge(y),
             [output.kv_cache_events for output in outputs],
         )
+        kv_connector_worker_meta = _combine_non_none(
+            lambda x, y: x.aggregate(y),
+            [output.kv_connector_worker_meta for output in outputs],
+        )
         invalid_block_ids = _combine_non_none(
             set.union, [output.invalid_block_ids for output in outputs]
         )
@@ -211,6 +215,7 @@ class KVConnectorOutput:
             finished_recving=finished_recving,
             kv_connector_stats=kv_connector_stats,
             kv_cache_events=kv_cache_events,
+            kv_connector_worker_meta=kv_connector_worker_meta,
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
             expected_finished_count=expected_finished_count,

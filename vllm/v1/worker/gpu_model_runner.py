@@ -3806,12 +3806,39 @@ class GPUModelRunner(
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # This branch returns before speculative drafting, so a
+                    # deferred connector lifecycle must be closed here.
+                    if defer_kv_connector_finalize:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else KVConnectorOutput.merge(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    # Pooling also has no draft pass after the target model.
+                    if defer_kv_connector_finalize:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else KVConnectorOutput.merge(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
@@ -4044,19 +4071,15 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
-            completed_decode_window_saves = self.finalize_kv_connector()
-            if completed_decode_window_saves:
-                if self.kv_connector_output is None:
-                    self.kv_connector_output = KVConnectorOutput()
-                for req_id, window_end in completed_decode_window_saves.items():
-                    self.kv_connector_output.completed_decode_window_saves[
-                        req_id
-                    ] = max(
-                        self.kv_connector_output.completed_decode_window_saves.get(
-                            req_id, 0
-                        ),
-                        window_end,
-                    )
+            finalized = self.finalize_kv_connector(
+                scheduler_output.finished_req_ids
+            )
+            if not finalized.is_empty():
+                self.kv_connector_output = (
+                    finalized
+                    if self.kv_connector_output is None
+                    else KVConnectorOutput.merge(self.kv_connector_output, finalized)
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()

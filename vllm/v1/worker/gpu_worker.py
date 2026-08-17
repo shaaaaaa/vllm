@@ -753,7 +753,14 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        except BaseException:
+            # Speculative execution keeps connector metadata bound until the
+            # draft pass completes. Do not leak that binding into a later step
+            # if sampling or drafting fails.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
 
     @torch.inference_mode()
     def execute_model(
@@ -815,20 +822,27 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        try:
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                if isinstance(
+                    output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+                ):
+                    return output
+        except BaseException:
+            # The target pass may have left a speculative connector lifecycle
+            # deliberately deferred for sample_tokens(). If target-side post
+            # processing fails first, clear that binding before propagating.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
