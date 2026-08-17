@@ -61,6 +61,9 @@ class DSABlockAllocationMode(str, Enum):
     PREFILL_CHILD = "prefill_child"
 
 
+LAYERWISE_PREFILL_BANK_COUNT = 2
+
+
 @dataclass(frozen=True)
 class DSASharedBlockLayout:
     """Logical block-id mapping for the DSA shared bundle pool.
@@ -305,7 +308,7 @@ class PrefillLayerBundlePool:
         parent_allocator: DSASharedBundleAllocator,
         num_physical_slots: int,
         *,
-        bank_count: int = 3,
+        bank_count: int = LAYERWISE_PREFILL_BANK_COUNT,
     ) -> None:
         if num_physical_slots <= 0:
             raise ValueError("num_physical_slots must be positive")

@@ -182,6 +182,27 @@ class MultiConnector(KVConnectorBase_V1):
             return False
         return all(c.prefer_cross_layer_blocks for c in self._connectors)
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return any(
+            c.supports_layerwise_prefill_transfer_window
+            for c in self._connectors
+        )
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return any(c.supports_dsa_index_lmcache for c in self._connectors)
+
+    @property
+    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
+        # Both capabilities must belong to the same leaf connector. Separate
+        # children satisfying one half each cannot implement the two-group
+        # bank hand-off protocol.
+        return any(
+            c.supports_layerwise_prefill_dsa_index_transfer_window
+            for c in self._connectors
+        )
+
     @classmethod
     def _get_connector_classes_and_configs(
         cls, vllm_config: "VllmConfig"
@@ -263,6 +284,17 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.wait_for_layer_load(layer_name)
 
+    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
+        if not self.supports_layerwise_prefill_transfer_window:
+            raise RuntimeError(
+                "At least one connector must support the layerwise-prefill "
+                "transfer window before a load can be submitted through "
+                "MultiConnector"
+            )
+        for c in self._connectors:
+            if c.supports_layerwise_prefill_transfer_window:
+                c.submit_layerwise_prefill_load(layer_name)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -272,6 +304,41 @@ class MultiConnector(KVConnectorBase_V1):
     ) -> None:
         for c in self._connectors:
             c.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+
+    def save_kv_layer_in_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> None:
+        for c in self._connectors:
+            c.save_kv_layer_in_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_layer,
+                attn_metadata,
+                **kwargs,
+            )
+
+    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
+        for c in self._connectors:
+            if c.supports_layerwise_prefill_transfer_window:
+                c.finish_layerwise_prefill_save(layer_name)
+
+    def save_kv_layer_outside_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> None:
+        for c in self._connectors:
+            c.save_kv_layer_outside_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_layer,
+                attn_metadata,
+                **kwargs,
+            )
 
     def wait_for_save(self):
         for c in self._connectors:

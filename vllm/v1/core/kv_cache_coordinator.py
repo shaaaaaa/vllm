@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
 from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
     DSASharedBlockLayout,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
@@ -143,7 +144,7 @@ class KVCacheCoordinator(ABC):
                 self.dsa_shared_allocator = PrefillLayerBundlePool(
                     parent_allocator,
                     self.dsa_shared_num_layer_pairs,
-                    bank_count=3,
+                    bank_count=LAYERWISE_PREFILL_BANK_COUNT,
                 )
             else:
                 self.dsa_shared_allocator = parent_allocator

@@ -251,7 +251,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
         block_ids_by_bank=(
             ([0],),
             ([10],),
-            ([20],),
         ),
         block_allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
     )
@@ -263,7 +262,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
         (
             ([1],),
             ([11],),
-            ([21],),
         ),
         DSABlockAllocationMode.PREFILL_CHILD,
         resumed_from_preemption=False,
@@ -273,7 +271,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
     assert req_state.block_ids_by_bank == (
         ([0, 1],),
         ([10, 11],),
-        ([20, 21],),
     )
 
     with pytest.raises(RuntimeError, match="allocation mode changed"):
@@ -284,7 +281,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
             (
                 ([2],),
                 ([12],),
-                ([22],),
             ),
             DSABlockAllocationMode.FULL_PARENT,
             resumed_from_preemption=False,
@@ -294,7 +290,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
     assert req_state.block_ids_by_bank == (
         ([0, 1],),
         ([10, 11],),
-        ([20, 21],),
     )
 
     with pytest.raises(RuntimeError, match="differs from bank 0"):
@@ -305,7 +300,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
             (
                 ([99],),
                 ([12],),
-                ([22],),
             ),
             DSABlockAllocationMode.PREFILL_CHILD,
             resumed_from_preemption=False,
@@ -315,7 +309,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
     assert req_state.block_ids_by_bank == (
         ([0, 1],),
         ([10, 11],),
-        ([20, 21],),
     )
 
     _update_request_kv_block_state(
@@ -325,7 +318,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
         (
             ([3],),
             ([13],),
-            ([23],),
         ),
         DSABlockAllocationMode.PREFILL_CHILD,
         resumed_from_preemption=True,
@@ -334,7 +326,6 @@ def test_update_states_preserves_layerwise_prefill_bank_identity():
     assert req_state.block_ids_by_bank == (
         ([3],),
         ([13],),
-        ([23],),
     )
 
 

@@ -1547,6 +1547,72 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_hybrid_model == 3
 
 
+def test_layerwise_prefill_max_concurrency_charges_two_banks(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    latent_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.float32,
+    )
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["latent.0", "latent.1"], latent_spec),
+            KVCacheGroupSpec(["indexer.0", "indexer.1"], indexer_spec),
+        ],
+    )
+
+    assert get_max_concurrency_for_kv_cache_config(
+        config,
+        kv_cache_config,
+    ) == 2
+
+
+def test_layerwise_prefill_max_memory_charges_two_banks(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    latent_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.float32,
+    )
+    groups = [
+        KVCacheGroupSpec(["latent.0"], latent_spec),
+        KVCacheGroupSpec(["indexer.0"], indexer_spec),
+    ]
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
+
+    # Two context blocks require two latent bundles plus one indexer bundle.
+    # The global slab reserves two rotating copies and one null bundle.
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        config,
+        groups,
+    ) == (2 * 3 + 1) * bundle_page
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4

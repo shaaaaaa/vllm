@@ -92,7 +92,7 @@ def test_child_allocator_rejects_invalid_free_atomically() -> None:
     assert parent.free_bundle_count == parent.layout.capacity_bundles
 
 
-def test_three_bank_logical_blocks_pin_and_free_all_physical_banks() -> None:
+def test_two_bank_logical_blocks_pin_and_free_all_physical_banks() -> None:
     parent, child = make_pool(parent_capacity=4, physical_slots=5)
     latent = DSASharedLogicalBlockPool(child, DSASharedBlockOwner.LATENT)
 
@@ -110,7 +110,7 @@ def test_three_bank_logical_blocks_pin_and_free_all_physical_banks() -> None:
         for block in blocks
         for block_id in block.bank_block_ids or ()
     }
-    assert len(physical_ids) == 6
+    assert len(physical_ids) == 4
     assert all(latent.blocks[block_id].ref_cnt == 1 for block_id in physical_ids)
 
     latent.pin_blocks(blocks)
@@ -175,15 +175,15 @@ def test_latent_and_indexer_share_child_capacity_without_overlap() -> None:
     assert child.free_bundle_count == child.layout.capacity_bundles
 
 
-def test_three_bank_capacity_is_charged_before_allocation() -> None:
+def test_two_bank_capacity_is_charged_before_allocation() -> None:
     _, child = make_pool(parent_capacity=2, physical_slots=3)
     latent = DSASharedLogicalBlockPool(child, DSASharedBlockOwner.LATENT)
 
-    # Six child bundles hold two three-bank logical bundles, i.e. four latent
+    # Six child bundles hold three two-bank logical bundles, i.e. six latent
     # blocks after bundle rounding.
-    assert latent.get_num_free_blocks() == 4
-    blocks = latent.get_new_blocks(4)
-    assert len(blocks) == 4
+    assert latent.get_num_free_blocks() == 6
+    blocks = latent.get_new_blocks(6)
+    assert len(blocks) == 6
     assert latent.get_num_free_blocks() == 0
     with pytest.raises(ValueError):
         latent.get_new_blocks(1)
@@ -204,10 +204,10 @@ def test_scheduler_exports_bank_major_physical_ids() -> None:
     )
     bank_ids = blocks.get_block_ids_by_bank()
     assert bank_ids is not None
-    assert len(bank_ids) == 3
+    assert len(bank_ids) == 2
     assert bank_ids[0][0] == [block.block_id for block in latent_blocks]
     assert bank_ids[0][1] == [block.block_id for block in indexer_blocks]
-    for bank in range(3):
+    for bank in range(2):
         assert bank_ids[bank][0] == [
             block.bank_block_ids[bank] for block in latent_blocks
         ]
@@ -223,7 +223,7 @@ def test_scheduler_exports_bank_major_physical_ids() -> None:
             (
                 KVCacheBlock(
                     1,
-                    bank_block_ids=(1, 2, 3),
+                    bank_block_ids=(1, 2),
                     allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
                 ),
                 KVCacheBlock(2),
@@ -234,7 +234,7 @@ def test_scheduler_exports_bank_major_physical_ids() -> None:
             (
                 KVCacheBlock(
                     1,
-                    bank_block_ids=(1, 2, 3),
+                    bank_block_ids=(1, 2),
                     allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
                 ),
                 KVCacheBlock(
@@ -260,7 +260,7 @@ def test_kv_cache_blocks_rejects_mixed_allocation_identity(
             (
                 KVCacheBlock(
                     1,
-                    bank_block_ids=(1, 2, 3),
+                    bank_block_ids=(1, 2),
                     allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
                 ),
                 KVCacheBlock(
@@ -274,12 +274,12 @@ def test_kv_cache_blocks_rejects_mixed_allocation_identity(
             (
                 KVCacheBlock(
                     1,
-                    bank_block_ids=(1, 2, 3),
+                    bank_block_ids=(1, 2),
                     allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
                 ),
                 KVCacheBlock(
                     2,
-                    bank_block_ids=(4, 5),
+                    bank_block_ids=(4, 5, 6),
                     allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
                 ),
             ),

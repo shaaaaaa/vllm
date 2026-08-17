@@ -800,6 +800,130 @@ def test_multi_connector_prefer_cross_layer_blocks(mc):
     assert mc.prefer_cross_layer_blocks is True
 
 
+def test_multi_connector_layerwise_prefill_transfer_window(mc):
+    mc._connectors[0].supports_layerwise_prefill_transfer_window = False
+    mc._connectors[1].supports_layerwise_prefill_transfer_window = False
+    assert mc.supports_layerwise_prefill_transfer_window is False
+    with pytest.raises(RuntimeError, match="At least one connector"):
+        mc.submit_layerwise_prefill_load("layer-0")
+
+    mc._connectors[0].supports_layerwise_prefill_transfer_window = True
+    assert mc.supports_layerwise_prefill_transfer_window is True
+    mc.submit_layerwise_prefill_load("layer-0")
+    mc._connectors[0].submit_layerwise_prefill_load.assert_called_once_with(
+        "layer-0"
+    )
+    mc._connectors[1].submit_layerwise_prefill_load.assert_not_called()
+
+    mc._connectors[0].submit_layerwise_prefill_load.reset_mock()
+    mc._connectors[1].supports_layerwise_prefill_transfer_window = True
+    assert mc.supports_layerwise_prefill_transfer_window is True
+    mc.submit_layerwise_prefill_load("layer-0")
+    for connector in mc._connectors:
+        connector.submit_layerwise_prefill_load.assert_called_once_with(
+            "layer-0"
+        )
+
+
+def test_multi_connector_dsa_index_capability(mc):
+    mc._connectors[0].supports_dsa_index_lmcache = False
+    mc._connectors[1].supports_dsa_index_lmcache = False
+    assert mc.supports_dsa_index_lmcache is False
+
+    mc._connectors[1].supports_dsa_index_lmcache = True
+    assert mc.supports_dsa_index_lmcache is True
+
+
+def test_multi_connector_requires_one_child_with_complete_prefill_protocol(mc):
+    for connector in mc._connectors:
+        connector.supports_layerwise_prefill_dsa_index_transfer_window = False
+
+    # Aggregate component capabilities are insufficient when different
+    # children provide them.
+    mc._connectors[0].supports_layerwise_prefill_transfer_window = True
+    mc._connectors[0].supports_dsa_index_lmcache = False
+    mc._connectors[1].supports_layerwise_prefill_transfer_window = False
+    mc._connectors[1].supports_dsa_index_lmcache = True
+    assert mc.supports_layerwise_prefill_transfer_window is True
+    assert mc.supports_dsa_index_lmcache is True
+    assert (
+        mc.supports_layerwise_prefill_dsa_index_transfer_window is False
+    )
+
+    mc._connectors[0].supports_layerwise_prefill_dsa_index_transfer_window = (
+        True
+    )
+    assert mc.supports_layerwise_prefill_dsa_index_transfer_window is True
+
+
+def test_multi_connector_separates_transfer_window_saves(mc):
+    layer = object()
+    metadata = object()
+    mc._connectors[0].supports_layerwise_prefill_transfer_window = True
+    mc._connectors[1].supports_layerwise_prefill_transfer_window = False
+
+    def bind_base_implementation(connector, method_name):
+        method = getattr(connector, method_name)
+        base_method = getattr(KVConnectorBase_V1, method_name)
+        method.side_effect = (
+            lambda *args, **kwargs: base_method(
+                connector,
+                *args,
+                **kwargs,
+            )
+        )
+
+    for connector in mc._connectors:
+        bind_base_implementation(
+            connector,
+            "save_kv_layer_in_layerwise_prefill_transfer_window",
+        )
+        bind_base_implementation(
+            connector,
+            "save_kv_layer_outside_layerwise_prefill_transfer_window",
+        )
+
+    mc.save_kv_layer_in_layerwise_prefill_transfer_window(
+        "layer-0", layer, metadata
+    )
+    mc._connectors[0].save_kv_layer.assert_called_once_with(
+        "layer-0", layer, metadata
+    )
+    mc._connectors[1].save_kv_layer.assert_not_called()
+
+    mc.save_kv_layer_outside_layerwise_prefill_transfer_window(
+        "layer-0", layer, metadata
+    )
+
+    for connector in mc._connectors:
+        connector.save_kv_layer_in_layerwise_prefill_transfer_window.assert_called_once_with(
+            "layer-0", layer, metadata
+        )
+        connector.save_kv_layer_outside_layerwise_prefill_transfer_window.assert_called_once_with(
+            "layer-0", layer, metadata
+        )
+        connector.save_kv_layer.assert_called_once_with(
+            "layer-0", layer, metadata
+        )
+
+
+def test_multi_connector_finishes_only_capable_children_recursively(mc):
+    first, legacy = mc._connectors
+    first.supports_layerwise_prefill_transfer_window = True
+    legacy.supports_layerwise_prefill_transfer_window = False
+
+    nested = object.__new__(MultiConnector)
+    nested._connectors = [mc, MagicMock(spec_set=KVConnectorBase_V1)]
+    nested_legacy = nested._connectors[1]
+    nested_legacy.supports_layerwise_prefill_transfer_window = False
+
+    nested.finish_layerwise_prefill_save("layer-0")
+
+    first.finish_layerwise_prefill_save.assert_called_once_with("layer-0")
+    legacy.finish_layerwise_prefill_save.assert_not_called()
+    nested_legacy.finish_layerwise_prefill_save.assert_not_called()
+
+
 def test_multi_connector_worker_metadata(mc):
     class MockConnectorWorkerMetadata(KVConnectorWorkerMetadata):
         def __init__(self, data: set[str]):

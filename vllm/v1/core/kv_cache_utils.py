@@ -18,7 +18,10 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
-from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
+from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
+    DSABlockAllocationMode,
+)
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -877,7 +880,9 @@ def get_max_concurrency_for_kv_cache_config(
             child_capacity = kv_cache_config.num_blocks * len(
                 latent_group.layer_names
             )
-            return child_capacity / (3 * bundles_per_req)
+            return child_capacity / (
+                LAYERWISE_PREFILL_BANK_COUNT * bundles_per_req
+            )
         return kv_cache_config.num_blocks / bundles_per_req
 
     num_layer_per_group = max(
@@ -1782,7 +1787,7 @@ def _report_kv_cache_config(
             low, high = 0, child_capacity * latent_blocks_per_bundle
             while low < high:
                 mid = (low + high + 1) // 2
-                required = 3 * (
+                required = LAYERWISE_PREFILL_BANK_COUNT * (
                     cdiv(mid, latent_blocks_per_bundle)
                     + cdiv(mid, indexer_blocks_per_bundle)
                 )
@@ -1881,7 +1886,9 @@ def _max_memory_usage_bytes_from_groups(
                 bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
             )
             if layerwise_prefill_p_node_enabled():
-                return (3 * bundles + 1) * bundle_page
+                return (
+                    LAYERWISE_PREFILL_BANK_COUNT * bundles + 1
+                ) * bundle_page
             return len(latent_group.layer_names) * (bundles + 1) * bundle_page
 
         total = 0
