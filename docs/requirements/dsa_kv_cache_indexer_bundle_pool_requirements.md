@@ -1,8 +1,7 @@
-# DSA KV-Cache / Indexer Bundle Pool 跨仓需求文档
+# DSA KV-Cache / Indexer Bundle Pool 跨仓需求
 
 ## 1. 文档信息
 
-- 主要贡献者：sth4nthL、BrokenDuskL
 - 涉及仓库：vLLM、vLLM Ascend、LMCache、LMCache Ascend
 - 状态：首版能力已实现，进入正确性、性能和硬件回归阶段
 - 适用模型：以 GLM-5.1 / DSA 为首个落地模型，接口不得绑定单一模型名称
@@ -207,4 +206,3 @@ pool 和 layerwise transfer，在保持 DSA 精度与原有 D 节点行为的前
 - NPU profile 证明 load/save 与 HCOM 至少部分重叠，且 combined 小于 strict-serial。
 - 正常完成和 abort 后无 pinned host 泄漏、UAF、stale event 或重复释放。
 - 四仓的纯 CPU 单测、NPU 单卡测试和 TP8 HCCL 集成测试均有可复现命令。
-
