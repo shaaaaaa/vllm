@@ -12,8 +12,6 @@ layerwise prefill、LMCache 持久化、NPU 异步传输和 decode offload 的�
 
 - `docs/design/prefill_layer_block_pool.md`
 - `vllm_ascend/distributed/kv_transfer/sparse_offload/DESIGN.md`
-- `vllm_ascend/distributed/kv_transfer/sparse_offload/INDEXER.md`
-- `vllm_ascend/distributed/kv_transfer/sparse_offload/INTEGRATION.md`
 - `LMCache/docs/design/decode_offload_rebuild_notes.md`
 
 ## 2. 背景与问题
