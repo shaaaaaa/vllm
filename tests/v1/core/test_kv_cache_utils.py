@@ -1619,6 +1619,49 @@ def test_layerwise_prefill_max_memory_charges_two_banks(monkeypatch):
     ) == (2 * 3 + 1) * bundle_page
 
 
+def test_report_kv_cache_config_logs_bytes_and_effective_context(monkeypatch):
+    spec = new_kv_cache_spec(block_size=16)
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(size=1024, shared_by=["layer.0"]),
+            KVCacheTensor(size=2048, shared_by=["layer.1"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer.0", "layer.1"], spec),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+    logged: list[tuple[str, tuple[Any, ...]]] = []
+
+    monkeypatch.setattr(kv_cache_utils, "dsa_two_groups_enabled", lambda: False)
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "get_max_concurrency_for_kv_cache_config",
+        lambda *_args: 1.0,
+    )
+    monkeypatch.setattr(
+        kv_cache_utils.logger,
+        "info_once",
+        lambda message, *args, **_kwargs: logged.append((message, args)),
+    )
+
+    kv_cache_utils._report_kv_cache_config(vllm_config, config)
+
+    message, args = next(
+        entry for entry in logged if entry[0].startswith("KV cache allocation summary")
+    )
+    assert "effective maximum context" in message
+    assert args[0] == "3,072"
+    assert args[2:] == ("160", "100", "100")
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4

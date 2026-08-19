@@ -1822,6 +1822,22 @@ def _report_kv_cache_config(
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
+    allocated_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+    effective_max_context = min(
+        num_tokens,
+        vllm_config.model_config.max_model_len,
+    )
+    logger.info_once(
+        "KV cache allocation summary: %s bytes (%s GiB) per worker rank; "
+        "calculated KV capacity: %s tokens; configured model limit: %s "
+        "tokens; effective maximum context: %s tokens",
+        f"{allocated_bytes:,}",
+        format_gib(allocated_bytes),
+        num_tokens_str,
+        max_model_len_str,
+        f"{effective_max_context:,}",
+        scope="local",
+    )
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
