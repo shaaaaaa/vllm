@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -27,6 +28,10 @@ def test_cold_perf_events_are_request_scoped_and_one_shot(monkeypatch):
 
     log.assert_called_once()
     assert '"req_id":"cold"' in log.call_args.args[1]
+    payload = json.loads(log.call_args.args[1])
+    assert payload["wall_time_ns"] > 0
+    assert payload["host"]
+    assert payload["clock_domain"].startswith(f"{payload['host']}:")
 
     diagnostics.forget_cold_perf_request("cold")
     assert not diagnostics.is_cold_perf_request("cold")

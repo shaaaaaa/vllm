@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 import os
+import socket
 import time
+from pathlib import Path
 from typing import Any
 
 from vllm.logger import init_logger
@@ -15,6 +17,28 @@ _COLD_PERF_ENABLED = os.environ.get(
 ).lower() not in _FALSE_VALUES
 _cold_perf_request_ids: set[str] = set()
 _cold_perf_emitted: set[tuple[str, str]] = set()
+
+
+def _clock_domain() -> tuple[str, str]:
+    host = socket.gethostname()
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot = str(round(time.time() - time.monotonic()))
+    return host, f"{host}:{boot}"
+
+
+_HOST, _CLOCK_DOMAIN = _clock_domain()
+
+
+def cold_perf_clock_fields() -> dict[str, Any]:
+    """Return clock-safe correlation fields for one cold-performance event."""
+
+    return {
+        "wall_time_ns": time.time_ns(),
+        "host": _HOST,
+        "clock_domain": _CLOCK_DOMAIN,
+    }
 
 
 def cold_perf_enabled() -> bool:
@@ -72,6 +96,7 @@ def log_cold_perf_event(
         "event": event,
         "pid": os.getpid(),
         "monotonic_ms": round(time.perf_counter() * 1000, 3),
+        **cold_perf_clock_fields(),
         **fields,
     }
     if request_id is not None and len(ids) == 1:
@@ -115,6 +140,7 @@ def log_live_source_handoff(
                 "event": event,
                 "pid": os.getpid(),
                 "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **cold_perf_clock_fields(),
                 "req_id": request_id,
                 "source_present": source is not None,
                 "descriptor_count": len(descriptors),
