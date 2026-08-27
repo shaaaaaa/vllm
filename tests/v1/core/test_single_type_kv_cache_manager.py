@@ -440,7 +440,7 @@ def test_dsa_external_prefix_hit_allocates_every_latent_block(
     blocks = manager.req_to_blocks[request_id]
     assert len(blocks) == (prompt_len + 255) // 256
     assert all(block != block_pool.null_block for block in blocks)
-    assert not hasattr(manager, "_compact_external_prefix_tokens")
+    assert not manager._compact_external_prefix_tokens
 
 
 def test_dsa_compact_external_admission_reserves_scratch_and_live_tail():
@@ -554,7 +554,7 @@ def test_dsa_compact_external_load_failure_expands_dense_prefill():
     manager.scratch_blocks = 16
     manager.allocate_new_computed_blocks_compact_external("cold", [], 0, 8191)
     manager.free("cold")
-    assert not hasattr(manager, "_compact_external_released_blocks")
+    assert not manager._compact_external_released_blocks
 
     new_blocks = manager.allocate_new_blocks("cold", 5000, 4999)
     blocks = manager.req_to_blocks["cold"]

@@ -715,9 +715,9 @@ class DSALatentManager(FullAttentionManager):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Requests admitted from a complete external DSA hit keep only a
-        # compact latent working set. The indexer group is unaffected.
+        # Per-request state for complete external DSA hits.
         self._compact_external_prefix_tokens: dict[str, int] = {}
+        self._compact_external_released_blocks: dict[str, int] = {}
 
     def _blocks_per_bundle(self) -> int:
         return getattr(self.block_pool, "blocks_per_bundle", 1)
@@ -736,6 +736,7 @@ class DSALatentManager(FullAttentionManager):
         num_tokens: int,
         num_tokens_main_model: int,
         force_compact: bool = False,
+        released_blocks: int = 0,
     ) -> list[int]:
         """Return physical latent rows required by the current allocation.
 
@@ -748,24 +749,23 @@ class DSALatentManager(FullAttentionManager):
         required_blocks = self._round_up_to_bundle(
             cdiv(num_tokens, self.block_size)
         )
-        if force_compact:
-            # In DP mode the bootstrap rank performs a last-prompt-token shadow
-            # forward to preserve cross-rank collective order. Keep that final
-            # prompt bundle resident in addition to sparse retrieval scratch.
-            scratch_end = self._round_up_to_bundle(self.scratch_blocks)
-            final_prompt_idx = max(cdiv(prefix_tokens, self.block_size) - 1, 0)
-            final_bundle_start = self._round_down_to_bundle(final_prompt_idx)
-            final_bundle_end = self._round_up_to_bundle(final_prompt_idx + 1)
-            return list(range(scratch_end)) + list(
-                range(max(scratch_end, final_bundle_start), final_bundle_end)
-            )
-        if num_tokens_main_model <= prefix_tokens:
+        if not force_compact and num_tokens_main_model <= prefix_tokens:
             # External lookup/load failed: dense prefill needs a contiguous
             # latent prefix. Grow it chunk by chunk as scheduling progresses.
             return list(range(required_blocks))
 
         scratch_end = self._round_up_to_bundle(self.scratch_blocks)
-        tail_start = self._round_down_to_bundle(prefix_tokens // self.block_size)
+        tail_start = max(
+            self._round_down_to_bundle(prefix_tokens // self.block_size),
+            released_blocks,
+        )
+        if force_compact:
+            # A bootstrap shadow forward needs the final prompt bundle as well
+            # as every live tail block requested by this scheduler step.
+            final_prompt_idx = max(cdiv(prefix_tokens, self.block_size) - 1, 0)
+            tail_start = min(
+                tail_start, self._round_down_to_bundle(final_prompt_idx)
+            )
         return list(range(scratch_end)) + list(
             range(max(scratch_end, tail_start), required_blocks)
         )
@@ -791,6 +791,7 @@ class DSALatentManager(FullAttentionManager):
     ) -> int:
         """Admission cost for an initial complete external DSA hit."""
         self._compact_external_prefix_tokens[request_id] = total_computed_tokens
+        self._compact_external_released_blocks.setdefault(request_id, 0)
         required_indices = self._compact_required_indices(
             total_computed_tokens,
             num_tokens,
@@ -819,7 +820,12 @@ class DSALatentManager(FullAttentionManager):
                 num_tokens_main_model,
             )
         required_indices = self._compact_required_indices(
-            prefix_tokens, num_tokens, num_tokens_main_model
+            prefix_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            released_blocks=self._compact_external_released_blocks.get(
+                request_id, 0
+            ),
         )
         return self._get_num_missing_blocks(
             request_id, required_indices
@@ -844,6 +850,7 @@ class DSALatentManager(FullAttentionManager):
         assert num_external_computed_tokens > 0
         prefix_tokens = num_local_computed_tokens + num_external_computed_tokens
         self._compact_external_prefix_tokens[request_id] = prefix_tokens
+        self._compact_external_released_blocks.setdefault(request_id, 0)
 
         scratch_blocks = self._round_up_to_bundle(self.scratch_blocks)
         allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
@@ -890,6 +897,9 @@ class DSALatentManager(FullAttentionManager):
             num_tokens,
             num_tokens_main_model,
             force_compact=force_compact,
+            released_blocks=self._compact_external_released_blocks.get(
+                request_id, 0
+            ),
         )
         req_blocks = self.req_to_blocks[request_id]
         if required_indices:
@@ -948,7 +958,7 @@ class DSALatentManager(FullAttentionManager):
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
-        if request_id not in self._compact_external_prefix_tokens:
+        if not self.is_compact_external(request_id):
             return super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
             )
@@ -989,6 +999,7 @@ class DSALatentManager(FullAttentionManager):
 
     def free(self, request_id: str) -> None:
         prefix_tokens = self._compact_external_prefix_tokens.pop(request_id, None)
+        self._compact_external_released_blocks.pop(request_id, None)
         if prefix_tokens is not None:
             req_blocks = self.req_to_blocks.get(request_id, ())
             logger.info(
