@@ -632,6 +632,11 @@ def _check_enough_kv_cache_memory(
             "for more details."
         )
 
+    # Temporarily allow startup even when a full-max-length request would not
+    # fit in the available KV cache memory. Runtime allocation remains bounded
+    # by the actual number of cache blocks.
+    return
+
     needed_memory = get_needed_memory()
 
     if needed_memory > available_memory:
