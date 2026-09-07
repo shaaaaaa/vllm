@@ -35,6 +35,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.v1.cold_start_perf import COLD_START_PERF_ENABLED
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -81,9 +82,9 @@ def _mtp_dw_diag_enabled() -> bool:
 
 
 def _mtp_dw_deep_diag_enabled() -> bool:
-    return _mtp_dw_diag_enabled() and os.getenv(
-        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
-    ) == "1"
+    return (
+        _mtp_dw_diag_enabled() and os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0") == "1"
+    )
 
 
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
@@ -140,9 +141,7 @@ def _mtp_dw_sample_deep_transition(
     return True
 
 
-def _mtp_dw_sample_deep_completion(
-    owner: Any, req_id: str, window_end: int
-) -> bool:
+def _mtp_dw_sample_deep_completion(owner: Any, req_id: str, window_end: int) -> bool:
     first_window_end = _mtp_dw_window_size()
     if (
         not _mtp_dw_deep_diag_enabled()
@@ -511,12 +510,13 @@ class Scheduler(SchedulerInterface):
         bootstrap_only_step = self._bootstrap_sample_ready
         if bootstrap_only_step:
             self._bootstrap_sample_ready = False
-            logger.info(
-                "[BOOTSTRAP_SCHED_ISOLATE_BEGIN] running=%d "
-                "max_running=%d action=pause_running_for_one_step",
-                len(self.running),
-                self.max_num_running_reqs,
-            )
+            if COLD_START_PERF_ENABLED:
+                logger.info(
+                    "[BOOTSTRAP_SCHED_ISOLATE_BEGIN] running=%d "
+                    "max_running=%d action=pause_running_for_one_step",
+                    len(self.running),
+                    self.max_num_running_reqs,
+                )
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -725,10 +725,7 @@ class Scheduler(SchedulerInterface):
                 # Bootstrap is sampler-only logical work. A backend may still
                 # execute a target shadow for DP/EP collective alignment. Keep
                 # it homogeneous so normal target outputs are never mixed in.
-                if (
-                    bootstrap_sample_req_ids
-                    and not request.bootstrap_sample_pending
-                ):
+                if bootstrap_sample_req_ids and not request.bootstrap_sample_pending:
                     break
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -819,7 +816,7 @@ class Scheduler(SchedulerInterface):
                     and num_computed_tokens == request.num_prompt_tokens
                     and request.num_tokens == request.num_prompt_tokens
                 )
-                if request.bootstrap_sample_pending:
+                if COLD_START_PERF_ENABLED and request.bootstrap_sample_pending:
                     logger.info(
                         "[BOOTSTRAP_LOOKUP_RESULT] req=%s prompt_tokens=%d "
                         "request_tokens=%d local_tokens=%d external_tokens=%d "
@@ -854,11 +851,12 @@ class Scheduler(SchedulerInterface):
                     # Preserve the work-kind isolation for this step. A stale
                     # artifact that missed lookup can prefill normally on the
                     # next scheduler iteration.
-                    logger.info(
-                        "[BOOTSTRAP_SCHED_DEFER] req=%s reason=isolated_step_miss "
-                        "next_step=normal_prefill",
-                        request_id,
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        logger.info(
+                            "[BOOTSTRAP_SCHED_DEFER] req=%s reason=isolated_step_miss "
+                            "next_step=normal_prefill",
+                            request_id,
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -870,24 +868,27 @@ class Scheduler(SchedulerInterface):
                     # Do not mix a sampler-only bootstrap with target forwards
                     # that were already selected from the RUNNING queue.
                     self._bootstrap_sample_ready = True
-                    logger.info(
-                        "[BOOTSTRAP_SCHED_DEFER] req=%s "
-                        "reason=normal_work_already_scheduled "
-                        "scheduled_requests=%s next_step=bootstrap_only",
-                        request_id,
-                        list(num_scheduled_tokens),
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        logger.info(
+                            "[BOOTSTRAP_SCHED_DEFER] req=%s "
+                            "reason=normal_work_already_scheduled "
+                            "scheduled_requests=%s next_step=bootstrap_only",
+                            request_id,
+                            list(num_scheduled_tokens),
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
                 if bootstrap_sample_req_ids and not bootstrap_full_hit:
                     # The current bootstrap batch is already homogeneous. A
                     # request whose artifact missed can prefill next step.
-                    logger.info(
-                        "[BOOTSTRAP_SCHED_DEFER] req=%s "
-                        "reason=bootstrap_batch_already_active next_step=normal_prefill",
-                        request_id,
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        logger.info(
+                            "[BOOTSTRAP_SCHED_DEFER] req=%s "
+                            "reason=bootstrap_batch_already_active "
+                            "next_step=normal_prefill",
+                            request_id,
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -987,7 +988,7 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                 )
-                if bootstrap_full_hit:
+                if COLD_START_PERF_ENABLED and bootstrap_full_hit:
                     logger.info(
                         "[BOOTSTRAP_ALLOCATE_BEGIN] req=%s compact=%s "
                         "new_tokens=%d external_tokens=%d lookahead_tokens=%d "
@@ -1091,41 +1092,38 @@ class Scheduler(SchedulerInterface):
                     if bootstrap_sample_req_ids is None:
                         bootstrap_sample_req_ids = set()
                     bootstrap_sample_req_ids.add(request_id)
-                    allocated_groups = self.kv_cache_manager.get_blocks(
-                        request_id
-                    ).blocks
-                    logger.info(
-                        "[BOOTSTRAP_SCHEDULED] req=%s prompt_tokens=%d "
-                        "logical_work_tokens=%d compact=%s group_layout=%s",
-                        request_id,
-                        request.num_prompt_tokens,
-                        num_new_tokens,
-                        request.dsa_compact_allocated,
-                        [
-                            {
-                                "group": group_index,
-                                "logical": len(group),
-                                "resident": sum(
-                                    not block.is_null for block in group
-                                ),
-                                "null": sum(block.is_null for block in group),
-                                "head_ids": [
-                                    block.block_id for block in group[:4]
-                                ],
-                                "tail_ids": [
-                                    block.block_id for block in group[-4:]
-                                ],
-                            }
-                            for group_index, group in enumerate(allocated_groups)
-                        ],
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        allocated_groups = self.kv_cache_manager.get_blocks(
+                            request_id
+                        ).blocks
+                        logger.info(
+                            "[BOOTSTRAP_SCHEDULED] req=%s prompt_tokens=%d "
+                            "logical_work_tokens=%d compact=%s group_layout=%s",
+                            request_id,
+                            request.num_prompt_tokens,
+                            num_new_tokens,
+                            request.dsa_compact_allocated,
+                            [
+                                {
+                                    "group": group_index,
+                                    "logical": len(group),
+                                    "resident": sum(
+                                        not block.is_null for block in group
+                                    ),
+                                    "null": sum(block.is_null for block in group),
+                                    "head_ids": [block.block_id for block in group[:4]],
+                                    "tail_ids": [
+                                        block.block_id for block in group[-4:]
+                                    ],
+                                }
+                                for group_index, group in enumerate(allocated_groups)
+                            ],
+                        )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
-                num_cached_tokens = min(
-                    num_computed_tokens, request.num_prompt_tokens
-                )
+                num_cached_tokens = min(num_computed_tokens, request.num_prompt_tokens)
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_cached_tokens
                 elif num_external_computed_tokens > 0:
@@ -1229,19 +1227,20 @@ class Scheduler(SchedulerInterface):
                     capture_final_hidden_req_ids = capture_final_hidden_req_ids or set()
                     capture_final_hidden_req_ids.add(req_id)
                     capture_pending.discard(req_id)
-                    logger.info(
-                        "[FINAL_HIDDEN_SCHED_DECISION] req=%s "
-                        "computed_before=%d scheduled_tokens=%d "
-                        "computed_after=%d prompt_tokens=%d request_tokens=%d "
-                        "is_prefill_chunk=%s crosses_prompt_end=true capture=true",
-                        req_id,
-                        computed_before,
-                        num_tokens,
-                        computed_after,
-                        request.num_prompt_tokens,
-                        request.num_tokens,
-                        request.is_prefill_chunk,
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        logger.info(
+                            "[FINAL_HIDDEN_SCHED_DECISION] req=%s "
+                            "computed_before=%d scheduled_tokens=%d "
+                            "computed_after=%d prompt_tokens=%d request_tokens=%d "
+                            "is_prefill_chunk=%s crosses_prompt_end=true capture=true",
+                            req_id,
+                            computed_before,
+                            num_tokens,
+                            computed_after,
+                            request.num_prompt_tokens,
+                            request.num_tokens,
+                            request.is_prefill_chunk,
+                        )
             if not capture_pending:
                 del self._capture_final_hidden_pending
 
@@ -1691,22 +1690,27 @@ class Scheduler(SchedulerInterface):
                         "prompt_length": request.num_prompt_tokens,
                         "prompt_sha256": request.final_hidden_prompt_fingerprint,
                         "model_fingerprint": self.final_hidden_model_fingerprint,
-                        "producer_ready_unix_ns": time.time_ns(),
+                        **(
+                            {"producer_ready_unix_ns": time.time_ns()}
+                            if COLD_START_PERF_ENABLED
+                            else {}
+                        ),
                     }
                 )
                 request.captured_final_hidden = envelope
-                logger.info(
-                    "[FINAL_HIDDEN_ENVELOPE_READY] req=%s prompt_tokens=%d "
-                    "dtype=%s shape=%s data_bytes_b64=%d checksum=%s "
-                    "model_fingerprint=%s",
-                    req_id,
-                    request.num_prompt_tokens,
-                    envelope.get("dtype"),
-                    envelope.get("shape"),
-                    len(envelope.get("data", "")),
-                    str(envelope.get("data_sha256", ""))[:16],
-                    self.final_hidden_model_fingerprint[:16],
-                )
+                if COLD_START_PERF_ENABLED:
+                    logger.info(
+                        "[FINAL_HIDDEN_ENVELOPE_READY] req=%s prompt_tokens=%d "
+                        "dtype=%s shape=%s data_bytes_b64=%d checksum=%s "
+                        "model_fingerprint=%s",
+                        req_id,
+                        request.num_prompt_tokens,
+                        envelope.get("dtype"),
+                        envelope.get("shape"),
+                        len(envelope.get("data", "")),
+                        str(envelope.get("data_sha256", ""))[:16],
+                        self.final_hidden_model_fingerprint[:16],
+                    )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1760,14 +1764,15 @@ class Scheduler(SchedulerInterface):
                 req_id in (scheduler_output.bootstrap_sample_req_ids or ())
                 and generated_token_ids
             ):
-                logger.info(
-                    "[BOOTSTRAP_SCHED_COMPLETE] req=%s sampled_tokens=%s "
-                    "computed_tokens_before=%d compact=%s",
-                    req_id,
-                    generated_token_ids,
-                    request.num_computed_tokens,
-                    request.dsa_compact_allocated,
-                )
+                if COLD_START_PERF_ENABLED:
+                    logger.info(
+                        "[BOOTSTRAP_SCHED_COMPLETE] req=%s sampled_tokens=%s "
+                        "computed_tokens_before=%d compact=%s",
+                        req_id,
+                        generated_token_ids,
+                        request.num_computed_tokens,
+                        request.dsa_compact_allocated,
+                    )
                 request.bootstrap_sample_pending = False
                 request.bootstrap_final_hidden = None
 
@@ -1809,9 +1814,7 @@ class Scheduler(SchedulerInterface):
                         generated_token_ids
                     )
                     generated_ok = len(generated_token_ids) == num_accepted + 1
-                    rejected_ok = (
-                        num_rejected == num_draft_tokens - num_accepted
-                    )
+                    rejected_ok = num_rejected == num_draft_tokens - num_accepted
                     if (
                         _mtp_dw_sample_step(self, req_id, accepted_frontier)
                         or not generated_ok
@@ -1828,8 +1831,7 @@ class Scheduler(SchedulerInterface):
                             ],
                             generated_count=len(generated_token_ids),
                             generated_ids=[
-                                int(token_id)
-                                for token_id in generated_token_ids[:8]
+                                int(token_id) for token_id in generated_token_ids[:8]
                             ],
                             accepted_count=num_accepted,
                             rejected_count=num_rejected,
@@ -2247,9 +2249,7 @@ class Scheduler(SchedulerInterface):
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             if request.capture_final_hidden:
-                capture_pending = getattr(
-                    self, "_capture_final_hidden_pending", None
-                )
+                capture_pending = getattr(self, "_capture_final_hidden_pending", None)
                 if capture_pending is None:
                     capture_pending = set()
                     self._capture_final_hidden_pending = capture_pending
@@ -2288,14 +2288,15 @@ class Scheduler(SchedulerInterface):
                     request.bootstrap_sample_pending = False
                     request.bootstrap_final_hidden = None
                 else:
-                    logger.info(
-                        "[BOOTSTRAP_SCHED_ACCEPT] req=%s prompt_tokens=%d "
-                        "hidden_size=%d model=%s action=lookup_external_cache",
-                        request.request_id,
-                        request.num_prompt_tokens,
-                        self.final_hidden_size,
-                        self.final_hidden_model_fingerprint[:16],
-                    )
+                    if COLD_START_PERF_ENABLED:
+                        logger.info(
+                            "[BOOTSTRAP_SCHED_ACCEPT] req=%s prompt_tokens=%d "
+                            "hidden_size=%d model=%s action=lookup_external_cache",
+                            request.request_id,
+                            request.num_prompt_tokens,
+                            self.final_hidden_size,
+                            self.final_hidden_model_fingerprint[:16],
+                        )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2375,9 +2376,7 @@ class Scheduler(SchedulerInterface):
             finish_reason = request.get_finished_reason()
             output_tokens = request.num_output_tokens
             raw_max_tokens = getattr(request, "max_tokens", None)
-            max_tokens = (
-                int(raw_max_tokens) if raw_max_tokens is not None else None
-            )
+            max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else None
             status = request.status
             _mtp_dw_event(
                 "step",
@@ -2650,7 +2649,10 @@ class Scheduler(SchedulerInterface):
             # DSA two-group mode: group 0 is the MLA latent — the only group the
             # connector offloads (the indexer group stays NPU-resident), so
             # passing block_ids[0] to a non-HMA connector remains correct.
-            assert len(self.kv_cache_config.kv_cache_groups) == 1 or dsa_two_groups_enabled()
+            assert (
+                len(self.kv_cache_config.kv_cache_groups) == 1
+                or dsa_two_groups_enabled()
+            )
             return self.connector.request_finished(request, block_ids[0])
 
         return self.connector.request_finished_all_groups(request, block_ids)
@@ -2692,7 +2694,7 @@ class Scheduler(SchedulerInterface):
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
-            if request.bootstrap_sample_pending:
+            if COLD_START_PERF_ENABLED and request.bootstrap_sample_pending:
                 logger.info(
                     "[BOOTSTRAP_REMOTE_LOAD_COMPLETE] req=%s success=true "
                     "computed_tokens=%d prompt_tokens=%d external_tokens=%d "
@@ -2780,9 +2782,10 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
-        for req_id, committed_end in (
-            kv_connector_output.completed_decode_window_saves.items()
-        ):
+        for (
+            req_id,
+            committed_end,
+        ) in kv_connector_output.completed_decode_window_saves.items():
             request = self.requests.get(req_id)
             if request is None:
                 if _mtp_dw_sample_deep_completion(self, req_id, committed_end):
@@ -2794,9 +2797,7 @@ class Scheduler(SchedulerInterface):
                         tp_rank=None,
                         tp_world=None,
                         frontier=None,
-                        window_start=max(
-                            0, int(committed_end) - _mtp_dw_window_size()
-                        ),
+                        window_start=max(0, int(committed_end) - _mtp_dw_window_size()),
                         window_end=int(committed_end),
                         kv_group=None,
                         request_present=False,
@@ -2827,9 +2828,7 @@ class Scheduler(SchedulerInterface):
                     tp_rank=None,
                     tp_world=None,
                     frontier=int(request.num_tokens),
-                    window_start=max(
-                        0, int(committed_end) - _mtp_dw_window_size()
-                    ),
+                    window_start=max(0, int(committed_end) - _mtp_dw_window_size()),
                     window_end=int(committed_end),
                     kv_group=None,
                     request_present=True,
