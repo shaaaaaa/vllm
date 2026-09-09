@@ -35,7 +35,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.v1.cold_start_perf import COLD_START_PERF_ENABLED
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -510,7 +510,7 @@ class Scheduler(SchedulerInterface):
         bootstrap_only_step = self._bootstrap_sample_ready
         if bootstrap_only_step:
             self._bootstrap_sample_ready = False
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 logger.info(
                     "[BOOTSTRAP_SCHED_ISOLATE_BEGIN] running=%d "
                     "max_running=%d action=pause_running_for_one_step",
@@ -816,7 +816,7 @@ class Scheduler(SchedulerInterface):
                     and num_computed_tokens == request.num_prompt_tokens
                     and request.num_tokens == request.num_prompt_tokens
                 )
-                if COLD_START_PERF_ENABLED and request.bootstrap_sample_pending:
+                if SERVING_PERF_ENABLED and request.bootstrap_sample_pending:
                     logger.info(
                         "[BOOTSTRAP_LOOKUP_RESULT] req=%s prompt_tokens=%d "
                         "request_tokens=%d local_tokens=%d external_tokens=%d "
@@ -851,7 +851,7 @@ class Scheduler(SchedulerInterface):
                     # Preserve the work-kind isolation for this step. A stale
                     # artifact that missed lookup can prefill normally on the
                     # next scheduler iteration.
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         logger.info(
                             "[BOOTSTRAP_SCHED_DEFER] req=%s reason=isolated_step_miss "
                             "next_step=normal_prefill",
@@ -868,7 +868,7 @@ class Scheduler(SchedulerInterface):
                     # Do not mix a sampler-only bootstrap with target forwards
                     # that were already selected from the RUNNING queue.
                     self._bootstrap_sample_ready = True
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         logger.info(
                             "[BOOTSTRAP_SCHED_DEFER] req=%s "
                             "reason=normal_work_already_scheduled "
@@ -882,7 +882,7 @@ class Scheduler(SchedulerInterface):
                 if bootstrap_sample_req_ids and not bootstrap_full_hit:
                     # The current bootstrap batch is already homogeneous. A
                     # request whose artifact missed can prefill next step.
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         logger.info(
                             "[BOOTSTRAP_SCHED_DEFER] req=%s "
                             "reason=bootstrap_batch_already_active "
@@ -988,7 +988,7 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                 )
-                if COLD_START_PERF_ENABLED and bootstrap_full_hit:
+                if SERVING_PERF_ENABLED and bootstrap_full_hit:
                     logger.info(
                         "[BOOTSTRAP_ALLOCATE_BEGIN] req=%s compact=%s "
                         "new_tokens=%d external_tokens=%d lookahead_tokens=%d "
@@ -1092,7 +1092,7 @@ class Scheduler(SchedulerInterface):
                     if bootstrap_sample_req_ids is None:
                         bootstrap_sample_req_ids = set()
                     bootstrap_sample_req_ids.add(request_id)
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         allocated_groups = self.kv_cache_manager.get_blocks(
                             request_id
                         ).blocks
@@ -1227,7 +1227,7 @@ class Scheduler(SchedulerInterface):
                     capture_final_hidden_req_ids = capture_final_hidden_req_ids or set()
                     capture_final_hidden_req_ids.add(req_id)
                     capture_pending.discard(req_id)
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         logger.info(
                             "[FINAL_HIDDEN_SCHED_DECISION] req=%s "
                             "computed_before=%d scheduled_tokens=%d "
@@ -1692,13 +1692,13 @@ class Scheduler(SchedulerInterface):
                         "model_fingerprint": self.final_hidden_model_fingerprint,
                         **(
                             {"producer_ready_unix_ns": time.time_ns()}
-                            if COLD_START_PERF_ENABLED
+                            if SERVING_PERF_ENABLED
                             else {}
                         ),
                     }
                 )
                 request.captured_final_hidden = envelope
-                if COLD_START_PERF_ENABLED:
+                if SERVING_PERF_ENABLED:
                     logger.info(
                         "[FINAL_HIDDEN_ENVELOPE_READY] req=%s prompt_tokens=%d "
                         "dtype=%s shape=%s data_bytes_b64=%d checksum=%s "
@@ -1764,7 +1764,7 @@ class Scheduler(SchedulerInterface):
                 req_id in (scheduler_output.bootstrap_sample_req_ids or ())
                 and generated_token_ids
             ):
-                if COLD_START_PERF_ENABLED:
+                if SERVING_PERF_ENABLED:
                     logger.info(
                         "[BOOTSTRAP_SCHED_COMPLETE] req=%s sampled_tokens=%s "
                         "computed_tokens_before=%d compact=%s",
@@ -2288,7 +2288,7 @@ class Scheduler(SchedulerInterface):
                     request.bootstrap_sample_pending = False
                     request.bootstrap_final_hidden = None
                 else:
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         logger.info(
                             "[BOOTSTRAP_SCHED_ACCEPT] req=%s prompt_tokens=%d "
                             "hidden_size=%d model=%s action=lookup_external_cache",
@@ -2694,7 +2694,7 @@ class Scheduler(SchedulerInterface):
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
-            if COLD_START_PERF_ENABLED and request.bootstrap_sample_pending:
+            if SERVING_PERF_ENABLED and request.bootstrap_sample_pending:
                 logger.info(
                     "[BOOTSTRAP_REMOTE_LOAD_COMPLETE] req=%s success=true "
                     "computed_tokens=%d prompt_tokens=%d external_tokens=%d "

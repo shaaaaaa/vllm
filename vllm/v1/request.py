@@ -21,7 +21,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.cold_start_perf import COLD_START_PERF_ENABLED
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -188,7 +188,7 @@ class Request:
                     final_hidden = self.kv_transfer_params.get("bootstrap_final_hidden")
                     if validate_final_hidden_payload(final_hidden):
                         bootstrap_final_hidden = final_hidden
-                        if COLD_START_PERF_ENABLED:
+                        if SERVING_PERF_ENABLED:
                             decoder_engine_received_unix_ns = time.time_ns()
                             producer_ready_unix_ns = final_hidden.get(
                                 "producer_ready_unix_ns"
@@ -293,7 +293,7 @@ class Request:
             self.capture_final_hidden = True
             self.final_hidden_prompt_fingerprint = final_hidden_prompt_fingerprint
 
-        if COLD_START_PERF_ENABLED and capture_final_hidden:
+        if SERVING_PERF_ENABLED and capture_final_hidden:
             logger.info(
                 "[FINAL_HIDDEN_REQUEST_CAPTURE] req=%s enabled=true "
                 "prompt_tokens=%d prompt_hash=%s max_tokens=%d",
@@ -316,7 +316,7 @@ class Request:
                 self.final_hidden_prompt_fingerprint = final_hidden_prompt_fingerprint
                 self.bootstrap_final_hidden = bootstrap_final_hidden
                 self.bootstrap_sample_pending = True
-                if COLD_START_PERF_ENABLED:
+                if SERVING_PERF_ENABLED:
                     logger.info(
                         "[FINAL_HIDDEN_REQUEST_ACCEPTED] req=%s prompt_tokens=%d "
                         "prompt_hash=%s bootstrap_pending=true",

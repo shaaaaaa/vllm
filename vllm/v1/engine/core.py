@@ -36,7 +36,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.v1.cold_start_perf import COLD_START_PERF_ENABLED
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -388,22 +388,22 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             schedule_started = time.perf_counter()
         scheduler_output = self.scheduler.schedule()
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             schedule_ms = (time.perf_counter() - schedule_started) * 1000
             bootstrap_dispatch_trace = self._stamp_bootstrap_executor_dispatch(
                 scheduler_output
             )
             dispatch_started = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             execute_submit_ms = (time.perf_counter() - dispatch_started) * 1000
             self._log_bootstrap_executor_dispatch(bootstrap_dispatch_trace)
             grammar_started = time.perf_counter()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             grammar_ms = (time.perf_counter() - grammar_started) * 1000
             result_ready_before_wait = future.done()
             result_wait_started = time.perf_counter()
@@ -413,26 +413,26 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 result_wait_ms = (time.perf_counter() - result_wait_started) * 1000
             if model_output is None:
-                if COLD_START_PERF_ENABLED:
+                if SERVING_PERF_ENABLED:
                     sample_started = time.perf_counter()
                 model_output = self.model_executor.sample_tokens(grammar_output)
-                if COLD_START_PERF_ENABLED:
+                if SERVING_PERF_ENABLED:
                     sample_ms = (time.perf_counter() - sample_started) * 1000
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             dispatch_to_result_ms = (time.perf_counter() - dispatch_started) * 1000
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             update_started = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             update_ms = (time.perf_counter() - update_started) * 1000
             self._log_engine_step_timing(
                 scheduler_output,
@@ -487,10 +487,10 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 schedule_started = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 schedule_ms = (time.perf_counter() - schedule_started) * 1000
                 bootstrap_dispatch_trace = self._stamp_bootstrap_executor_dispatch(
                     scheduler_output
@@ -500,7 +500,7 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 execute_submit_ms = (time.perf_counter() - dispatch_started) * 1000
                 self._log_bootstrap_executor_dispatch(bootstrap_dispatch_trace)
                 grammar_ms = 0.0
@@ -515,18 +515,18 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         grammar_started = time.perf_counter()
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         grammar_ms = (time.perf_counter() - grammar_started) * 1000
                         sample_submit_started = time.perf_counter()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
-                    if COLD_START_PERF_ENABLED:
+                    if SERVING_PERF_ENABLED:
                         sample_submit_ms = (
                             time.perf_counter() - sample_submit_started
                         ) * 1000
@@ -535,7 +535,7 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 setattr(
                     scheduler_output,
                     "_engine_step_timing",
@@ -568,7 +568,7 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             batch_queue_depth = len(batch_queue) + 1
             result_ready_before_wait = future.done()
             result_wait_started = time.perf_counter()
@@ -577,14 +577,14 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 future_wait_ms = (time.perf_counter() - result_wait_started) * 1000
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             timing = getattr(scheduler_output, "_engine_step_timing", {})
             dispatch_started = timing.get("dispatch_started")
             dispatch_to_result_ms = (
@@ -596,12 +596,12 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             update_started = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        if COLD_START_PERF_ENABLED:
+        if SERVING_PERF_ENABLED:
             update_ms = (time.perf_counter() - update_started) * 1000
             self._log_engine_step_timing(
                 scheduler_output,
@@ -634,17 +634,17 @@ class EngineCore:
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 grammar_started = time.perf_counter()
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 timing = getattr(deferred_scheduler_output, "_engine_step_timing", {})
                 timing["grammar_ms"] = (time.perf_counter() - grammar_started) * 1000
                 sample_submit_started = time.perf_counter()
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            if COLD_START_PERF_ENABLED:
+            if SERVING_PERF_ENABLED:
                 timing["sample_submit_ms"] = (
                     time.perf_counter() - sample_submit_started
                 ) * 1000
@@ -676,7 +676,7 @@ class EngineCore:
         result_ready_before_wait: bool,
         batch_queue_depth: int,
     ) -> None:
-        if not COLD_START_PERF_ENABLED:
+        if not SERVING_PERF_ENABLED:
             return
         bootstrap_requests = sorted(
             getattr(scheduler_output, "bootstrap_sample_req_ids", None) or ()
@@ -726,7 +726,7 @@ class EngineCore:
     def _stamp_bootstrap_executor_dispatch(
         scheduler_output: SchedulerOutput,
     ) -> tuple[list[str], dict[str, float | None]] | None:
-        if not COLD_START_PERF_ENABLED:
+        if not SERVING_PERF_ENABLED:
             return
         payloads = getattr(scheduler_output, "bootstrap_final_hiddens", None)
         if not payloads:
@@ -748,7 +748,7 @@ class EngineCore:
     def _log_bootstrap_executor_dispatch(
         trace: tuple[list[str], dict[str, float | None]] | None,
     ) -> None:
-        if not COLD_START_PERF_ENABLED:
+        if not SERVING_PERF_ENABLED:
             return
         if trace is None:
             return
@@ -1454,7 +1454,7 @@ class EngineCoreProc(EngineCore):
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             payload = req.bootstrap_final_hidden
-            if payload is not None and COLD_START_PERF_ENABLED:
+            if payload is not None and SERVING_PERF_ENABLED:
                 dequeued_unix_ns = time.time_ns()
                 enqueued_unix_ns = payload.get("decoder_input_enqueued_unix_ns")
                 engine_received_unix_ns = payload.get("decoder_engine_received_unix_ns")
@@ -1648,7 +1648,7 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         preprocess_started = (
-                            time.perf_counter() if COLD_START_PERF_ENABLED else 0.0
+                            time.perf_counter() if SERVING_PERF_ENABLED else 0.0
                         )
                         try:
                             request = self.preprocess_add_request(req)
@@ -1657,7 +1657,7 @@ class EngineCoreProc(EngineCore):
                             continue
                         prepared_req = request[0]
                         payload = prepared_req.bootstrap_final_hidden
-                        if payload is not None and COLD_START_PERF_ENABLED:
+                        if payload is not None and SERVING_PERF_ENABLED:
                             enqueued_unix_ns = time.time_ns()
                             engine_received_unix_ns = payload.get(
                                 "decoder_engine_received_unix_ns"
@@ -1673,7 +1673,7 @@ class EngineCoreProc(EngineCore):
                                 (
                                     (
                                         time.perf_counter()
-                                        if COLD_START_PERF_ENABLED
+                                        if SERVING_PERF_ENABLED
                                         else 0.0
                                     )
                                     - preprocess_started

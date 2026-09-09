@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    PD_SERVING_PERF: str = "0"
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -472,6 +473,11 @@ def get_env_or_set_default(
 logger = logging.getLogger(__name__)
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Shared PD serving timing; non-sensitive and configured before startup.
+    # 0/empty/false/no/off disable it; 1 enables host timing; detail adds host
+    # detail; device opts into device timing in supported components. Other
+    # nonfalse values enable host timing. Register for propagation to Ray workers.
+    "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
