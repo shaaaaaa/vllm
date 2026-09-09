@@ -295,6 +295,24 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def begin_sparse_decode_graph_step(
+        self, forward_context: "ForwardContext"
+    ) -> bool:
+        """Bind graph-external sparse sources for the upcoming forward.
+
+        Connectors that can replay selective host-to-device KV loads from a
+        device graph may override this hook. It runs after connector metadata
+        is bound and before :meth:`start_load_kv`. Returning ``False`` keeps
+        the model runner on its ordinary eager connector path.
+        """
+        return False
+
+    def end_sparse_decode_graph_step(
+        self, forward_context: "ForwardContext"
+    ) -> None:
+        """Release or fence resources acquired by the matching begin hook."""
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """

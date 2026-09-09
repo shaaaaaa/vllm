@@ -116,16 +116,32 @@ class KVConnectorModelRunnerMixin:
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
+        forward_context = get_forward_context()
+        sparse_graph_step_ready = False
+        sparse_graph_step_ended = False
+
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         defer_clear = defer_finalize
         try:
-            kv_connector.start_load_kv(get_forward_context())
+            sparse_graph_step_ready = (
+                kv_connector.begin_sparse_decode_graph_step(forward_context)
+            )
+            # Platform model runners use this result to retain their graph
+            # route or fall back before model execution. The attribute is
+            # optional so connectors and runners can adopt it gradually.
+            forward_context.kv_connector_sparse_decode_graph_ready = bool(
+                sparse_graph_step_ready
+            )
+            kv_connector.start_load_kv(forward_context)
             try:
                 yield output
             finally:
+                if sparse_graph_step_ready:
+                    sparse_graph_step_ended = True
+                    kv_connector.end_sparse_decode_graph_step(forward_context)
                 if wait_for_save and not defer_finalize:
                     kv_connector.wait_for_save()
 
@@ -150,6 +166,8 @@ class KVConnectorModelRunnerMixin:
             defer_clear = False
             raise
         finally:
+            if sparse_graph_step_ready and not sparse_graph_step_ended:
+                kv_connector.end_sparse_decode_graph_step(forward_context)
             if not defer_clear:
                 kv_connector.clear_connector_metadata()
 
