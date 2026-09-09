@@ -234,6 +234,8 @@ class Scheduler(SchedulerInterface):
             and self.parallel_config.decode_context_parallel_size == 1
             and supported_speculative_config
         )
+        # schedule() reads this flag even when final-hidden bootstrap is disabled.
+        self._bootstrap_sample_ready = False
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
