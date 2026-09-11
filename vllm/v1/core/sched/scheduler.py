@@ -2440,6 +2440,10 @@ class Scheduler(SchedulerInterface):
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
+        # A cancelled/failed receiver may also owe an asynchronous store
+        # acknowledgement. Neither completion alone may retire its blocks.
+        request.kv_transfer_pending_recv = delay_free_blocks
+        request.kv_transfer_pending_send = connector_delay_free_blocks
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
@@ -2775,9 +2779,8 @@ class Scheduler(SchedulerInterface):
 
         The Worker side connectors add finished_recving and
         finished_sending reqs to the output.
-        * if finished_sending: free the blocks
-        # if finished_recving: add to state so we can
-            schedule the request during the next step.
+        Active receivers become schedulable after finished_recving. Finished
+        requests retain blocks until both receive and send obligations complete.
         """
 
         if self.connector is not None:
@@ -2853,11 +2856,17 @@ class Scheduler(SchedulerInterface):
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                req.kv_transfer_pending_recv = False
+                if not req.kv_transfer_pending_send:
+                    self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests[req_id]
+            assert req.is_finished()
+            req.kv_transfer_pending_send = False
+            if not req.kv_transfer_pending_recv:
+                self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,
