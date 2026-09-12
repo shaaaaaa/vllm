@@ -122,6 +122,20 @@ def new_kv_cache_spec(
     )
 
 
+def new_mla_cache_spec(
+    block_size=4,
+    num_kv_heads=1,
+    head_size=8,
+    dtype=torch.float32,
+):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+
+
 def new_sliding_window_spec(
     block_size=16,
     num_kv_heads=2,
@@ -194,6 +208,62 @@ def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
             config,
             groups,
             available_memory=0,
+        )
+
+
+def _dsa_cold_compact_config(max_model_len=100):
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=max_model_len))
+    vllm_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
+    return vllm_config
+
+
+def _dsa_cold_compact_specs():
+    return {
+        "latent": new_mla_cache_spec(head_size=8),
+        "indexer": new_mla_cache_spec(head_size=4),
+    }
+
+
+def _enable_dsa_shared_cold_compact(monkeypatch, enabled: bool):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    monkeypatch.setenv(
+        "LMCACHE_ENABLE_DSA_COLD_COMPACT_LOAD", "true" if enabled else "false"
+    )
+
+
+def test_dsa_cold_compact_capacity_off_uses_full_context(monkeypatch):
+    _enable_dsa_shared_cold_compact(monkeypatch, enabled=False)
+
+    with pytest.raises(ValueError, match="KV cache is needed"):
+        get_kv_cache_configs(
+            _dsa_cold_compact_config(),
+            [_dsa_cold_compact_specs()],
+            [3000],
+        )
+
+
+def test_dsa_cold_compact_capacity_uses_sparse_decode_residency(monkeypatch):
+    _enable_dsa_shared_cold_compact(monkeypatch, enabled=True)
+
+    configs = get_kv_cache_configs(
+        _dsa_cold_compact_config(),
+        [_dsa_cold_compact_specs()],
+        [3000],
+    )
+
+    assert configs[0].num_blocks == 22
+
+
+def test_dsa_cold_compact_capacity_still_requires_sparse_decode_memory(monkeypatch):
+    _enable_dsa_shared_cold_compact(monkeypatch, enabled=True)
+
+    with pytest.raises(ValueError, match="KV cache is needed"):
+        get_kv_cache_configs(
+            _dsa_cold_compact_config(),
+            [_dsa_cold_compact_specs()],
+            [2000],
         )
 
 

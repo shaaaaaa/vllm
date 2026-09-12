@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
+from vllm.v1.core.dsa_shared_pool import dsa_scratch_blocks_for_topk
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -1800,17 +1801,49 @@ def _max_memory_usage_bytes_from_groups(
                 latent_group.kv_cache_spec.page_size_bytes,
                 indexer_group.kv_cache_spec.page_size_bytes,
             )
-            blocks = cdiv(
-                latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-                latent_group.kv_cache_spec.page_size_bytes,
+            latent_blocks_per_bundle = (
+                bundle_page // latent_group.kv_cache_spec.page_size_bytes
             )
-            bundles = cdiv(
-                blocks,
-                bundle_page // latent_group.kv_cache_spec.page_size_bytes,
-            ) + cdiv(
-                blocks,
-                bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
+            indexer_blocks_per_bundle = (
+                bundle_page // indexer_group.kv_cache_spec.page_size_bytes
             )
+            if (
+                os.getenv("LMCACHE_ENABLE_DSA_COLD_COMPACT_LOAD", "").lower()
+                == "true"
+                and dsa_shrink_stage() == 2
+            ):
+                hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+                if hf_config is None:
+                    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+                dsa_index_topk = getattr(hf_config, "index_topk", None)
+                dsa_sparse_rows = (
+                    max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0)
+                    + 1
+                )
+                scratch_blocks = (
+                    dsa_scratch_blocks_for_topk(
+                        dsa_index_topk,
+                        latent_group.kv_cache_spec.block_size,
+                        dsa_sparse_rows,
+                    )
+                    if dsa_index_topk is not None
+                    else 0
+                )
+                indexer_ctx_blocks = cdiv(
+                    vllm_config.model_config.max_model_len,
+                    indexer_group.kv_cache_spec.block_size,
+                )
+                bundles = cdiv(
+                    scratch_blocks, latent_blocks_per_bundle
+                ) + cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
+            else:
+                blocks = cdiv(
+                    latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    latent_group.kv_cache_spec.page_size_bytes,
+                )
+                bundles = cdiv(
+                    blocks, latent_blocks_per_bundle
+                ) + cdiv(blocks, indexer_blocks_per_bundle)
             return len(latent_group.layer_names) * (bundles + 1) * bundle_page
 
         total = 0
