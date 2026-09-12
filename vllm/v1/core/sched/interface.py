@@ -184,15 +184,7 @@ class SchedulerInterface(ABC):
     def has_requests(self) -> bool:
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
-        return (
-            self.has_unfinished_requests()
-            or self.has_finished_requests()
-            or self.has_pending_connector_control()
-        )
-
-    def has_pending_connector_control(self) -> bool:
-        """Allow idle connector cleanup without inventing unfinished requests."""
-        return False
+        return self.has_unfinished_requests() or self.has_finished_requests()
 
     @property
     @abstractmethod

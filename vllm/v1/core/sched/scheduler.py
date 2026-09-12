@@ -1319,7 +1319,6 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        request.kv_resume_checkpoint = None
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -2478,10 +2477,6 @@ class Scheduler(SchedulerInterface):
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
-
-    def has_pending_connector_control(self) -> bool:
-        pending = getattr(self.connector, "has_pending_control", None)
-        return bool(pending and pending())
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

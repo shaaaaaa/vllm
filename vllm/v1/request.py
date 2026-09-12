@@ -122,9 +122,6 @@ class Request:
     kv_transfer_pending_recv: bool = False
     kv_transfer_pending_send: bool = False
 
-    # Internal connector proof: (preemption generation, history length, KV end).
-    # It does not change prompt/output accounting or the external request API.
-    kv_resume_checkpoint: tuple[int, int, int] | None = None
     # Final-hidden handoff state is intentionally lazy. Ordinary requests use
     # these immutable class defaults and do not grow their instance __dict__.
     capture_final_hidden = False
