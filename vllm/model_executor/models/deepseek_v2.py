@@ -76,7 +76,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.utils import (
+    extract_layer_index,
+    sequence_parallel_chunk,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -940,7 +943,95 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.is_v32 = hasattr(config, "index_topk")
 
+        # IndexCache config
+        # Refer: https://arxiv.org/abs/2603.12201 for more details.
+        #
+        # Two orthogonal flags are derived here:
+        # - _skip_topk: this structural consumer reuses an earlier producer's
+        #   top-k indices. Legacy runtime overrides retain production behavior.
+        # - _indexer_omitted: the checkpoint has no indexer weights for this
+        #   layer (structural omission, e.g. GLM-5.2 "shared" layers), so no
+        #   Indexer module may be constructed.
+        # Keep module ownership explicit; a full producer and MTP layer must
+        # still construct and load all of their indexer weights.
+        _skip_topk = False
+        _indexer_omitted = False
+        is_mtp_layer = False
         if self.is_v32:
+            # Only parse the DSA layer id for v3.2-style models; other models
+            # can contain multiple integers in their prefixes.
+            layer_id = extract_layer_index(prefix)
+
+            _num_hidden_layers = getattr(config, "num_hidden_layers", None)
+            # The skip pattern only governs backbone layers. MTP/nextn layers
+            # (layer_id >= num_hidden_layers) always build a full indexer: they
+            # compute indices at draft step 0 and toggle at runtime via
+            # set_skip_topk (index_share_for_mtp_iteration).
+            is_mtp_layer = (
+                _num_hidden_layers is not None and layer_id >= _num_hidden_layers
+            )
+
+            _indexer_types = getattr(config, "indexer_types", None)
+            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            if _index_topk_pattern is not None and not isinstance(
+                _index_topk_pattern, list | tuple
+            ):
+                _index_topk_pattern = None
+
+            if _indexer_types is not None:
+                # Checkpoint-level indexer sharing (GLM-5.2): "full" layers are
+                # top-k producers with their own indexer weights, "shared"
+                # layers have no indexer weights in the checkpoint and read the
+                # top-k indices written by the nearest preceding producer.
+                if _num_hidden_layers is None or len(_indexer_types) != (
+                    _num_hidden_layers
+                ):
+                    raise ValueError(
+                        "indexer_types must have exactly num_hidden_layers "
+                        f"entries, got len={len(_indexer_types)} "
+                        f"num_hidden_layers={_num_hidden_layers}."
+                    )
+                invalid_types = sorted(
+                    {t for t in _indexer_types if t not in ("full", "shared")}
+                )
+                if invalid_types:
+                    raise ValueError(
+                        "indexer_types entries must be 'full' or 'shared', "
+                        f"got unexpected values: {invalid_types}."
+                    )
+                if _indexer_types[0] != "full":
+                    raise ValueError(
+                        "indexer_types must start with a 'full' producer "
+                        "layer: a shared consumer cannot read the shared "
+                        "top-k buffer before any producer has written it."
+                    )
+                if _index_topk_pattern is not None and len(_index_topk_pattern) == len(
+                    _indexer_types
+                ):
+                    # Cross-validate the two encodings of the same contract.
+                    for li, (pattern_entry, type_entry) in enumerate(
+                        zip(_index_topk_pattern, _indexer_types)
+                    ):
+                        if (pattern_entry == "S") != (type_entry == "shared"):
+                            raise ValueError(
+                                "index_topk_pattern and indexer_types disagree "
+                                f"at layer {li}: pattern={pattern_entry!r} "
+                                f"indexer_type={type_entry!r}."
+                            )
+                if is_mtp_layer:
+                    # MTP layers are not covered by backbone indexer_types;
+                    # they always keep a full indexer.
+                    pass
+                elif _indexer_types[layer_id] == "shared":
+                    _skip_topk = True
+                    _indexer_omitted = True
+            if is_mtp_layer:
+                _skip_topk = False
+                _indexer_omitted = False
+
+        self.skip_topk = _skip_topk
+
+        if self.is_v32 and not _indexer_omitted:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -979,6 +1070,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            skip_topk=self.skip_topk,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1461,6 +1553,15 @@ class DeepseekV2ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # With a shared indexer (GLM-5.2 indexer_types) only some layers build
+        # an indexer, yet the checkpoint may still ship indexer weights for
+        # the omitted layers. Track the prefixes that actually instantiated an
+        # indexer so only those weights can be dropped; missing weights for a
+        # constructed (producer) indexer must still fail the loader gate.
+        indexer_present_prefixes = {
+            n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+        }
+        skipped_omitted_indexer_weights = 0
         skip_extra_layer_weights = getattr(
             self.config, "vllm_skip_extra_layer_weights", False
         )
@@ -1479,6 +1580,12 @@ class DeepseekV2ForCausalLM(
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            if ".indexer." in name and (
+                name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+            ):
+                skipped_omitted_indexer_weights += 1
+                continue  # this layer has no indexer; drop its checkpoint weights
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
@@ -1637,6 +1744,24 @@ class DeepseekV2ForCausalLM(
                         weight_loader(param, loaded_weight)
             if name is not None and not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
+
+        if skipped_omitted_indexer_weights:
+            producer_indexer_layers = sorted(
+                {
+                    p.split(".layers.")[-1].split(".")[0]
+                    for p in indexer_present_prefixes
+                    if ".layers." in p
+                },
+                key=lambda s: int(s) if s.isdigit() else s,
+            )
+            logger.info(
+                "Dropped %d checkpoint indexer weights for layers without a "
+                "constructed indexer; %d layers kept their producer indexer "
+                "(layer ids: %s).",
+                skipped_omitted_indexer_weights,
+                len(producer_indexer_layers),
+                producer_indexer_layers,
+            )
 
         return loaded_params
 

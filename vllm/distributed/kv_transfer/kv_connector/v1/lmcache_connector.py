@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+from vllm.utils.func_utils import supports_kw
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -110,7 +111,21 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
             cls = LMCacheConnectorLatestImpl
 
-        self._lmcache_engine = cls(vllm_config, role, self)
+        if supports_kw(cls, "kv_cache_config"):
+            self._lmcache_engine = cls(
+                vllm_config,
+                role,
+                self,
+                kv_cache_config=kv_cache_config,
+            )
+        else:
+            if len(kv_cache_config.kv_cache_groups) > 1:
+                raise ValueError(
+                    f"{cls.__name__} does not accept runtime KV cache topology "
+                    "and cannot serve a multi-group model. Upgrade the LMCache "
+                    "implementation or disable the native adapter."
+                )
+            self._lmcache_engine = cls(vllm_config, role, self)
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 

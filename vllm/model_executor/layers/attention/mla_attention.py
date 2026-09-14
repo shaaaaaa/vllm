@@ -303,6 +303,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         use_sparse: bool = False,
         indexer: object | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
+        skip_topk: bool = False,
         **extra_impl_args,
     ):
         super().__init__()
@@ -317,6 +319,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+        self.skip_topk = skip_topk
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -386,6 +389,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_config.enable_prefix_caching = False
 
         impl_cls = cast(type[MLAAttentionImpl], self.attn_backend.get_impl_cls())
+        # Sparse MLA reads top-k indices from a shared buffer. Pass it
+        # explicitly so backbone shared-consumer layers (indexer=None) still
+        # find it, together with the layer's compute-sharing flag.
+        if use_sparse:
+            extra_impl_args["topk_indices_buffer"] = topk_indices_buffer
+            extra_impl_args["skip_topk"] = skip_topk
         self.impl = impl_cls(
             num_heads=self.num_heads,
             head_size=self.head_size,

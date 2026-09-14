@@ -1017,6 +1017,60 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _get_kv_cache_groups_dsa_two_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """
+    Generates exactly two role groups for DSA un-bundled models.
+
+    Unlike `_get_kv_cache_groups_uniform_page_size`, this never splits a
+    semantic role into count-aligned sub-groups. Shared-indexer models such
+    as GLM-5.2 register an unequal number of LATENT (e.g. 79 with MTP) and
+    INDEXER (e.g. 22) layers; the two-group protocol (per-group block pools,
+    KV connectors, LMCache) requires exactly one LATENT group and one
+    INDEXER group whose layer counts may differ.
+
+    Args:
+        kv_cache_spec: The KVCacheSpec of each attention layer in the model
+    Returns:
+        The generated KVCacheGroupSpecs (group 0 = LATENT, group 1 = INDEXER)
+    """
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_type_layers[layer_spec].append(layer_name)
+    if len(same_type_layers) != 2:
+        raise ValueError(
+            "DSA two-group mode expects exactly two KV cache specs "
+            "(latent + indexer), got "
+            f"{len(same_type_layers)} distinct specs."
+        )
+    groups = [
+        KVCacheGroupSpec(layer_names, spec)
+        for spec, layer_names in same_type_layers.items()
+    ]
+    # Sort by descending page size so the latent group is group 0 (KV
+    # connectors that only handle the latent consume block_ids[0]).
+    groups.sort(key=lambda g: -g.kv_cache_spec.page_size_bytes)
+    latent_layers = len(groups[0].layer_names)
+    indexer_layers = len(groups[1].layer_names)
+    if indexer_layers <= 0 or indexer_layers > latent_layers:
+        raise ValueError(
+            "DSA two-group mode expects 0 < indexer_layers <= latent_layers, "
+            f"got latent={latent_layers} indexer={indexer_layers}. Shared "
+            "consumers register no INDEXER cache and producers are a subset "
+            "of the LATENT layers."
+        )
+    logger.info(
+        "DSA two-group KV cache groups: latent=%d layers (page %.2f MiB), "
+        "indexer=%d layers (page %.2f MiB).",
+        latent_layers,
+        groups[0].kv_cache_spec.page_size_bytes / 2**20,
+        indexer_layers,
+        groups[1].kv_cache_spec.page_size_bytes / 2**20,
+    )
+    return groups
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1206,9 +1260,13 @@ def get_kv_cache_config_from_groups(
             indexer_group = min(
                 kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
             )
-            if len(latent_group.layer_names) != len(indexer_group.layer_names):
+            latent_layers = len(latent_group.layer_names)
+            indexer_layers = len(indexer_group.layer_names)
+            if not 0 < indexer_layers <= latent_layers:
                 raise ValueError(
-                    "DSA shared pool expects one indexer layer per latent layer."
+                    "DSA shared pool expects at most one indexer layer per "
+                    f"latent layer, got latent={latent_layers} "
+                    f"indexer={indexer_layers}."
                 )
 
             latent_page = latent_group.kv_cache_spec.page_size_bytes
@@ -1216,8 +1274,14 @@ def get_kv_cache_config_from_groups(
             bundle_page = lcm(latent_page, indexer_page)
             latent_blocks_per_bundle = bundle_page // latent_page
             indexer_blocks_per_bundle = bundle_page // indexer_page
-            num_layer_pairs = len(latent_group.layer_names)
-            slot_count = available_memory // (num_layer_pairs * bundle_page)
+            # Every LATENT layer owns one raw bundle-page slab so a bundle id
+            # maps to the same offset in every layer tensor. With a shared
+            # indexer (GLM-5.2) only `indexer_layers` slabs additionally
+            # expose an INDEXER view; the remaining latent-only slabs still
+            # occupy physical bytes, so capacity is billed conservatively on
+            # the full latent layer count.
+            num_physical_tensors = latent_layers
+            slot_count = available_memory // (num_physical_tensors * bundle_page)
             natural_bundles = slot_count - 1
             num_bundles = may_override_num_blocks(
                 vllm_config,
@@ -1248,8 +1312,9 @@ def get_kv_cache_config_from_groups(
                 "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
                 "latent_page=%.2f MiB indexer_page=%.2f MiB "
                 "bundle_page=%.2f MiB latent_blocks_per_bundle=%d "
-                "indexer_blocks_per_bundle=%d layer_pairs=%d "
-                "natural_shared_bundles=%d natural_nonshared_blocks_per_group=%d.",
+                "indexer_blocks_per_bundle=%d latent_layers=%d "
+                "indexer_layers=%d natural_shared_bundles=%d "
+                "natural_nonshared_blocks_per_group=%d.",
                 gpu_mem_util,
                 kv_mem_override,
                 available_memory / 2**30,
@@ -1258,12 +1323,13 @@ def get_kv_cache_config_from_groups(
                 bundle_page / 2**20,
                 latent_blocks_per_bundle,
                 indexer_blocks_per_bundle,
-                num_layer_pairs,
+                latent_layers,
+                indexer_layers,
                 natural_bundles,
                 natural_nonshared_blocks,
             )
             tensor_size = (num_bundles + 1) * bundle_page
-            shared_pool_bytes = num_layer_pairs * tensor_size
+            shared_pool_bytes = num_physical_tensors * tensor_size
             max_model_len = vllm_config.model_config.max_model_len
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             latent_ctx_blocks = cdiv(
@@ -1307,7 +1373,7 @@ def get_kv_cache_config_from_groups(
                 "DSA shared pool budget: gpu_memory_utilization=%s "
                 "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
                 "allocated=%.2f GiB fits_budget=%s bundles=%d "
-                "bundle_page=%.2f MiB layer_pairs=%d.",
+                "bundle_page=%.2f MiB physical_tensors=%d.",
                 gpu_mem_util,
                 kv_mem_override,
                 available_memory / 2**30,
@@ -1315,7 +1381,7 @@ def get_kv_cache_config_from_groups(
                 shared_pool_bytes <= available_memory,
                 num_bundles,
                 bundle_page / 2**20,
-                num_layer_pairs,
+                num_physical_tensors,
             )
             logger.info(
                 "DSA shared pool capacity: max_model_len=%d max_num_seqs=%d "
@@ -1336,34 +1402,53 @@ def get_kv_cache_config_from_groups(
                 sparse_decode_capacity >= max_num_seqs,
             )
 
+            # Pair latent and indexer layers by exact sibling name
+            # (<layer>.self_attn.attn <-> <layer>.self_attn.indexer.k_cache).
+            # With a shared indexer only producer layers have an indexer
+            # sibling; consumer layers get a latent-only tensor. Never fall
+            # back to positional zip(): with unequal group sizes it would
+            # silently mis-pair or truncate layers.
             indexer_by_name = set(indexer_group.layer_names)
             used_indexers: set[str] = set()
-            pairs: list[tuple[str, str]] = []
+            kv_cache_tensors: list[KVCacheTensor] = []
+            paired_layers = 0
+            latent_only_layers = 0
             for latent_name in latent_group.layer_names:
                 sibling = latent_name.rsplit(".", 1)[0] + ".indexer.k_cache"
                 if sibling in indexer_by_name:
-                    pairs.append((latent_name, sibling))
+                    kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=tensor_size, shared_by=[latent_name, sibling]
+                        )
+                    )
                     used_indexers.add(sibling)
-            if len(pairs) != len(latent_group.layer_names):
-                pairs = list(zip(latent_group.layer_names, indexer_group.layer_names))
-                used_indexers = {indexer for _, indexer in pairs}
+                    paired_layers += 1
+                else:
+                    kv_cache_tensors.append(
+                        KVCacheTensor(size=tensor_size, shared_by=[latent_name])
+                    )
+                    latent_only_layers += 1
             if used_indexers != indexer_by_name:
+                orphan_indexers = sorted(indexer_by_name - used_indexers)
                 raise ValueError(
-                    "DSA shared pool could not pair latent/indexer layers."
+                    "DSA shared pool could not pair latent/indexer layers: "
+                    f"indexer layers without a latent sibling: {orphan_indexers}."
                 )
 
             logger.info(
                 "DSA shared pool sizing: bundles=%d, bundle_page=%.2f MiB, "
-                "layer_pairs=%d, tensor_slots_include_null=%d.",
+                "latent_layers=%d, indexer_layers=%d, paired_layers=%d, "
+                "latent_only_layers=%d, physical_tensors=%d, "
+                "tensor_slots_include_null=%d.",
                 num_bundles,
                 bundle_page / 2**20,
-                num_layer_pairs,
+                latent_layers,
+                indexer_layers,
+                paired_layers,
+                latent_only_layers,
+                len(kv_cache_tensors),
                 num_bundles + 1,
             )
-            kv_cache_tensors = [
-                KVCacheTensor(size=tensor_size, shared_by=[latent, indexer])
-                for latent, indexer in pairs
-            ]
             return KVCacheConfig(
                 num_blocks=num_bundles,
                 kv_cache_tensors=kv_cache_tensors,
@@ -1637,12 +1722,12 @@ def get_kv_cache_groups(
     if dsa_two_groups_enabled() and not is_kv_cache_page_size_uniform(kv_cache_spec):
         # DSA two-group mode: latent (page 147456) and indexer (page 32768) keep
         # their true page sizes and are backed by per-group block pools, so no
-        # page-size unification is needed. Sort groups by descending page size so
-        # the latent group is group 0 (KV connectors that only handle the latent
-        # consume block_ids[0]).
-        groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
-        groups.sort(key=lambda g: -g.kv_cache_spec.page_size_bytes)
-        return groups
+        # page-size unification is needed. Aggregate by semantic role so the
+        # group count stays exactly two even when the layer counts are unequal
+        # (GLM-5.2 shared indexer: e.g. 79 LATENT / 22 INDEXER); group 0 is
+        # the latent group (KV connectors that only handle the latent consume
+        # block_ids[0]).
+        return _get_kv_cache_groups_dsa_two_groups(kv_cache_spec)
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
