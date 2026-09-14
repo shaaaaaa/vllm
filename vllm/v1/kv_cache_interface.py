@@ -17,6 +17,48 @@ from vllm.utils.torch_utils import get_dtype_size
 logger = init_logger(__name__)
 
 
+def _parse_dsa_role_env(name: str) -> bool:
+    raw = os.getenv(name, "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
+
+
+def layerwise_prefill_p_node_enabled() -> bool:
+    """Whether this process is a layerwise-prefill P node.
+
+    This is an explicit node marker.  Do not infer it from ``kv_role`` or
+    ``kv_rank``: those values describe connector behavior and are ambiguous
+    for ``kv_both`` deployments.
+    """
+    return _parse_dsa_role_env("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE")
+
+
+def dsa_sparse_decode_d_node_enabled() -> bool:
+    """Whether this process is a pure sparse-decode D node.
+
+    Like the P marker this is an explicit node role declaration.  It selects
+    the real sparse decode residency requirements instead of the legacy
+    full-context KV cache check.  It must not be conflated with ``kv_role``.
+    """
+    return _parse_dsa_role_env("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE")
+
+
+def dsa_node_roles() -> tuple[bool, bool]:
+    """Return ``(is_p_node, is_d_node)`` after validating exclusivity."""
+    is_p_node = layerwise_prefill_p_node_enabled()
+    is_d_node = dsa_sparse_decode_d_node_enabled()
+    if is_p_node and is_d_node:
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and "
+            "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE are mutually exclusive"
+        )
+    return is_p_node, is_d_node
+
+
 def dsa_two_groups_enabled() -> bool:
     """vllm-ascend DSA un-bundled latent/indexer (two-group mode).
 

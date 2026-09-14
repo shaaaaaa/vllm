@@ -66,7 +66,7 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, dsa_sparse_decode_d_node_enabled
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -1168,6 +1168,9 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        # D-only admission failures are turned into per-request errors before
+        # the step, so a missing bootstrap source never kills the engine.
+        self._finish_request_load_failures()
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
@@ -1566,6 +1569,41 @@ class EngineCoreProc(EngineCore):
                 by_client[client_index].add(req_id)
             for client_index, req_ids in by_client.items():
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
+
+    def _finish_request_load_failures(self) -> None:
+        """Finish D-only requests whose external bootstrap source never arrived.
+
+        The connector bounds how long a request may wait for a complete external
+        source.  Only requests that have not started DMA are reported here; the
+        scheduler terminates them with an error and notifies the owning client,
+        while the rest of the decode batch keeps running.
+        """
+        if not dsa_sparse_decode_d_node_enabled():
+            return
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            return
+        failures = connector.get_request_load_failures()
+        if not failures:
+            return
+        finished = self.scheduler.finish_requests(
+            list(failures), RequestStatus.FINISHED_ERROR
+        )
+        if not finished:
+            return
+        by_client = defaultdict[int, list[str]](list)
+        for req_id, client_index in finished:
+            reason = failures.get(req_id)
+            if reason:
+                logger.warning(
+                    "Finishing request %s because its external KV lookup "
+                    "failed: %s",
+                    req_id,
+                    reason,
+                )
+            by_client[client_index].append(req_id)
+        for client_index, req_ids in by_client.items():
+            self._send_error_outputs_to_client(req_ids, client_index)
 
 
 class DPEngineCoreProc(EngineCoreProc):
