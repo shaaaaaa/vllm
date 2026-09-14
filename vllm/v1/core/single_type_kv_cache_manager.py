@@ -521,6 +521,7 @@ class DSALatentManager(FullAttentionManager):
         # Per-request state for complete external DSA hits.
         self._compact_external_prefix_tokens: dict[str, int] = {}
         self._compact_external_released_blocks: dict[str, int] = {}
+        self.checkpoint_tail_alignment = 0
 
     def _blocks_per_bundle(self) -> int:
         return getattr(self.block_pool, "blocks_per_bundle", 1)
@@ -558,8 +559,15 @@ class DSALatentManager(FullAttentionManager):
             return list(range(required_blocks))
 
         scratch_end = self._round_up_to_bundle(self.scratch_blocks)
+        tail_tokens = prefix_tokens
+        if self.checkpoint_tail_alignment:
+            tail_tokens = (
+                prefix_tokens
+                // self.checkpoint_tail_alignment
+                * self.checkpoint_tail_alignment
+            )
         tail_start = max(
-            self._round_down_to_bundle(prefix_tokens // self.block_size),
+            self._round_down_to_bundle(tail_tokens // self.block_size),
             released_blocks,
         )
         if force_compact:
