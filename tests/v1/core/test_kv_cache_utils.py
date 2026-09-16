@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -2339,3 +2340,133 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+@pytest.mark.parametrize("p_node,expected", [(False, 2.0), (True, 79.0)])
+def test_layerwise_prefill_concurrency_counts_global_child_capacity(monkeypatch, p_node, expected):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", str(p_node).lower())
+    latent = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float32)
+    indexer = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float32)
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
+    cache = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([f"latent.{i}" for i in range(79)], latent),
+            KVCacheGroupSpec([f"indexer.{i}" for i in range(22)], indexer),
+        ],
+    )
+    # One request: 2 latent + 1 indexer bundles; P needs two banks but can
+    # allocate from all 79 physical layer slots of the parent slab.
+    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(config, cache) == expected
+
+
+def test_layerwise_prefill_uses_one_dense_global_slab(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=4,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+    latent_spec = new_kv_cache_spec(head_size=64)
+    indexer_spec = new_kv_cache_spec(head_size=32)
+    groups = [
+        KVCacheGroupSpec(["latent.0", "latent.1"], latent_spec),
+        KVCacheGroupSpec(["indexer.0", "indexer.1"], indexer_spec),
+    ]
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        groups,
+        available_memory=11 * bundle_page,
+    )
+
+    assert result.num_blocks == 4
+    assert len(result.kv_cache_tensors) == 1
+    assert result.kv_cache_tensors[0].size == (2 * 4 + 1) * bundle_page
+    assert result.kv_cache_tensors[0].shared_by == [
+        "latent.0",
+        "latent.1",
+        "indexer.0",
+        "indexer.1",
+    ]
+
+
+def test_layerwise_prefill_reconciles_global_slab_across_workers(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=16,
+            original_max_model_len=16,
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_seqs=1,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        num_speculative_tokens=0,
+    )
+    latent_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.float32,
+    )
+    worker_spec = {
+        "latent.0": latent_spec,
+        "latent.1": latent_spec,
+        "indexer.0": indexer_spec,
+        "indexer.1": indexer_spec,
+    }
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+
+    # Two layer pairs yield 5 and 4 bundles respectively. Reconciliation must
+    # shrink both global slabs to: one null bundle + 2 * 4 child bundles.
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [worker_spec, worker_spec],
+        [11 * bundle_page, 9 * bundle_page],
+    )
+
+    assert [config.num_blocks for config in configs] == [4, 4]
+    assert all(len(config.kv_cache_tensors) == 1 for config in configs)
+    assert [config.kv_cache_tensors[0].size for config in configs] == [
+        9 * bundle_page,
+        9 * bundle_page,
+    ]
