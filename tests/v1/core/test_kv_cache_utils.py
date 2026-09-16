@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -175,8 +176,13 @@ def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
         num_speculative_tokens=0,
     )
     groups = [
-        KVCacheGroupSpec(["latent"], new_kv_cache_spec(head_size=64)),
-        KVCacheGroupSpec(["indexer"], new_kv_cache_spec(head_size=32)),
+        KVCacheGroupSpec(
+            ["model.layers.0.self_attn.attn"], new_kv_cache_spec(head_size=64)
+        ),
+        KVCacheGroupSpec(
+            ["model.layers.0.self_attn.indexer.k_cache"],
+            new_kv_cache_spec(head_size=32),
+        ),
     ]
 
     result = kv_cache_utils.get_kv_cache_config_from_groups(
@@ -195,6 +201,206 @@ def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
             groups,
             available_memory=0,
         )
+
+
+def _glm52_like_layer_names(num_layers: int = 78, mtp: int = 1):
+    """Build GLM-5.2-style latent/indexer layer names.
+
+    Backbone producers are at 0, 1, 2, 6, 10, ..., 74 (21 layers); the rest
+    are shared consumers. With one physical MTP layer the totals are
+    79 LATENT / 22 INDEXER.
+    """
+    producer_layers = {0, 1, 2} | {6 + 4 * i for i in range(18)}
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(num_layers)]
+    indexer_names = [
+        f"model.layers.{i}.self_attn.indexer.k_cache" for i in producer_layers
+    ]
+    if mtp:
+        latent_names.append(f"model.layers.{num_layers}.self_attn.attn")
+        indexer_names.append(f"model.layers.{num_layers}.self_attn.indexer.k_cache")
+    return latent_names, indexer_names
+
+
+def _new_dsa_mla_spec(head_size: int, block_size: int = 16):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.float32,
+    )
+
+
+def _dsa_vllm_config(disable_hybrid_kv_cache_manager: bool = False):
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=disable_hybrid_kv_cache_manager
+        )
+    )
+
+
+def test_dsa_two_groups_grouping_keeps_two_unequal_groups(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    kv_cache_spec = {
+        **{n: _new_dsa_mla_spec(head_size=576) for n in latent_names},
+        **{n: _new_dsa_mla_spec(head_size=128) for n in indexer_names},
+    }
+    groups = kv_cache_utils.get_kv_cache_groups(
+        _dsa_vllm_config(),
+        kv_cache_spec,
+    )
+    assert len(groups) == 2
+    latent_group, indexer_group = groups
+    assert len(latent_group.layer_names) == 79
+    assert len(indexer_group.layer_names) == 22
+    # group 0 must be the latent group (larger page size)
+    assert (
+        latent_group.kv_cache_spec.page_size_bytes
+        > indexer_group.kv_cache_spec.page_size_bytes
+    )
+
+
+def test_dsa_two_groups_grouping_fails_on_bad_cardinality(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(78)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(79)]
+    kv_cache_spec = {
+        **{n: _new_dsa_mla_spec(head_size=576) for n in latent_names},
+        **{n: _new_dsa_mla_spec(head_size=128) for n in indexer_names},
+    }
+    with pytest.raises(ValueError, match="indexer_layers <= latent_layers"):
+        kv_cache_utils.get_kv_cache_groups(
+            _dsa_vllm_config(),
+            kv_cache_spec,
+        )
+
+
+def _dsa_shared_config(num_gpu_blocks_override=None):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=num_gpu_blocks_override,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+
+
+def test_dsa_shared_pool_unequal_groups_pairing(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(num_gpu_blocks_override=4),
+        groups,
+        available_memory=0,
+    )
+
+    assert result.num_blocks == 4
+    # 79 physical tensors: 22 paired + 57 latent-only
+    assert len(result.kv_cache_tensors) == 79
+    shared_by_counts = [len(t.shared_by) for t in result.kv_cache_tensors]
+    assert shared_by_counts.count(2) == 22
+    assert shared_by_counts.count(1) == 57
+    # every latent layer and every indexer layer must be covered exactly once
+    covered = [name for t in result.kv_cache_tensors for name in t.shared_by]
+    assert sorted(covered) == sorted(latent_names + indexer_names)
+    # paired tensors must be latent+indexer siblings of producer layers
+    for t in result.kv_cache_tensors:
+        if len(t.shared_by) == 2:
+            latent, indexer = t.shared_by
+            assert indexer == latent.rsplit(".", 1)[0] + ".indexer.k_cache"
+        else:
+            assert t.shared_by[0] in latent_names
+    # capacity is billed on the full latent layer count (79 slabs)
+    from math import gcd
+
+    latent_page = 16 * 576 * 4  # block_size * head_size * dtype_size
+    indexer_page = 16 * 128 * 4
+    bundle_page = latent_page * indexer_page // gcd(latent_page, indexer_page)
+    assert all(t.size == (4 + 1) * bundle_page for t in result.kv_cache_tensors)
+
+
+def test_dsa_shared_pool_unequal_groups_orphan_indexer_fails(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names, indexer_names = _glm52_like_layer_names(mtp=0)
+    # orphan: indexer layer without a latent sibling
+    indexer_names = indexer_names + ["model.layers.999.self_attn.indexer.k_cache"]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    with pytest.raises(ValueError, match="could not pair"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            _dsa_shared_config(num_gpu_blocks_override=4),
+            groups,
+            available_memory=0,
+        )
+
+
+def test_dsa_shared_pool_rejects_indexer_heavier_group(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(4)]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    with pytest.raises(ValueError, match="at most one indexer layer per latent"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            _dsa_shared_config(num_gpu_blocks_override=4),
+            groups,
+            available_memory=0,
+        )
+
+
+def test_dsa_shared_pool_equal_groups_unchanged(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(79)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(79)]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(num_gpu_blocks_override=4),
+        groups,
+        available_memory=0,
+    )
+    assert len(result.kv_cache_tensors) == 79
+    assert all(len(t.shared_by) == 2 for t in result.kv_cache_tensors)
+
+
+def test_dsa_nonshared_two_groups_unequal_counts(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "0")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(),
+        groups,
+        available_memory=2**33,
+    )
+    # independent pools: one tensor per layer, per-group block counts
+    assert len(result.kv_cache_tensors) == 79 + 22
+    assert result.num_blocks_per_group is not None
+    assert len(result.num_blocks_per_group) == 2
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -2134,3 +2340,133 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+@pytest.mark.parametrize("p_node,expected", [(False, 2.0), (True, 79.0)])
+def test_layerwise_prefill_concurrency_counts_global_child_capacity(monkeypatch, p_node, expected):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", str(p_node).lower())
+    latent = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float32)
+    indexer = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float32)
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=32))
+    cache = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([f"latent.{i}" for i in range(79)], latent),
+            KVCacheGroupSpec([f"indexer.{i}" for i in range(22)], indexer),
+        ],
+    )
+    # One request: 2 latent + 1 indexer bundles; P needs two banks but can
+    # allocate from all 79 physical layer slots of the parent slab.
+    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(config, cache) == expected
+
+
+def test_layerwise_prefill_uses_one_dense_global_slab(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=4,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+    latent_spec = new_kv_cache_spec(head_size=64)
+    indexer_spec = new_kv_cache_spec(head_size=32)
+    groups = [
+        KVCacheGroupSpec(["latent.0", "latent.1"], latent_spec),
+        KVCacheGroupSpec(["indexer.0", "indexer.1"], indexer_spec),
+    ]
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        groups,
+        available_memory=11 * bundle_page,
+    )
+
+    assert result.num_blocks == 4
+    assert len(result.kv_cache_tensors) == 1
+    assert result.kv_cache_tensors[0].size == (2 * 4 + 1) * bundle_page
+    assert result.kv_cache_tensors[0].shared_by == [
+        "latent.0",
+        "latent.1",
+        "indexer.0",
+        "indexer.1",
+    ]
+
+
+def test_layerwise_prefill_reconciles_global_slab_across_workers(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=16,
+            original_max_model_len=16,
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_seqs=1,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        num_speculative_tokens=0,
+    )
+    latent_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.float32,
+    )
+    worker_spec = {
+        "latent.0": latent_spec,
+        "latent.1": latent_spec,
+        "indexer.0": indexer_spec,
+        "indexer.1": indexer_spec,
+    }
+    bundle_page = math.lcm(
+        latent_spec.page_size_bytes,
+        indexer_spec.page_size_bytes,
+    )
+
+    # Two layer pairs yield 5 and 4 bundles respectively. Reconciliation must
+    # shrink both global slabs to: one null bundle + 2 * 4 child bundles.
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [worker_spec, worker_spec],
+        [11 * bundle_page, 9 * bundle_page],
+    )
+
+    assert [config.num_blocks for config in configs] == [4, 4]
+    assert all(len(config.kv_cache_tensors) == 1 for config in configs)
+    assert [config.kv_cache_tensors[0].size for config in configs] == [
+        9 * bundle_page,
+        9 * bundle_page,
+    ]

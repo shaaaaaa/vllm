@@ -233,6 +233,8 @@ class Scheduler(SchedulerInterface):
             and self.parallel_config.decode_context_parallel_size == 1
             and supported_speculative_config
         )
+        # schedule() reads this flag even when final-hidden bootstrap is disabled.
+        self._bootstrap_sample_ready = False
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -1182,13 +1184,26 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1424,6 +1439,10 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        new_block_ids_by_bank: list[
+            tuple[tuple[list[int], ...], ...] | None
+        ] = []
+        new_block_allocation_modes = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1455,6 +1474,14 @@ class Scheduler(SchedulerInterface):
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
+            new_block_ids_by_bank.append(
+                req_to_new_blocks[req_id].get_block_ids_by_bank(
+                    allow_none=True
+                )
+            )
+            new_block_allocation_modes.append(
+                req_to_new_blocks[req_id].get_allocation_mode()
+            )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1468,6 +1495,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            new_block_ids_by_bank=new_block_ids_by_bank,
+            new_block_allocation_modes=new_block_allocation_modes,
         )
 
     def _try_schedule_encoder_inputs(
