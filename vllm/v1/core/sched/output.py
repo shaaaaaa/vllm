@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
-
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -44,18 +42,12 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
-    # Layerwise-prefill physical IDs, bank-major then KV-group-major.
-    block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None = None
-    block_allocation_mode: DSABlockAllocationMode | None = None
-
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
-        block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None = None,
-        block_allocation_mode: DSABlockAllocationMode | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -68,8 +60,6 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
-            block_ids_by_bank=block_ids_by_bank,
-            block_allocation_mode=block_allocation_mode,
         )
 
     def __repr__(self) -> str:
@@ -132,13 +122,6 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    # Per-request block deltas, bank-major then KV-group-major.
-    new_block_ids_by_bank: list[
-        tuple[tuple[list[int], ...], ...] | None
-    ] | None = None
-    new_block_allocation_modes: list[
-        DSABlockAllocationMode | None
-    ] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -153,8 +136,6 @@ class CachedRequestData:
             f"new_token_ids_lens={new_token_ids_lens},"
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
-            f"new_block_ids_by_bank={self.new_block_ids_by_bank},"
-            f"new_block_allocation_modes={self.new_block_allocation_modes},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens}"
             f")"
@@ -191,8 +172,6 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
-            new_block_ids_by_bank=[],
-            new_block_allocation_modes=[],
         )
 
 
