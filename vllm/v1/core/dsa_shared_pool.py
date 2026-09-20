@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,6 +64,16 @@ class DSABlockAllocationMode(str, Enum):
 
 
 LAYERWISE_PREFILL_BANK_COUNT = 2
+LAYERWISE_PREFILL_BUNDLE_MULTIPLIER = 2
+
+
+def layerwise_prefill_bundle_multiplier() -> int:
+    """Keep the legacy physical layout unless the P-node DMA path is enabled."""
+    return (
+        LAYERWISE_PREFILL_BUNDLE_MULTIPLIER
+        if os.environ.get("LMCACHE_LAYERWISE_PREFILL_DMA", "0") == "1"
+        else 1
+    )
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,7 @@ class DSASharedBlockLayout:
     latent_page_size_bytes: int
     indexer_page_size_bytes: int
     capacity_bundles: int
+    bundle_multiplier: int = 1
     k_nope_dim: int = 512
     k_pe_dim: int = 64
     indexer_dim: int = 128
@@ -85,6 +97,8 @@ class DSASharedBlockLayout:
             raise ValueError("page sizes must be positive")
         if self.capacity_bundles <= 0:
             raise ValueError("capacity_bundles must be positive")
+        if self.bundle_multiplier <= 0:
+            raise ValueError("bundle_multiplier must be positive")
         if self.latent_dim != self.k_nope_dim + self.k_pe_dim:
             raise ValueError(
                 "latent_page/indexer_page ratio does not match k_nope+k_pe dims"
@@ -96,7 +110,9 @@ class DSASharedBlockLayout:
 
     @property
     def bundle_page_size_bytes(self) -> int:
-        return _lcm(self.latent_page_size_bytes, self.indexer_page_size_bytes)
+        return self.bundle_multiplier * _lcm(
+            self.latent_page_size_bytes, self.indexer_page_size_bytes
+        )
 
     @property
     def latent_blocks_per_bundle(self) -> int:
@@ -324,6 +340,7 @@ class PrefillLayerBundlePool:
             latent_page_size_bytes=parent_layout.latent_page_size_bytes,
             indexer_page_size_bytes=parent_layout.indexer_page_size_bytes,
             capacity_bundles=self.parent_capacity * num_physical_slots,
+            bundle_multiplier=parent_layout.bundle_multiplier,
             k_nope_dim=parent_layout.k_nope_dim,
             k_pe_dim=parent_layout.k_pe_dim,
             indexer_dim=parent_layout.indexer_dim,

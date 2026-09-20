@@ -21,6 +21,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.v1.core.dsa_shared_pool import (
     LAYERWISE_PREFILL_BANK_COUNT,
     DSABlockAllocationMode,
+    layerwise_prefill_bundle_multiplier,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -828,6 +829,15 @@ def dsa_kv_residency_mode() -> str:
     return "prefill_child" if layerwise_prefill_p_node_enabled() else "legacy"
 
 
+def dsa_bundle_page_size_bytes(*page_sizes: int) -> int:
+    """The P-only physical bundle is twice the legacy LCM-sized bundle."""
+    multiplier = (
+        layerwise_prefill_bundle_multiplier()
+        if layerwise_prefill_p_node_enabled() else 1
+    )
+    return lcm(*page_sizes) * multiplier
+
+
 def dsa_required_bundles(
     mode: str,
     seq_len: int,
@@ -886,7 +896,7 @@ def get_max_concurrency_for_kv_cache_config(
             kv_cache_config.kv_cache_groups,
             key=lambda g: g.kv_cache_spec.page_size_bytes,
         )
-        bundle_page = lcm(
+        bundle_page = dsa_bundle_page_size_bytes(
             latent_group.kv_cache_spec.page_size_bytes,
             indexer_group.kv_cache_spec.page_size_bytes,
         )
@@ -1315,7 +1325,7 @@ def get_kv_cache_config_from_groups(
 
             latent_page = latent_group.kv_cache_spec.page_size_bytes
             indexer_page = indexer_group.kv_cache_spec.page_size_bytes
-            bundle_page = lcm(latent_page, indexer_page)
+            bundle_page = dsa_bundle_page_size_bytes(latent_page, indexer_page)
             latent_blocks_per_bundle = bundle_page // latent_page
             indexer_blocks_per_bundle = bundle_page // indexer_page
             # Every LATENT layer owns one raw bundle-page slab so a bundle id
@@ -1925,7 +1935,7 @@ def _report_kv_cache_config(
             kv_cache_config.kv_cache_groups,
             key=lambda g: g.kv_cache_spec.page_size_bytes,
         )
-        bundle_page = lcm(
+        bundle_page = dsa_bundle_page_size_bytes(
             *(
                 g.kv_cache_spec.page_size_bytes
                 for g in kv_cache_config.kv_cache_groups
@@ -2046,7 +2056,7 @@ def _max_memory_usage_bytes_from_groups(
             indexer_group = min(
                 kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
             )
-            bundle_page = lcm(
+            bundle_page = dsa_bundle_page_size_bytes(
                 latent_group.kv_cache_spec.page_size_bytes,
                 indexer_group.kv_cache_spec.page_size_bytes,
             )
@@ -2412,7 +2422,7 @@ def get_kv_cache_configs(
                         kv_cache_config.kv_cache_groups,
                         key=lambda g: g.kv_cache_spec.page_size_bytes,
                     )
-                    bundle_page = lcm(
+                    bundle_page = dsa_bundle_page_size_bytes(
                         latent_group.kv_cache_spec.page_size_bytes,
                         indexer_group.kv_cache_spec.page_size_bytes,
                     )

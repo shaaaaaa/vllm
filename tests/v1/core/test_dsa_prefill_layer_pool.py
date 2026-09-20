@@ -10,6 +10,7 @@ from vllm.v1.core.dsa_shared_pool import (
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
     PrefillLayerBundlePool,
+    layerwise_prefill_bundle_multiplier,
 )
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -27,6 +28,29 @@ def make_pool(
     )
     parent = DSASharedBundleAllocator(layout)
     return parent, PrefillLayerBundlePool(parent, physical_slots)
+
+
+def test_doubled_prefill_bundle_preserves_parent_child_mapping() -> None:
+    layout = DSASharedBlockLayout(
+        latent_page_size_bytes=576,
+        indexer_page_size_bytes=128,
+        capacity_bundles=3,
+        bundle_multiplier=2,
+    )
+    child = PrefillLayerBundlePool(DSASharedBundleAllocator(layout), 2)
+    assert layout.bundle_page_size_bytes == 2304
+    assert child.layout.bundle_page_size_bytes == 2304
+    assert child.layout.latent_blocks_per_bundle == 4
+    assert child.layout.indexer_blocks_per_bundle == 18
+    assert len(child.layout.block_ids_for_bundle(DSASharedBlockOwner.LATENT, 1)) == 4
+    assert len(child.layout.block_ids_for_bundle(DSASharedBlockOwner.INDEXER, 1)) == 18
+
+
+def test_dma_switch_keeps_legacy_bundle_when_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("LMCACHE_LAYERWISE_PREFILL_DMA", raising=False)
+    assert layerwise_prefill_bundle_multiplier() == 1
+    monkeypatch.setenv("LMCACHE_LAYERWISE_PREFILL_DMA", "1")
+    assert layerwise_prefill_bundle_multiplier() == 2
 
 
 def test_child_id_mapping_is_dense_and_reversible() -> None:

@@ -17,6 +17,7 @@ from vllm.v1.core.dsa_shared_pool import (
     PrefillLayerBundlePool,
     dsa_block_pool_index,
     dsa_scratch_blocks_for_topk,
+    layerwise_prefill_bundle_multiplier,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -131,6 +132,10 @@ class KVCacheCoordinator(ABC):
                 latent_page_size_bytes=latent_group.kv_cache_spec.page_size_bytes,
                 indexer_page_size_bytes=indexer_group.kv_cache_spec.page_size_bytes,
                 capacity_bundles=kv_cache_config.num_blocks,
+                bundle_multiplier=(
+                    layerwise_prefill_bundle_multiplier()
+                    if self.layerwise_prefill_p_node else 1
+                ),
             )
             self.dsa_shared_num_layer_pairs = len(latent_group.layer_names)
             parent_allocator = DSASharedBundleAllocator(parent_layout)
