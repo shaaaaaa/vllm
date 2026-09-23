@@ -1202,6 +1202,8 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    *,
+    for_profiling: bool = False,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
@@ -1211,9 +1213,20 @@ def get_kv_cache_config_from_groups(
         vllm_config: The global VllmConfig
         kv_cache_groups: The KV cache groups
         available_memory: Memory available for KV cache in bytes
+        for_profiling: Allocate only the explicit profiling block override,
+            using zero as the unknown-budget sentinel rather than an HBM limit.
     Returns:
         The generated KVCacheConfig
     """
+    if for_profiling and (
+        available_memory != 0
+        or vllm_config.cache_config.num_gpu_blocks_override is None
+        or vllm_config.cache_config.num_gpu_blocks_override <= 0
+    ):
+        raise ValueError(
+            "Profiling KV allocation requires a zero budget sentinel and "
+            "a positive block override"
+        )
     hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
     if hf_config is None:
         hf_config = getattr(vllm_config.model_config, "hf_config", None)
@@ -1345,6 +1358,7 @@ def get_kv_cache_config_from_groups(
             shared_pool_bytes = (num_bundles + 1) * bundle_bytes
             if (
                 layout.indexer_scale_page_size_bytes
+                and not for_profiling
                 and shared_pool_bytes > available_memory
             ):
                 raise ValueError(

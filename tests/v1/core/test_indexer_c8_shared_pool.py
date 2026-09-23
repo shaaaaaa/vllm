@@ -145,3 +145,147 @@ def test_quantized_bundle_owner_reuse_keeps_one_allocator(api):
     assert first != second and allocator.free_bundle_count == 0
     allocator.free(latent, first)
     assert allocator.allocate(indexer, 1) == first
+
+
+@pytest.fixture
+def profiling_case(api, monkeypatch):
+    """Execute the real profiler caller and shared sizing helper together."""
+    path = ROOT / "vllm/v1/core/kv_cache_utils.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    functions = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("get_kv_cache_config_from_groups", "may_override_num_blocks")
+    ]
+    module = ast.parse("from __future__ import annotations")
+    module.body.extend(functions)
+    ns = dict(
+        dsa_shared_block_layout=api.dsa_shared_block_layout,
+        dsa_two_groups_enabled=lambda: True,
+        dsa_shared_pool_enabled=lambda: True,
+        cdiv=lambda a, b: (a + b - 1) // b,
+        KVCacheTensor=NS,
+        KVCacheConfig=NS,
+        logger=Mock(),
+    )
+    exec(compile(module, str(path), "exec"), ns)
+    sizing = ns["get_kv_cache_config_from_groups"]
+    path = ROOT / "vllm/v1/worker/gpu_model_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    runner_cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "GPUModelRunner"
+    )
+    method = next(
+        n
+        for n in runner_cls.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "_init_minimal_kv_cache_for_profiling"
+    )
+    caller_ns = dict(logger=Mock())
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        caller_ns,
+    )
+    caller = caller_ns[method.name]
+
+    def make(c8, capture_size=32, saved_override=None):
+        latent, indexer = specs(c8)
+        names = [f"model.layers.{i}.self_attn.attn" for i in range(79)]
+        groups = [
+            NS(kv_cache_spec=latent, layer_names=names),
+            NS(
+                kv_cache_spec=indexer,
+                layer_names=[
+                    n.rsplit(".", 1)[0] + ".indexer.k_cache" for n in names[:22]
+                ],
+            ),
+        ]
+        if c8 == "mixed":
+            indexer.indexer_c8_layer_names = tuple(groups[1].layer_names[:16])
+            indexer.indexer_scale_layer_count = 16
+            indexer.shared_indexer_key_dtype = torch.bfloat16
+            indexer.indexer_scale_page_size_bytes = 512
+            indexer.page_size_bytes = 32768 + 512
+        config = NS(
+            model_config=NS(max_model_len=178000, hf_text_config=NS(index_topk=2048)),
+            num_speculative_tokens=1,
+            cache_config=NS(num_gpu_blocks_override=saved_override),
+            scheduler_config=NS(max_num_seqs=16),
+        )
+        exports = NS(
+            get_kv_cache_config_from_groups=sizing,
+            get_kv_cache_groups=lambda *_: groups,
+        )
+        monkeypatch.setitem(sys.modules, "vllm.v1.core.kv_cache_utils", exports)
+        runner = NS(
+            vllm_config=config,
+            cache_config=config.cache_config,
+            compilation_config=NS(max_cudagraph_capture_size=capture_size),
+            get_kv_cache_spec=lambda: {},
+            initialize_kv_cache=Mock(),
+        )
+        charge = api.dsa_shared_block_layout(
+            latent, indexer
+        ).allocation_bytes_per_bundle(79, 22)
+        return runner, groups, charge, exports
+
+    return make, caller, sizing
+
+
+@pytest.mark.parametrize("c8", [False, True, "mixed"])
+@pytest.mark.parametrize("capture_size", [None, 32])
+def test_graph_profiling_zero_sentinel_allocates_exact_pool(
+    profiling_case, c8, capture_size
+):
+    make, caller, _ = profiling_case
+    runner, _, charge, _ = make(c8, capture_size, saved_override=7)
+    caller(runner)
+    minimal = runner.initialize_kv_cache.call_args.args[0]
+    blocks = capture_size or 1
+    assert minimal.num_blocks == blocks
+    assert sum(t.size for t in minimal.kv_cache_tensors) == (blocks + 1) * charge
+    assert runner.cache_config.num_gpu_blocks_override == 7
+    assert runner.cache_config.num_gpu_blocks == blocks
+
+
+@pytest.mark.parametrize("stage", ["sizing", "initialization"])
+@pytest.mark.parametrize("saved_override", [None, 19])
+def test_graph_profiling_restores_override_on_failure(
+    profiling_case, stage, saved_override
+):
+    make, caller, _ = profiling_case
+    runner, _, _, exports = make(True, saved_override=saved_override)
+    fail = Mock(side_effect=RuntimeError("injected failure"))
+    if stage == "sizing":
+        exports.get_kv_cache_config_from_groups = fail
+    else:
+        runner.initialize_kv_cache = fail
+    with pytest.raises(RuntimeError, match="injected failure"):
+        caller(runner)
+    assert runner.cache_config.num_gpu_blocks_override is saved_override
+    if stage == "sizing":
+        runner.initialize_kv_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("c8", [True, "mixed"])
+def test_real_c8_budget_still_rejects_oversized_override(profiling_case, c8):
+    make, _, sizing = profiling_case
+    runner, groups, charge, _ = make(c8, saved_override=32)
+    for budget in (0, 33 * charge - 1):
+        with pytest.raises(ValueError, match="exceeds the HBM budget"):
+            sizing(runner.vllm_config, groups, available_memory=budget)
+    allocated = sizing(runner.vllm_config, groups, available_memory=33 * charge)
+    assert sum(t.size for t in allocated.kv_cache_tensors) == 33 * charge
+
+
+@pytest.mark.parametrize("budget,override", [(1, 32), (0, None), (0, 0), (0, -1)])
+def test_profiling_bypass_requires_explicit_minimal_allocation(
+    profiling_case, budget, override
+):
+    make, _, sizing = profiling_case
+    runner, groups, _, _ = make(True, saved_override=override)
+    with pytest.raises(ValueError, match="zero budget sentinel"):
+        sizing(runner.vllm_config, groups, available_memory=budget, for_profiling=True)
