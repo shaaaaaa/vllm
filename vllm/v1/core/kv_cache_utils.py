@@ -1429,6 +1429,7 @@ def get_kv_cache_config_from_groups(
             # back to positional zip(): with unequal group sizes it would
             # silently mis-pair or truncate layers.
             indexer_by_name = set(indexer_group.layer_names)
+            c8_names = getattr(indexer_group.kv_cache_spec, "indexer_c8_layer_names", None)
             used_indexers: set[str] = set()
             kv_cache_tensors: list[KVCacheTensor] = []
             paired_layers = 0
@@ -1439,7 +1440,8 @@ def get_kv_cache_config_from_groups(
                     kv_cache_tensors.append(
                         KVCacheTensor(
                             size=tensor_size
-                            + (num_bundles + 1) * layout.scale_bytes_per_bundle,
+                            + ((num_bundles + 1) * layout.scale_bytes_per_bundle
+                               if c8_names is None or sibling in c8_names else 0),
                             shared_by=[latent_name, sibling],
                         )
                     )

@@ -73,6 +73,7 @@ class DSASharedBlockLayout:
     latent_element_size: int = 2
     indexer_element_size: int = 2
     indexer_scale_page_size_bytes: int = 0
+    indexer_scale_layer_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.latent_page_size_bytes <= 0 or self.indexer_page_size_bytes <= 0:
@@ -150,9 +151,14 @@ class DSASharedBlockLayout:
         """Charge key/latent slabs and the permanently allocated scale sidecars."""
         if not 0 < indexer_layers <= latent_layers:
             raise ValueError("DSA layer counts must satisfy 0 < indexer <= latent")
+        scale_layers = self.indexer_scale_layer_count
+        if scale_layers is None:
+            scale_layers = indexer_layers
+        if not 0 <= scale_layers <= indexer_layers:
+            raise ValueError("Indexer scale layer count exceeds physical owners")
         return (
             latent_layers * self.bundle_page_size_bytes
-            + indexer_layers * self.scale_bytes_per_bundle
+            + scale_layers * self.scale_bytes_per_bundle
         )
 
     def blocks_per_bundle(self, owner: DSASharedBlockOwner) -> int:
@@ -224,9 +230,11 @@ def dsa_shared_block_layout(
         indexer_dim=indexer_dims[-1],
         latent_element_size=latent_spec.dtype.itemsize,
         indexer_element_size=(
-            indexer_spec.c8_k_cache_dtype if scale_bytes else indexer_spec.dtype
+            getattr(indexer_spec, "shared_indexer_key_dtype", indexer_spec.c8_k_cache_dtype)
+            if scale_bytes else indexer_spec.dtype
         ).itemsize,
         indexer_scale_page_size_bytes=scale_bytes,
+        indexer_scale_layer_count=getattr(indexer_spec, "indexer_scale_layer_count", None),
     )
 
 

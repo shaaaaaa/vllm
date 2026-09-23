@@ -73,7 +73,7 @@ def test_shared_key_ownership_covers_exact_latent_bytes(api, c8):
         occupied.update(actual)
 
 
-@pytest.mark.parametrize("c8", [False, True])
+@pytest.mark.parametrize("c8", [False, True, "mixed"])
 @pytest.mark.parametrize("layers", [(4, 4), (5, 2)])
 def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers):
     path = ROOT / "vllm/v1/core/kv_cache_utils.py"
@@ -109,6 +109,12 @@ def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers):
             ],
         ),
     ]
+    if c8 == "mixed":
+        indexer.indexer_c8_layer_names = tuple(groups[1].layer_names[::2])
+        indexer.indexer_scale_layer_count = len(indexer.indexer_c8_layer_names)
+        indexer.shared_indexer_key_dtype = torch.bfloat16
+        indexer.indexer_scale_page_size_bytes = 512
+        indexer.page_size_bytes = 32768 + 512
     config = NS(
         model_config=NS(max_model_len=4096, hf_text_config=NS(index_topk=2048)),
         num_speculative_tokens=1,
@@ -122,7 +128,10 @@ def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers):
     assert result.num_blocks == 4
     assert sum(t.size for t in result.kv_cache_tensors) == 5 * charge <= budget
     for tensor in result.kv_cache_tensors:
-        extra = layout.scale_bytes_per_bundle if len(tensor.shared_by) == 2 else 0
+        has_scales = len(tensor.shared_by) == 2 and (
+            c8 != "mixed" or tensor.shared_by[1] in indexer.indexer_c8_layer_names
+        )
+        extra = layout.scale_bytes_per_bundle if has_scales else 0
         assert tensor.size == 5 * (layout.bundle_page_size_bytes + extra)
 
 
