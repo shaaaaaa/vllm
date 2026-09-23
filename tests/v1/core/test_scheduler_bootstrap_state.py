@@ -27,7 +27,6 @@ class _ReachedKVProcessing(Exception):
 @pytest.fixture(params=[False, True], ids=["sync", "async"])
 def scheduler(request):
     namespace = {
-        "SERVING_PERF_ENABLED": True,
         "SchedulerInterface": object,
         "MULTIMODAL_REGISTRY": Mock(
             supports_multimodal_inputs=Mock(return_value=False)
@@ -43,6 +42,7 @@ def scheduler(request):
         "defaultdict": defaultdict,
         "time": time,
         "logger": Mock(),
+        "SERVING_PERF_ENABLED": True,
     }
     for filename, class_name in (
         ("scheduler.py", "Scheduler"),
