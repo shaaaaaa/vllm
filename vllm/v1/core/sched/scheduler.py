@@ -35,7 +35,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.v1.serving_perf import SERVING_PERF_ENABLED
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -70,6 +70,7 @@ from vllm.v1.request import (
     StreamingUpdate,
     validate_final_hidden_payload,
 )
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -1180,17 +1181,18 @@ class Scheduler(SchedulerInterface):
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
             new_reqs_data = [
-                NewRequestData.from_request(
+                self._make_new_request_data(
                     req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req_to_new_blocks[req.request_id],
                     req._all_token_ids,
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                self._make_new_request_data(
+                    req,
+                    req_to_new_blocks[req.request_id],
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1412,6 +1414,28 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
+    def _make_new_request_data(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        prefill_token_ids: list[int] | None = None,
+    ) -> NewRequestData:
+        bank_ids = None
+        allocation_mode = None
+        if self.kv_cache_manager.coordinator.layerwise_prefill_p_node:
+            # This accessor already validates the allocation mode. Ordinary
+            # and D-node requests need neither the scan nor bank metadata.
+            bank_ids = blocks.get_block_ids_by_bank()
+            if bank_ids is not None:
+                allocation_mode = DSABlockAllocationMode.PREFILL_CHILD
+        return NewRequestData.from_request(
+            request,
+            blocks.get_block_ids(),
+            prefill_token_ids,
+            block_ids_by_bank=bank_ids,
+            block_allocation_mode=allocation_mode,
+        )
+
     def _make_cached_request_data(
         self,
         running_reqs: list[Request],
@@ -1426,6 +1450,9 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        layerwise_prefill = self.kv_cache_manager.coordinator.layerwise_prefill_p_node
+        new_block_ids_by_bank = [] if layerwise_prefill else None
+        new_block_allocation_modes = [] if layerwise_prefill else None
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1457,6 +1484,19 @@ class Scheduler(SchedulerInterface):
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
+            if (
+                new_block_ids_by_bank is not None
+                and new_block_allocation_modes is not None
+            ):
+                bank_ids = req_to_new_blocks[req_id].get_block_ids_by_bank(
+                    allow_none=True
+                )
+                new_block_ids_by_bank.append(bank_ids)
+                new_block_allocation_modes.append(
+                    DSABlockAllocationMode.PREFILL_CHILD
+                    if bank_ids is not None
+                    else None
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1470,6 +1510,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            new_block_ids_by_bank=new_block_ids_by_bank,
+            new_block_allocation_modes=new_block_allocation_modes,
         )
 
     def _try_schedule_encoder_inputs(
