@@ -10,11 +10,11 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
 from vllm.v1.core.dsa_shared_pool import (
-    DSASharedBlockLayout,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
     dsa_block_pool_index,
     dsa_scratch_blocks_for_topk,
+    dsa_shared_block_layout,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -118,13 +118,14 @@ class KVCacheCoordinator(ABC):
             )
             assert isinstance(latent_group.kv_cache_spec, MLAAttentionSpec)
             assert isinstance(indexer_group.kv_cache_spec, MLAAttentionSpec)
-            layout = DSASharedBlockLayout(
-                latent_page_size_bytes=latent_group.kv_cache_spec.page_size_bytes,
-                indexer_page_size_bytes=indexer_group.kv_cache_spec.page_size_bytes,
+            layout = dsa_shared_block_layout(
+                latent_group.kv_cache_spec,
+                indexer_group.kv_cache_spec,
                 capacity_bundles=kv_cache_config.num_blocks,
             )
             self.dsa_shared_allocator = DSASharedBundleAllocator(layout)
             self.dsa_shared_num_layer_pairs = len(latent_group.layer_names)
+            self.dsa_shared_indexer_layer_count = len(indexer_group.layer_names)
             self.block_pools = []
             for group in kv_cache_config.kv_cache_groups:
                 owner = (
@@ -447,9 +448,13 @@ class KVCacheCoordinator(ABC):
                         )
                     )
 
-        bundle_bytes = (
-            layout.bundle_page_size_bytes
-            * getattr(self, "dsa_shared_num_layer_pairs", 1)
+        bundle_bytes = layout.allocation_bytes_per_bundle(
+            getattr(self, "dsa_shared_num_layer_pairs", 1),
+            getattr(
+                self,
+                "dsa_shared_indexer_layer_count",
+                getattr(self, "dsa_shared_num_layer_pairs", 1),
+            ),
         )
         used_gib = used * bundle_bytes / 2**30
         total_gib = capacity * bundle_bytes / 2**30

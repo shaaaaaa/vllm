@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from math import gcd
+from typing import Any
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -69,12 +70,25 @@ class DSASharedBlockLayout:
     k_nope_dim: int = 512
     k_pe_dim: int = 64
     indexer_dim: int = 128
+    latent_element_size: int = 2
+    indexer_element_size: int = 2
+    indexer_scale_page_size_bytes: int = 0
+    indexer_scale_layer_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.latent_page_size_bytes <= 0 or self.indexer_page_size_bytes <= 0:
             raise ValueError("page sizes must be positive")
         if self.capacity_bundles <= 0:
             raise ValueError("capacity_bundles must be positive")
+        if (
+            min(self.latent_element_size, self.indexer_element_size) <= 0
+            or self.indexer_scale_page_size_bytes < 0
+        ):
+            raise ValueError("invalid DSA element or scale size")
+        if (
+            self.indexer_dim * self.latent_page_size_bytes * self.indexer_element_size
+        ) % (self.indexer_page_size_bytes * self.latent_element_size):
+            raise ValueError("DSA page sizes do not share integral token geometry")
         if self.latent_dim != self.k_nope_dim + self.k_pe_dim:
             raise ValueError(
                 "latent_page/indexer_page ratio does not match k_nope+k_pe dims"
@@ -101,7 +115,8 @@ class DSASharedBlockLayout:
         return (
             self.indexer_dim
             * self.latent_page_size_bytes
-            // self.indexer_page_size_bytes
+            * self.indexer_element_size
+            // (self.indexer_page_size_bytes * self.latent_element_size)
         )
 
     @property
@@ -110,11 +125,41 @@ class DSASharedBlockLayout:
 
     @property
     def nope_pages_per_bundle(self) -> int:
-        return self.latent_blocks_per_bundle * self.k_nope_dim // self.indexer_dim
+        return (
+            self.latent_blocks_per_bundle
+            * self.k_nope_dim
+            * self.latent_element_size
+            // (self.indexer_dim * self.indexer_element_size)
+        )
 
     @property
     def pe_pages_per_bundle(self) -> int:
-        return self.latent_blocks_per_bundle * self.k_pe_dim // self.indexer_dim
+        return (
+            self.latent_blocks_per_bundle
+            * self.k_pe_dim
+            * self.latent_element_size
+            // (self.indexer_dim * self.indexer_element_size)
+        )
+
+    @property
+    def scale_bytes_per_bundle(self) -> int:
+        return self.indexer_blocks_per_bundle * self.indexer_scale_page_size_bytes
+
+    def allocation_bytes_per_bundle(
+        self, latent_layers: int, indexer_layers: int
+    ) -> int:
+        """Charge key/latent slabs and the permanently allocated scale sidecars."""
+        if not 0 < indexer_layers <= latent_layers:
+            raise ValueError("DSA layer counts must satisfy 0 < indexer <= latent")
+        scale_layers = self.indexer_scale_layer_count
+        if scale_layers is None:
+            scale_layers = indexer_layers
+        if not 0 <= scale_layers <= indexer_layers:
+            raise ValueError("Indexer scale layer count exceeds physical owners")
+        return (
+            latent_layers * self.bundle_page_size_bytes
+            + scale_layers * self.scale_bytes_per_bundle
+        )
 
     def blocks_per_bundle(self, owner: DSASharedBlockOwner) -> int:
         if owner == DSASharedBlockOwner.LATENT:
@@ -165,6 +210,32 @@ class DSASharedBlockLayout:
                 return block_id // self.nope_pages_per_bundle
             return (block_id - nope_slab_pages) // self.pe_pages_per_bundle
         raise AssertionError(f"Unexpected DSA owner: {owner}")
+
+
+def dsa_shared_block_layout(
+    latent_spec: Any,
+    indexer_spec: Any,
+    capacity_bundles: int = 1,
+) -> DSASharedBlockLayout:
+    """Resolve shared key geometry separately from indexer scale storage."""
+    scale_bytes = int(getattr(indexer_spec, "indexer_scale_page_size_bytes", 0))
+    latent_dims = getattr(latent_spec, "sparse_head_dim", None) or (512, 64)
+    indexer_dims = getattr(indexer_spec, "sparse_head_dim", None) or (128,)
+    return DSASharedBlockLayout(
+        latent_page_size_bytes=latent_spec.page_size_bytes,
+        indexer_page_size_bytes=indexer_spec.page_size_bytes - scale_bytes,
+        capacity_bundles=capacity_bundles,
+        k_nope_dim=latent_dims[0],
+        k_pe_dim=latent_dims[1],
+        indexer_dim=indexer_dims[-1],
+        latent_element_size=latent_spec.dtype.itemsize,
+        indexer_element_size=(
+            getattr(indexer_spec, "shared_indexer_key_dtype", indexer_spec.c8_k_cache_dtype)
+            if scale_bytes else indexer_spec.dtype
+        ).itemsize,
+        indexer_scale_page_size_bytes=scale_bytes,
+        indexer_scale_layer_count=getattr(indexer_spec, "indexer_scale_layer_count", None),
+    )
 
 
 class DSASharedBundleAllocator:
