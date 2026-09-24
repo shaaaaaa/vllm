@@ -990,6 +990,19 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                 )
+                if (
+                    compact_external_load
+                    and load_kv_async
+                    and request.num_preemptions == 0
+                    and request.num_computed_tokens == 0
+                    and num_new_local_computed_tokens == 0
+                    and request.num_tokens == request.num_prompt_tokens
+                    and num_external_computed_tokens == request.num_tokens - 1
+                    and request.num_tokens % self.block_size == 1
+                ):
+                    # The worker restores N cached tokens, while the scheduler
+                    # reuses N-1. Reserve the final destination, not computation.
+                    effective_lookahead_tokens = max(effective_lookahead_tokens, 1)
                 if SERVING_PERF_ENABLED and bootstrap_full_hit:
                     logger.info(
                         "[BOOTSTRAP_ALLOCATE_BEGIN] req=%s compact=%s "
