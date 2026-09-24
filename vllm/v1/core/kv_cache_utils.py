@@ -907,6 +907,16 @@ def get_max_concurrency_for_kv_cache_config(
             bundle_page // indexer_group.kv_cache_spec.page_size_bytes
         )
         mode = dsa_kv_residency_mode()
+        if mode != "prefill_child":
+            # Preserve the ordinary/D-node admission calculation.
+            max_blocks_per_req = cdiv(
+                vllm_config.model_config.max_model_len,
+                latent_group.kv_cache_spec.block_size,
+            )
+            bundles_per_req = cdiv(
+                max_blocks_per_req, latent_blocks_per_bundle
+            ) + cdiv(max_blocks_per_req, indexer_blocks_per_bundle)
+            return kv_cache_config.num_blocks / bundles_per_req
         bundles_per_req = dsa_required_bundles(
             mode,
             vllm_config.model_config.max_model_len,
