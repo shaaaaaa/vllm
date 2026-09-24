@@ -1306,7 +1306,10 @@ def get_kv_cache_config_from_groups(
             bundle_bytes = layout.allocation_bytes_per_bundle(
                 latent_layers, indexer_layers
             )
-            slot_count = available_memory // bundle_bytes
+            backing_overhead = layout.allocation_overhead_bytes(
+                latent_layers, indexer_layers
+            )
+            slot_count = (available_memory - backing_overhead) // bundle_bytes
             natural_bundles = slot_count - 1
             num_bundles = may_override_num_blocks(
                 vllm_config,
@@ -1355,7 +1358,7 @@ def get_kv_cache_config_from_groups(
                 natural_nonshared_blocks,
             )
             tensor_size = (num_bundles + 1) * bundle_page
-            shared_pool_bytes = (num_bundles + 1) * bundle_bytes
+            shared_pool_bytes = (num_bundles + 1) * bundle_bytes + backing_overhead
             if (
                 layout.indexer_scale_page_size_bytes
                 and not for_profiling
@@ -1454,8 +1457,18 @@ def get_kv_cache_config_from_groups(
                     kv_cache_tensors.append(
                         KVCacheTensor(
                             size=tensor_size
-                            + ((num_bundles + 1) * layout.scale_bytes_per_bundle
-                               if c8_names is None or sibling in c8_names else 0),
+                            * (
+                                layout.indexer_bank_count
+                                if layout.paired_indexer_banks
+                                and c8_names is not None
+                                and sibling not in c8_names
+                                else 1
+                            )
+                            + (
+                                (num_bundles + 1) * layout.scale_bytes_per_bundle
+                                if c8_names is None or sibling in c8_names
+                                else 0
+                            ),
                             shared_by=[latent_name, sibling],
                         )
                     )
@@ -1489,6 +1502,9 @@ def get_kv_cache_config_from_groups(
             )
             return KVCacheConfig(
                 num_blocks=num_bundles,
+                dsa_paired_bank_slots=num_bundles + 1
+                if layout.paired_indexer_banks
+                else 0,
                 kv_cache_tensors=kv_cache_tensors,
                 kv_cache_groups=kv_cache_groups,
                 dsa_index_topk=dsa_index_topk,
@@ -1940,6 +1956,8 @@ def _max_memory_usage_bytes_from_groups(
             )
             return (bundles + 1) * layout.allocation_bytes_per_bundle(
                 len(latent_group.layer_names), len(indexer_group.layer_names)
+            ) + layout.allocation_overhead_bytes(
+                len(latent_group.layer_names), len(indexer_group.layer_names)
             )
 
         total = 0
@@ -2258,6 +2276,8 @@ def get_kv_cache_configs(
             num_blocks_old = kv_cache_config.num_blocks
             if num_blocks_old != min_num_blocks:
                 kv_cache_config.num_blocks = min_num_blocks
+                if kv_cache_config.dsa_paired_bank_slots:
+                    kv_cache_config.dsa_paired_bank_slots = min_num_blocks + 1
                 for tensor in kv_cache_config.kv_cache_tensors:
                     assert tensor.size % (num_blocks_old + 1) == 0
                     tensor.size = tensor.size // (num_blocks_old + 1) * (

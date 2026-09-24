@@ -73,9 +73,10 @@ def test_shared_key_ownership_covers_exact_latent_bytes(api, c8):
         occupied.update(actual)
 
 
-@pytest.mark.parametrize("c8", [False, True, "mixed"])
+@pytest.mark.parametrize("c8", [False, True, "mixed", "paired"])
 @pytest.mark.parametrize("layers", [(4, 4), (5, 2)])
-def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers):
+@pytest.mark.parametrize("alignment", [0, 2097152])
+def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers, alignment):
     path = ROOT / "vllm/v1/core/kv_cache_utils.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     node = next(
@@ -109,30 +110,40 @@ def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers):
             ],
         ),
     ]
-    if c8 == "mixed":
+    if c8 in ("mixed", "paired"):
         indexer.indexer_c8_layer_names = tuple(groups[1].layer_names[::2])
         indexer.indexer_scale_layer_count = len(indexer.indexer_c8_layer_names)
         indexer.shared_indexer_key_dtype = torch.bfloat16
-        indexer.indexer_scale_page_size_bytes = 512
-        indexer.page_size_bytes = 32768 + 512
+        indexer.indexer_paired_banks = c8 == "paired"
+        indexer.indexer_scale_page_size_bytes = 256 if c8 == "paired" else 512
+        indexer.page_size_bytes = 32768 + indexer.indexer_scale_page_size_bytes
     config = NS(
         model_config=NS(max_model_len=4096, hf_text_config=NS(index_topk=2048)),
         num_speculative_tokens=1,
         cache_config=NS(),
         scheduler_config=NS(max_num_seqs=16),
     )
+    indexer.shared_pool_alignment_bytes = alignment if c8 == "paired" else 0
     layout = api.dsa_shared_block_layout(latent, indexer, 4)
     charge = layout.allocation_bytes_per_bundle(*layers)
-    budget = 5 * charge + 17
+    overhead = (2 * layers[0] - layers[1]) * indexer.shared_pool_alignment_bytes
+    budget = 5 * charge + overhead + 17
     result = namespace[node.name](config, groups, budget)
     assert result.num_blocks == 4
-    assert sum(t.size for t in result.kv_cache_tensors) == 5 * charge <= budget
+    assert (
+        sum(t.size for t in result.kv_cache_tensors) == 5 * charge <= budget - overhead
+    )
     for tensor in result.kv_cache_tensors:
         has_scales = len(tensor.shared_by) == 2 and (
-            c8 != "mixed" or tensor.shared_by[1] in indexer.indexer_c8_layer_names
+            c8 not in ("mixed", "paired")
+            or tensor.shared_by[1] in indexer.indexer_c8_layer_names
         )
         extra = layout.scale_bytes_per_bundle if has_scales else 0
-        assert tensor.size == 5 * (layout.bundle_page_size_bytes + extra)
+        multiplier = (
+            2 if c8 == "paired" and len(tensor.shared_by) == 2 and not has_scales else 1
+        )
+        assert tensor.size == 5 * (multiplier * layout.bundle_page_size_bytes + extra)
+    assert result.dsa_paired_bank_slots == (5 if c8 == "paired" else 0)
 
 
 def test_quantized_bundle_owner_reuse_keeps_one_allocator(api):
@@ -203,12 +214,13 @@ def profiling_case(api, monkeypatch):
                 ],
             ),
         ]
-        if c8 == "mixed":
+        if c8 in ("mixed", "paired"):
             indexer.indexer_c8_layer_names = tuple(groups[1].layer_names[:16])
             indexer.indexer_scale_layer_count = 16
             indexer.shared_indexer_key_dtype = torch.bfloat16
-            indexer.indexer_scale_page_size_bytes = 512
-            indexer.page_size_bytes = 32768 + 512
+            indexer.indexer_paired_banks = c8 == "paired"
+            indexer.indexer_scale_page_size_bytes = 256 if c8 == "paired" else 512
+            indexer.page_size_bytes = 32768 + indexer.indexer_scale_page_size_bytes
         config = NS(
             model_config=NS(max_model_len=178000, hf_text_config=NS(index_topk=2048)),
             num_speculative_tokens=1,
@@ -235,7 +247,7 @@ def profiling_case(api, monkeypatch):
     return make, caller, sizing
 
 
-@pytest.mark.parametrize("c8", [False, True, "mixed"])
+@pytest.mark.parametrize("c8", [False, True, "mixed", "paired"])
 @pytest.mark.parametrize("capture_size", [None, 32])
 def test_graph_profiling_zero_sentinel_allocates_exact_pool(
     profiling_case, c8, capture_size
@@ -270,7 +282,7 @@ def test_graph_profiling_restores_override_on_failure(
         runner.initialize_kv_cache.assert_not_called()
 
 
-@pytest.mark.parametrize("c8", [True, "mixed"])
+@pytest.mark.parametrize("c8", [True, "mixed", "paired"])
 def test_real_c8_budget_still_rejects_oversized_override(profiling_case, c8):
     make, _, sizing = profiling_case
     runner, groups, charge, _ = make(c8, saved_override=32)

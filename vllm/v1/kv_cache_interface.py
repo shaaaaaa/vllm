@@ -544,6 +544,9 @@ class KVCacheConfig:
     dsa_num_speculative_tokens: int = 0
     """Number of speculative tokens used to size DSA compact scratch rows."""
 
+    dsa_paired_bank_slots: int = 0
+    """Worker-local paired-bank addressing; zero retains the legacy layout."""
+
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
