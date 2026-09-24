@@ -48,6 +48,9 @@ class NewRequestData:
     block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None = None
     block_allocation_mode: DSABlockAllocationMode | None = None
 
+    # The API-facing ID before engine randomization; None when unavailable.
+    external_req_id: str | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -70,6 +73,7 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
             block_ids_by_bank=block_ids_by_bank,
             block_allocation_mode=block_allocation_mode,
+            external_req_id=getattr(request, "external_req_id", None),
         )
 
     def __repr__(self) -> str:
