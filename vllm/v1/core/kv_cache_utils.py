@@ -860,6 +860,93 @@ def dsa_required_bundles(
     return full_bundles
 
 
+def _dsa_compact_startup_bundles(
+    max_tokens: int,
+    layout: Any,
+    *,
+    latent_block_size: int,
+    indexer_block_size: int,
+    scratch_tokens: int,
+    dense_tokens: int,
+) -> int:
+    """Bound initial cold restores and the short full-resident policy.
+
+    This is an explicit serving contract, not a dense fallback budget. The
+    compact formula matches DSALatentManager._compact_required_indices with
+    prefix=N-1, allocation end=N and force_compact=True. It includes the
+    previous prompt bundle when N-1 lands exactly at a bundle boundary.
+    """
+    if (
+        type(scratch_tokens) is not int
+        or scratch_tokens <= 0
+        or type(dense_tokens) is not int
+        or dense_tokens < 0
+        or scratch_tokens % latent_block_size
+    ):
+        raise ValueError("Invalid DSA compact startup residency limits")
+    latent_tokens = latent_block_size * layout.latent_blocks_per_bundle
+    indexer_tokens = indexer_block_size * layout.indexer_blocks_per_bundle
+    dense_end = min(max_tokens, max(scratch_tokens, dense_tokens))
+    required = cdiv(dense_end, latent_tokens) + cdiv(dense_end, indexer_tokens)
+    if max_tokens <= dense_end:
+        return required
+    scratch = cdiv(scratch_tokens, latent_tokens)
+
+    def compact(tokens: int) -> int:
+        tail_start = max(scratch, max(tokens - 2, 0) // latent_tokens)
+        latent = scratch + max(0, cdiv(tokens, latent_tokens) - tail_start)
+        return latent + cdiv(tokens, indexer_tokens)
+
+    # Between boundary prompts compact residency is monotonic. At a boundary
+    # it briefly needs two tail bundles, so testing N alone can under-budget a
+    # shorter allowed prompt and make max-length auto-fit non-monotonic.
+    boundary = (max_tokens - 1) // latent_tokens * latent_tokens + 1
+    required = max(required, compact(max_tokens))
+    if boundary > dense_end:
+        required = max(required, compact(boundary))
+    return required
+
+
+def dsa_dense_request_token_capacity(kv_cache_config: KVCacheConfig) -> int | None:
+    """Dense request ceiling for an explicitly compact-sized shared D pool.
+
+    Use the reconciled parent capacity, not currently free bundles. Ordinary
+    deployments return None and retain their existing admission behavior.
+    """
+    groups = kv_cache_config.kv_cache_groups
+    marked = [
+        g
+        for g in groups
+        if getattr(g.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0)
+    ]
+    if not marked:
+        return None
+    if (
+        len(groups) != 2
+        or layerwise_prefill_p_node_enabled()
+        or not dsa_two_groups_enabled()
+        or not dsa_shared_pool_enabled()
+        or getattr(kv_cache_config, "num_blocks_per_group", None) is not None
+    ):
+        raise ValueError("Compact startup residency requires a shared D pool")
+    latent = max(groups, key=lambda g: g.kv_cache_spec.page_size_bytes)
+    indexer = min(groups, key=lambda g: g.kv_cache_spec.page_size_bytes)
+    if len(marked) != 1 or marked[0] is not latent:
+        raise ValueError("Compact startup residency must mark only the latent group")
+    layout = dsa_shared_block_layout(latent.kv_cache_spec, indexer.kv_cache_spec)
+    latent_tokens = latent.kv_cache_spec.block_size * layout.latent_blocks_per_bundle
+    indexer_tokens = indexer.kv_cache_spec.block_size * layout.indexer_blocks_per_bundle
+    capacity = kv_cache_config.num_blocks
+    low, high = 0, capacity * min(latent_tokens, indexer_tokens)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if cdiv(mid, latent_tokens) + cdiv(mid, indexer_tokens) <= capacity:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1957,6 +2044,26 @@ def _report_kv_cache_config(
         vllm_config: The global VllmConfig
         kv_cache_config: The resolved KV cache configuration
     """
+    dense_capacity = dsa_dense_request_token_capacity(kv_cache_config)
+    if dense_capacity is not None:
+        initial_budget = _max_memory_usage_bytes_from_groups(
+            vllm_config, kv_cache_config.kv_cache_groups
+        )
+        logger.info_once(
+            "DSA cold-compact startup: allocated KV payload=%s bytes; "
+            "dense full-resident request capacity=%s tokens; configured "
+            "model limit=%s tokens; initial admission budget=%s bytes "
+            "including null bundles, scales and alignment. This budget "
+            "covers initial full-cache-hit restores and short dense requests; "
+            "generated-tail growth and dense misses require runtime admission.",
+            f"{sum(t.size for t in kv_cache_config.kv_cache_tensors):,}",
+            f"{dense_capacity:,}",
+            f"{vllm_config.model_config.max_model_len:,}",
+            f"{initial_budget:,}",
+            scope="local",
+        )
+        return
+
     min_block_size = min(
         [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
     )
@@ -2110,6 +2217,11 @@ def _max_memory_usage_bytes_from_groups(
             latent_blocks_per_bundle = layout.latent_blocks_per_bundle
             indexer_blocks_per_bundle = layout.indexer_blocks_per_bundle
             mode = dsa_kv_residency_mode()
+            scratch_tokens = getattr(
+                latent_group.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0
+            )
+            if scratch_tokens and mode == "prefill_child":
+                raise ValueError("Compact startup residency requires a shared D pool")
             if mode == "prefill_child":
                 bundles = dsa_required_bundles(
                     mode,
@@ -2127,17 +2239,31 @@ def _max_memory_usage_bytes_from_groups(
                     allocated_slots * (bundle_page + layout.scale_bytes_per_bundle)
                     + layout.backing_alignment_bytes
                 )
-            blocks = cdiv(
-                latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-                latent_group.kv_cache_spec.page_size_bytes,
-            )
-            bundles = cdiv(
-                blocks,
-                bundle_page // latent_group.kv_cache_spec.page_size_bytes,
-            ) + cdiv(
-                blocks,
-                layout.indexer_blocks_per_bundle,
-            )
+            if scratch_tokens:
+                bundles = _dsa_compact_startup_bundles(
+                    vllm_config.model_config.max_model_len,
+                    layout,
+                    latent_block_size=latent_group.kv_cache_spec.block_size,
+                    indexer_block_size=indexer_group.kv_cache_spec.block_size,
+                    scratch_tokens=scratch_tokens,
+                    dense_tokens=getattr(
+                        latent_group.kv_cache_spec,
+                        "dsa_compact_startup_dense_tokens",
+                        0,
+                    ),
+                )
+            else:
+                blocks = cdiv(
+                    latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    latent_group.kv_cache_spec.page_size_bytes,
+                )
+                bundles = cdiv(
+                    blocks,
+                    bundle_page // latent_group.kv_cache_spec.page_size_bytes,
+                ) + cdiv(
+                    blocks,
+                    layout.indexer_blocks_per_bundle,
+                )
             return (bundles + 1) * layout.allocation_bytes_per_bundle(
                 len(latent_group.layer_names), len(indexer_group.layer_names)
             ) + layout.allocation_overhead_bytes(

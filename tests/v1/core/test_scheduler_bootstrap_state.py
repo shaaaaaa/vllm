@@ -37,6 +37,7 @@ def scheduler(request):
         "create_request_queue": lambda policy: deque(),
         "EncoderCacheManager": Mock(),
         "KVCacheManager": Mock(),
+        "dsa_dense_request_token_capacity": lambda _: None,
         "envs": SimpleNamespace(VLLM_USE_V2_MODEL_RUNNER=False),
         "PauseState": SimpleNamespace(UNPAUSED=0, PAUSED_ALL=1),
         "defaultdict": defaultdict,
