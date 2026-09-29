@@ -89,6 +89,9 @@ def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers, align
         dsa_shared_block_layout=api.dsa_shared_block_layout,
         dsa_two_groups_enabled=lambda: True,
         dsa_shared_pool_enabled=lambda: True,
+        layerwise_prefill_p_node_enabled=lambda: False,
+        dsa_kv_residency_mode=lambda: "legacy",
+        LAYERWISE_PREFILL_BANK_COUNT=2,
         cdiv=lambda a, b: (a + b - 1) // b,
         may_override_num_blocks=lambda config, n: n,
         KVCacheTensor=NS,
@@ -96,6 +99,13 @@ def test_actual_sizing_charges_null_bundle_and_all_scales(api, c8, layers, align
         logger=Mock(),
     )
     module = ast.parse("from __future__ import annotations")
+    module.body.append(
+        next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "dsa_required_bundles"
+        )
+    )
     module.body.append(node)
     exec(compile(module, str(path), "exec"), namespace)
     latent, indexer = specs(c8)
@@ -167,7 +177,12 @@ def profiling_case(api, monkeypatch):
         n
         for n in tree.body
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("get_kv_cache_config_from_groups", "may_override_num_blocks")
+        and n.name
+        in (
+            "get_kv_cache_config_from_groups",
+            "may_override_num_blocks",
+            "dsa_required_bundles",
+        )
     ]
     module = ast.parse("from __future__ import annotations")
     module.body.extend(functions)
@@ -175,6 +190,9 @@ def profiling_case(api, monkeypatch):
         dsa_shared_block_layout=api.dsa_shared_block_layout,
         dsa_two_groups_enabled=lambda: True,
         dsa_shared_pool_enabled=lambda: True,
+        layerwise_prefill_p_node_enabled=lambda: False,
+        dsa_kv_residency_mode=lambda: "legacy",
+        LAYERWISE_PREFILL_BANK_COUNT=2,
         cdiv=lambda a, b: (a + b - 1) // b,
         KVCacheTensor=NS,
         KVCacheConfig=NS,
