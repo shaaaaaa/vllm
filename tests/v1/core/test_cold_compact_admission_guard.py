@@ -190,14 +190,17 @@ def test_real_lmcache_initial_compact_predicate_requires_full_prefix(hit):
     assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == 'dsa_cold_compact_load' for t in node.targets)]
     expression = next(node for node in assignments if isinstance(node.value, ast.BoolOp))
+    resident = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == 'resident_cold_load' for t in node.targets))
     scope = dict(self=NS(supports_dsa_cold_compact_load=lambda: True,
+                        config=NS(pd_role='receiver'),
                         _block_size=128, _dsa_scratch_capacity=128, _dsa_kv_policy_threshold=128),
         num_computed_tokens=0, full_request_hit=hit == 1000, full_resumed_query_hit=False,
         need_to_allocate=hit - int(hit == 1000), num_external_hit_tokens=hit,
         compact_remap_frontier=hit - int(hit == 1000), resumed=False, query_scope='all_tokens',
         request=NS(num_preemptions=0, num_tokens=1000), request_prompt_tokens=1000,
         cdiv=lambda value, divisor: (value + divisor - 1) // divisor)
-    exec(compile(ast.Module(body=[expression], type_ignores=[]), str(path), 'exec'), scope)
+    exec(compile(ast.Module(body=[resident, expression], type_ignores=[]), str(path), 'exec'), scope)
     assert scope['dsa_cold_compact_load'] is (hit == 1000)
 
 

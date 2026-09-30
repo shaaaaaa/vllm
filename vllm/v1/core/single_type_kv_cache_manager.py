@@ -558,6 +558,10 @@ class DSALatentManager(FullAttentionManager):
             return list(range(required_blocks))
 
         scratch_end = self._round_up_to_bundle(self.scratch_blocks)
+        if prefix_tokens < self.scratch_blocks * self.block_size:
+            # A resident short prefix needs no unused sparse scratch rows.
+            # Grow that prefix normally as decode/lookahead consumes more slots.
+            scratch_end = min(scratch_end, required_blocks)
         tail_start = max(
             self._round_down_to_bundle(prefix_tokens // self.block_size),
             released_blocks,
@@ -656,6 +660,11 @@ class DSALatentManager(FullAttentionManager):
         self._compact_external_released_blocks.setdefault(request_id, 0)
 
         scratch_blocks = self._round_up_to_bundle(self.scratch_blocks)
+        if prefix_tokens < self.scratch_blocks * self.block_size:
+            scratch_blocks = min(
+                scratch_blocks,
+                self._round_up_to_bundle(cdiv(prefix_tokens, self.block_size)),
+            )
         allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
         assert len(allocated_blocks) == scratch_blocks
 
