@@ -316,6 +316,47 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
+def test_prefill_exports_cached_tokens_in_kv_transfer_params():
+    """P-side cached tokens are included in the handoff to the D worker."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+
+    block_size = vllm_config.cache_config.block_size
+    num_tokens = block_size * 3
+    warmup = create_request(
+        request_id=1,
+        num_tokens=num_tokens,
+        common_prefix_len=num_tokens,
+        block_size=block_size,
+    )
+    scheduler.add_request(warmup)
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output([warmup], use_eos=True)
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    request = create_request(
+        request_id=2,
+        num_tokens=num_tokens,
+        common_prefix_len=num_tokens,
+        block_size=block_size,
+        do_remote_decode=True,
+    )
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    assert request.num_cached_tokens == num_tokens - block_size
+
+    model_runner_output = create_model_runner_output([request])
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output, model_runner_output
+    )
+    output = engine_core_outputs[0].outputs[0]
+    assert output.finish_reason is not None
+    assert output.kv_transfer_params is not None
+    assert output.kv_transfer_params["remote_prefill_cached_tokens"] == (
+        num_tokens - block_size
+    )
+
+
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
     FakeNixlWrapper,
