@@ -16,6 +16,7 @@ from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.glm4_moe_tool_parser import (
     Glm4MoeModelToolParser,
 )
+from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 
 # Use a common model that is likely to be available
 MODEL = "zai-org/GLM-4.5"
@@ -388,19 +389,19 @@ def test_streaming_no_tool_calls(glm4_moe_tool_parser, mock_request):
     current_text = "This is just regular text without any tool calls."
 
     result = glm4_moe_tool_parser.extract_tool_calls_streaming(
-        previous_text="This is just regular text",
+        previous_text="",
         current_text=current_text,
-        delta_text=" without any tool calls.",
+        delta_text=current_text,
         previous_token_ids=[],
         current_token_ids=[],
         delta_token_ids=[],
         request=mock_request,
     )
 
-    # Should return the delta text as content
+    # The re-parse parser returns the newly available cumulative content.
     assert result is not None
     assert hasattr(result, "content")
-    assert result.content == " without any tool calls."
+    assert result.content == current_text
 
 
 def test_streaming_with_content_before_tool_calls(glm4_moe_tool_parser, mock_request):
@@ -414,19 +415,19 @@ def test_streaming_with_content_before_tool_calls(glm4_moe_tool_parser, mock_req
     current_text = "I will help you get the weather<tool_call>"
 
     result = glm4_moe_tool_parser.extract_tool_calls_streaming(
-        previous_text="I will help you",
+        previous_text="",
         current_text=current_text,
-        delta_text="get the weather.<tool_call>",
+        delta_text=current_text,
         previous_token_ids=[],
         current_token_ids=[],
         delta_token_ids=[],
         request=mock_request,
     )
 
-    # Should return content when no tool call tokens are detected
+    # The incomplete opening tag is held back while preceding content is sent.
     assert result is not None
     assert hasattr(result, "content")
-    assert result.content == "get the weather."
+    assert result.content == "I will help you get the weather"
 
 
 def test_extract_tool_calls_special_characters(glm4_moe_tool_parser, mock_request):
@@ -474,19 +475,13 @@ def test_extract_tool_calls_incomplete_tool_call(glm4_moe_tool_parser, mock_requ
 
 def _reset_streaming_state(parser):
     """Helper to reset parser streaming state."""
-    parser._buffer = ""
-    parser._in_tool_call = False
+    parser._streaming_text = ""
+    parser._sent_content_idx = 0
     parser.current_tool_name_sent = False
-    parser._current_tool_name = None
-    parser._pending_key = None
-    parser._streaming_string_value = False
     parser.prev_tool_call_arr = []
     parser.current_tool_id = -1
     parser.streamed_args_for_tool = []
     parser._tool_call_ids = []
-    parser._args_started = []
-    parser._args_closed = []
-    parser._seen_keys = []
 
 
 def test_streaming_incremental_string_value(glm4_moe_tool_parser, mock_request):
@@ -560,49 +555,59 @@ def test_streaming_empty_tool_call(glm4_moe_tool_parser, mock_request):
     assert glm4_moe_tool_parser.current_tool_id == -1
 
 
+def test_streaming_no_args_tool_call(glm4_moe_tool_parser, mock_request):
+    """A complete tool call without an argument block emits an empty object."""
+    _reset_streaming_state(glm4_moe_tool_parser)
+    text = "<tool_call>get_current_date</tool_call>"
+
+    result = glm4_moe_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    assert result is not None
+    assert result.tool_calls
+    assert result.tool_calls[0].function is not None
+    assert result.tool_calls[0].function.name == "get_current_date"
+    assert result.tool_calls[0].function.arguments == "{}"
+
+
 def test_streaming_prev_tool_call_arr_updates(glm4_moe_tool_parser, mock_request):
-    """Test that prev_tool_call_arr contains parsed dict after tool call."""
+    """Test that parser state tracks the re-parsed JSON prefix."""
     _reset_streaming_state(glm4_moe_tool_parser)
 
-    # Stream a complete tool call
-    name_only = {"name": "get_weather", "arguments": {}}
-    name_and_args = {"name": "get_weather", "arguments": {"city": "Beijing"}}
     chunks = [
-        # Delta, expected streamed_args_for_tool, expected prev_tool_call_arr
-        ("<tool_call>get_weather\n", "", name_only),
-        ("<arg_key>city</arg_key>", "", name_only),
-        ("<arg_value>Beijing</arg_value>", '{"city": "Beijing"', name_only),
-        # Note: arguments are only updated when the tool call is complete.
-        ("</tool_call>", '{"city": "Beijing"}', name_and_args),
+        "<tool_call>get_weather\n",
+        "<arg_key>city</arg_key>",
+        "<arg_value>Beijing</arg_value>",
+        "</tool_call>",
     ]
 
-    for chunk, exp_streamed, exp_prev_tc in chunks:
+    current_text = ""
+    for chunk in chunks:
+        current_text += chunk
         glm4_moe_tool_parser.extract_tool_calls_streaming(
             previous_text="",
-            current_text="",
+            current_text=current_text,
             delta_text=chunk,
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[],
             request=mock_request,
         )
-        assert glm4_moe_tool_parser.streamed_args_for_tool[0] == exp_streamed
-        assert glm4_moe_tool_parser.prev_tool_call_arr[0] == exp_prev_tc
 
-    # After the tool call completes, prev_tool_call_arr should have parsed dict
     assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 1
     tool_entry = glm4_moe_tool_parser.prev_tool_call_arr[0]
     assert tool_entry.get("name") == "get_weather"
-    # arguments should be a dict, not a string
     args = tool_entry.get("arguments")
-    assert isinstance(args, dict), f"Expected dict, got {type(args)}"
-    assert args.get("city") == "Beijing"
-
-    # Test equivalence of prev_tool_call_arr and streamed_args_for_tool
-    # Simulates logic in chat_completion/serving.py:chat_completion_stream_generator
-    tool_call_json = json.dumps(tool_entry.get("arguments", {}))
-    streamed_content = glm4_moe_tool_parser.streamed_args_for_tool[0]
-    assert tool_call_json.startswith(streamed_content)
+    assert isinstance(args, str)
+    assert json.loads(args) == {"city": "Beijing"}
+    assert glm4_moe_tool_parser.streamed_args_for_tool[0] == args
 
 
 def test_streaming_multiple_tool_calls_sequential(glm4_moe_tool_parser, mock_request):
@@ -621,10 +626,12 @@ def test_streaming_multiple_tool_calls_sequential(glm4_moe_tool_parser, mock_req
         "</tool_call>",
     ]
 
+    current_text = ""
     for chunk in chunks:
+        current_text += chunk
         glm4_moe_tool_parser.extract_tool_calls_streaming(
             previous_text="",
-            current_text="",
+            current_text=current_text,
             delta_text=chunk,
             previous_token_ids=[],
             current_token_ids=[],
@@ -634,8 +641,10 @@ def test_streaming_multiple_tool_calls_sequential(glm4_moe_tool_parser, mock_req
 
     # Should have two tool calls in prev_tool_call_arr
     assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 2
-    assert glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"]["city"] == "Beijing"
-    assert glm4_moe_tool_parser.prev_tool_call_arr[1]["arguments"]["city"] == "Shanghai"
+    args0 = json.loads(glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"])
+    args1 = json.loads(glm4_moe_tool_parser.prev_tool_call_arr[1]["arguments"])
+    assert args0["city"] == "Beijing"
+    assert args1["city"] == "Shanghai"
 
 
 def test_streaming_json_escape_in_string(glm4_moe_tool_parser, mock_request):
@@ -817,3 +826,199 @@ def test_extract_tool_calls_numeric_deserialization(glm4_moe_tool_parser, mock_r
     # Boolean should be deserialized as bool
     assert args["enabled"] is True
     assert isinstance(args["enabled"], bool)
+
+
+def test_streaming_multi_token_chunk(glm4_moe_tool_parser, mock_request):
+    """A complete argument can arrive across a multi-token delta."""
+    _reset_streaming_state(glm4_moe_tool_parser)
+    chunks = [
+        "<tool_call>get_weather\n<arg_key>city</arg_key><arg_value>Bei",
+        "jing</arg_value></tool_call>",
+    ]
+
+    current_text = ""
+    deltas = []
+    for chunk in chunks:
+        current_text += chunk
+        delta = glm4_moe_tool_parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=mock_request,
+        )
+        if delta is not None:
+            deltas.append(delta)
+
+    assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 1
+    assert json.loads(glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"]) == {
+        "city": "Beijing"
+    }
+    streamed_args = "".join(
+        tc.function.arguments
+        for delta in deltas
+        for tc in delta.tool_calls
+        if tc.function and tc.function.arguments
+    )
+    assert json.loads(streamed_args) == {"city": "Beijing"}
+
+
+def test_streaming_content_between_tool_calls(glm4_moe_tool_parser, mock_request):
+    """Text between completed tool calls is emitted exactly once."""
+    _reset_streaming_state(glm4_moe_tool_parser)
+    text = (
+        "Before\n"
+        "<tool_call>get_weather\n<arg_key>city</arg_key>"
+        "<arg_value>Beijing</arg_value></tool_call>"
+        "\nBetween\n"
+        "<tool_call>get_weather\n<arg_key>city</arg_key>"
+        "<arg_value>Shanghai</arg_value></tool_call>"
+    )
+
+    delta = glm4_moe_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    assert delta is not None
+    assert delta.content == "Before\n\nBetween\n"
+    assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 2
+    assert json.loads(glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"])[
+        "city"
+    ] == "Beijing"
+    assert json.loads(glm4_moe_tool_parser.prev_tool_call_arr[1]["arguments"])[
+        "city"
+    ] == "Shanghai"
+
+
+def test_remaining_unstreamed_args_uses_a_strict_prefix(glm4_moe_tool_parser):
+    """Final flush returns only a suffix and rejects non-prefix state."""
+    glm4_moe_tool_parser.prev_tool_call_arr = [
+        {"arguments": '{"city":"Beijing","unit":"celsius"}'},
+    ]
+    glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}']
+    assert (
+        glm4_moe_tool_parser.get_remaining_unstreamed_args()
+        == ',"unit":"celsius"}'
+    )
+
+    glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}junk']
+    assert glm4_moe_tool_parser.get_remaining_unstreamed_args() == ""
+
+
+def test_remaining_unstreamed_args_serializes_dict_once(glm4_moe_tool_parser):
+    """Dict parser state is serialized once, without double JSON encoding."""
+    glm4_moe_tool_parser.prev_tool_call_arr = [
+        {"arguments": {"city": "Beijing", "temperature": 20}},
+    ]
+    glm4_moe_tool_parser.streamed_args_for_tool = ['{"city": "Beijing"']
+    remaining = glm4_moe_tool_parser.get_remaining_unstreamed_args()
+    assert remaining == ', "temperature": 20}'
+
+
+def test_glm47_reparse_streaming_uses_special_argument_regex(glm4_moe_tokenizer):
+    parser = Glm47MoeModelToolParser(glm4_moe_tokenizer)
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                )
+            )
+        ],
+    )
+    text = (
+        "<tool_call>get_weather\n"
+        "<arg_key>city</arg_key>\n"
+        "<arg_value>Beijing</arg_value></tool_call>"
+    )
+
+    result = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    assert result is not None
+    assert json.loads(parser.prev_tool_call_arr[0]["arguments"]) == {
+        "city": "Beijing"
+    }
+
+
+def test_reparse_state_resets_when_current_text_restarts(
+    glm4_moe_tokenizer, mock_request
+):
+    parser = Glm4MoeModelToolParser(glm4_moe_tokenizer)
+    parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="old content",
+        delta_text="old content",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    text = "<tool_call>get_weather\n<arg_key>city</arg_key>"
+    result = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    assert result is not None
+    assert len(parser.prev_tool_call_arr) == 1
+    assert parser.current_tool_id == 0
+
+
+def test_parser_instances_do_not_share_reparse_state(
+    glm4_moe_tokenizer, mock_request
+):
+    parser_a = Glm4MoeModelToolParser(glm4_moe_tokenizer)
+    parser_b = Glm4MoeModelToolParser(glm4_moe_tokenizer)
+    text_a = "<tool_call>get_weather\n<arg_key>city</arg_key>"
+    text_b = "<tool_call>get_weather\n<arg_key>city</arg_key>"
+
+    parser_a.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text_a,
+        delta_text=text_a,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+    parser_b.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text_b,
+        delta_text=text_b,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+
+    assert parser_a.prev_tool_call_arr is not parser_b.prev_tool_call_arr
+    assert parser_a.streamed_args_for_tool is not parser_b.streamed_args_for_tool
+    assert parser_a.current_tool_id == parser_b.current_tool_id == 0

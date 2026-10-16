@@ -1793,15 +1793,10 @@ async def test_tool_choice_validation_without_parser():
     assert "--tool-call-parser" in response_named.error.message
 
 
-class TestCreateRemainingArgsDelta:
-    """Tests for _create_remaining_args_delta helper function.
+class TestRemainingToolArgs:
+    """Tests for parser-owned final tool-argument suffix calculation."""
 
-    This helper is used when streaming tool calls to preserve id/type/name
-    fields in the finish chunk, which would otherwise be lost.
-    """
-
-    def test_preserves_id_type_name(self):
-        """Test that id, type, and name are preserved from original delta."""
+    def test_merge_preserves_tool_call_metadata(self):
         from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
         from vllm.entrypoints.openai.engine.protocol import (
             DeltaFunctionCall,
@@ -1809,124 +1804,76 @@ class TestCreateRemainingArgsDelta:
             DeltaToolCall,
         )
 
-        original_delta = DeltaMessage(
+        delta = DeltaMessage(
             tool_calls=[
                 DeltaToolCall(
-                    index=0,
+                    index=2,
                     id="call_abc123",
                     type="function",
                     function=DeltaFunctionCall(
-                        name="get_weather",
-                        arguments='{"location": "Paris"}',
+                        name="get_weather", arguments='{"city":"Paris"'
                     ),
                 )
             ]
         )
 
-        result = OpenAIServingChat._create_remaining_args_delta(
-            original_delta, '", "unit": "celsius"}', 0
+        OpenAIServingChat._append_remaining_tool_args(
+            delta, ',"unit":"celsius"}', 2
         )
 
-        assert len(result.tool_calls) == 1
-        tc = result.tool_calls[0]
-        assert tc.index == 0
-        assert tc.id == "call_abc123"
-        assert tc.type == "function"
-        assert tc.function.name == "get_weather"
-        assert tc.function.arguments == '", "unit": "celsius"}'
+        tool_call = delta.tool_calls[0]
+        assert tool_call.id == "call_abc123"
+        assert tool_call.type == "function"
+        assert tool_call.index == 2
+        assert tool_call.function is not None
+        assert tool_call.function.name == "get_weather"
+        assert tool_call.function.arguments == (
+            '{"city":"Paris","unit":"celsius"}'
+        )
 
-    def test_matches_by_index(self):
-        """Test that the correct tool call is matched by index."""
+    def test_merge_does_not_create_standalone_delta(self):
         from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-        from vllm.entrypoints.openai.engine.protocol import (
-            DeltaFunctionCall,
-            DeltaMessage,
-            DeltaToolCall,
+        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+
+        delta = DeltaMessage()
+        OpenAIServingChat._append_remaining_tool_args(
+            delta, '{"city":"Paris"}', 0
         )
+        assert delta.tool_calls == []
 
-        original_delta = DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=0,
-                    id="call_first",
-                    type="function",
-                    function=DeltaFunctionCall(name="func_a", arguments="{}"),
-                ),
-                DeltaToolCall(
-                    index=1,
-                    id="call_second",
-                    type="function",
-                    function=DeltaFunctionCall(name="func_b", arguments="{}"),
-                ),
-            ]
-        )
+    def test_dict_arguments_are_serialized_once(self):
+        from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
-        result = OpenAIServingChat._create_remaining_args_delta(
-            original_delta, '{"extra": true}', 1
-        )
+        parser = ToolParser(None)  # type: ignore[arg-type]
+        parser.prev_tool_call_arr = [
+            {"arguments": {"city": "Paris", "unit": "celsius"}}
+        ]
+        parser.streamed_args_for_tool = ['{"city": "Paris"']
 
-        assert len(result.tool_calls) == 1
-        tc = result.tool_calls[0]
-        assert tc.index == 1
-        assert tc.id == "call_second"
-        assert tc.function.name == "func_b"
+        assert parser.get_remaining_unstreamed_args() == ', "unit": "celsius"}'
 
-    def test_no_matching_tool_call(self):
-        """Test graceful handling when no matching tool call is found."""
-        from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-        from vllm.entrypoints.openai.engine.protocol import (
-            DeltaFunctionCall,
-            DeltaMessage,
-            DeltaToolCall,
-        )
+    def test_string_arguments_are_not_double_serialized(self):
+        from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
-        original_delta = DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=0,
-                    id="call_zero",
-                    type="function",
-                    function=DeltaFunctionCall(name="func", arguments="{}"),
-                )
-            ]
-        )
+        parser = ToolParser(None)  # type: ignore[arg-type]
+        parser.prev_tool_call_arr = [
+            {"arguments": '{"city":"Paris","unit":"celsius"}'}
+        ]
+        parser.streamed_args_for_tool = ['{"city":"Paris"']
 
-        result = OpenAIServingChat._create_remaining_args_delta(
-            original_delta, '{"arg": 1}', 5
-        )
+        assert parser.get_remaining_unstreamed_args() == ',"unit":"celsius"}'
 
-        assert len(result.tool_calls) == 1
-        tc = result.tool_calls[0]
-        assert tc.index == 5
-        assert tc.id is None
-        assert tc.type is None
-        assert tc.function.name is None
-        assert tc.function.arguments == '{"arg": 1}'
+    def test_non_prefix_state_does_not_flush(self):
+        from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
-    def test_function_is_none(self):
-        """Test handling when original tool call has no function."""
-        from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-        from vllm.entrypoints.openai.engine.protocol import DeltaMessage, DeltaToolCall
+        parser = ToolParser(None)  # type: ignore[arg-type]
+        parser.prev_tool_call_arr = [{"arguments": '{"city":"Paris"}'}]
+        parser.streamed_args_for_tool = ['{"city":"London"}']
 
-        original_delta = DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=0,
-                    id="call_nofunc",
-                    type="function",
-                    function=None,
-                )
-            ]
-        )
+        assert parser.get_remaining_unstreamed_args() == ""
 
-        result = OpenAIServingChat._create_remaining_args_delta(
-            original_delta, '{"data": "value"}', 0
-        )
+    def test_empty_state_does_not_flush(self):
+        from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
-        assert len(result.tool_calls) == 1
-        tc = result.tool_calls[0]
-        assert tc.index == 0
-        assert tc.id == "call_nofunc"
-        assert tc.type == "function"
-        assert tc.function.name is None
-        assert tc.function.arguments == '{"data": "value"}'
+        parser = ToolParser(None)  # type: ignore[arg-type]
+        assert parser.get_remaining_unstreamed_args() == ""

@@ -29,6 +29,19 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def partial_tag_overlap(text: str, tag: str) -> int:
+    """Return the length of a partial ``tag`` suffix in ``text``.
+
+    This is used by streaming tool parsers to hold back a partial XML tag
+    until the rest of the tag arrives in a later output chunk.
+    """
+    max_check = min(len(tag) - 1, len(text))
+    for length in range(max_check, 0, -1):
+        if text.endswith(tag[:length]):
+            return length
+    return 0
+
+
 def find_common_prefix(s1: str, s2: str) -> str:
     """
     Finds a common prefix that is shared between two strings, if there is one.
