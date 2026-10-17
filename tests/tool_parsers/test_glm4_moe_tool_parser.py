@@ -8,6 +8,8 @@ import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
@@ -39,7 +41,10 @@ def mock_request() -> ChatCompletionRequest:
         ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="get_weather",
-                parameters={"city": {"type": "string"}},
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
             ),
         ),
     ]
@@ -402,6 +407,94 @@ def test_streaming_no_tool_calls(glm4_moe_tool_parser, mock_request):
     assert result is not None
     assert hasattr(result, "content")
     assert result.content == current_text
+    assert json.loads(result.model_dump_json(exclude_unset=True)) == {
+        "content": current_text
+    }
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize("chunk_size", [1, 4, 256])
+def test_streaming_text_omits_empty_tool_calls(
+    parser_cls, chunk_size, glm4_moe_tokenizer, mock_request
+):
+    """Plain text must not signal a tool transition to protocol gateways."""
+    parser = parser_cls(glm4_moe_tokenizer)
+    text = "我是 Claude Code，底层模型是 **GLM-5.3**。\n\n服务 IP 需查看配置。"
+    received_text = []
+    for start in range(0, len(text), chunk_size):
+        delta_text = text[start : start + chunk_size]
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=text[:start],
+            current_text=text[: start + chunk_size],
+            delta_text=delta_text,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=mock_request,
+        )
+        assert delta is not None
+        response = ChatCompletionStreamResponse(
+            id="chatcmpl-text-stream",
+            created=0,
+            model=MODEL,
+            choices=[ChatCompletionResponseStreamChoice(index=0, delta=delta)],
+        )
+        # Match the serving layer's serialization, including nested fields.
+        payload = json.loads(response.model_dump_json(exclude_unset=True))
+        wire_delta = payload["choices"][0]["delta"]
+        assert wire_delta == {"content": delta_text}
+        received_text.append(wire_delta["content"])
+
+    assert "".join(received_text) == text
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+def test_streaming_mixed_text_and_tool_call_preserves_arguments(
+    parser_cls, glm4_moe_tokenizer, mock_request
+):
+    """Omitting empty tool lists must preserve real calls in an MTP chunk."""
+    parser = parser_cls(glm4_moe_tokenizer)
+    text = (
+        "先查天气。<tool_call>get_weather\n"
+        "<arg_key>city</arg_key><arg_value>北京</arg_value></tool_call>"
+    )
+    delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+    assert delta is not None
+    payload = json.loads(delta.model_dump_json(exclude_unset=True))
+    assert payload["content"] == "先查天气。"
+    calls = payload["tool_calls"]
+    assert calls[0]["id"]
+    assert calls[0]["type"] == "function"
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert all(call["index"] == 0 for call in calls)
+    arguments = "".join(call["function"].get("arguments", "") for call in calls)
+    assert json.loads(arguments) == {"city": "北京"}
+
+    # A completed tool call must not leak an empty tool list into later text.
+    suffix = "\n查询完成。"
+    delta = parser.extract_tool_calls_streaming(
+        previous_text=text,
+        current_text=text + suffix,
+        delta_text=suffix,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=mock_request,
+    )
+    assert delta is not None
+    assert json.loads(delta.model_dump_json(exclude_unset=True)) == {"content": suffix}
 
 
 def test_streaming_with_content_before_tool_calls(glm4_moe_tool_parser, mock_request):
@@ -428,6 +521,9 @@ def test_streaming_with_content_before_tool_calls(glm4_moe_tool_parser, mock_req
     assert result is not None
     assert hasattr(result, "content")
     assert result.content == "I will help you get the weather"
+    assert json.loads(result.model_dump_json(exclude_unset=True)) == {
+        "content": "I will help you get the weather"
+    }
 
 
 def test_extract_tool_calls_special_characters(glm4_moe_tool_parser, mock_request):
@@ -574,7 +670,12 @@ def test_streaming_no_args_tool_call(glm4_moe_tool_parser, mock_request):
     assert result.tool_calls
     assert result.tool_calls[0].function is not None
     assert result.tool_calls[0].function.name == "get_current_date"
-    assert result.tool_calls[0].function.arguments == "{}"
+    arguments = "".join(
+        call.function.arguments or ""
+        for call in result.tool_calls
+        if call.function is not None
+    )
+    assert json.loads(arguments) == {}
 
 
 def test_streaming_prev_tool_call_arr_updates(glm4_moe_tool_parser, mock_request):
@@ -890,12 +991,14 @@ def test_streaming_content_between_tool_calls(glm4_moe_tool_parser, mock_request
     assert delta is not None
     assert delta.content == "Before\n\nBetween\n"
     assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 2
-    assert json.loads(glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"])[
-        "city"
-    ] == "Beijing"
-    assert json.loads(glm4_moe_tool_parser.prev_tool_call_arr[1]["arguments"])[
-        "city"
-    ] == "Shanghai"
+    assert (
+        json.loads(glm4_moe_tool_parser.prev_tool_call_arr[0]["arguments"])["city"]
+        == "Beijing"
+    )
+    assert (
+        json.loads(glm4_moe_tool_parser.prev_tool_call_arr[1]["arguments"])["city"]
+        == "Shanghai"
+    )
 
 
 def test_remaining_unstreamed_args_uses_a_strict_prefix(glm4_moe_tool_parser):
@@ -904,10 +1007,7 @@ def test_remaining_unstreamed_args_uses_a_strict_prefix(glm4_moe_tool_parser):
         {"arguments": '{"city":"Beijing","unit":"celsius"}'},
     ]
     glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}']
-    assert (
-        glm4_moe_tool_parser.get_remaining_unstreamed_args()
-        == ',"unit":"celsius"}'
-    )
+    assert glm4_moe_tool_parser.get_remaining_unstreamed_args() == ',"unit":"celsius"}'
 
     glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}junk']
     assert glm4_moe_tool_parser.get_remaining_unstreamed_args() == ""
@@ -957,9 +1057,7 @@ def test_glm47_reparse_streaming_uses_special_argument_regex(glm4_moe_tokenizer)
     )
 
     assert result is not None
-    assert json.loads(parser.prev_tool_call_arr[0]["arguments"]) == {
-        "city": "Beijing"
-    }
+    assert json.loads(parser.prev_tool_call_arr[0]["arguments"]) == {"city": "Beijing"}
 
 
 def test_reparse_state_resets_when_current_text_restarts(
@@ -992,9 +1090,7 @@ def test_reparse_state_resets_when_current_text_restarts(
     assert parser.current_tool_id == 0
 
 
-def test_parser_instances_do_not_share_reparse_state(
-    glm4_moe_tokenizer, mock_request
-):
+def test_parser_instances_do_not_share_reparse_state(glm4_moe_tokenizer, mock_request):
     parser_a = Glm4MoeModelToolParser(glm4_moe_tokenizer)
     parser_b = Glm4MoeModelToolParser(glm4_moe_tokenizer)
     text_a = "<tool_call>get_weather\n<arg_key>city</arg_key>"

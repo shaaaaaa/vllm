@@ -334,9 +334,7 @@ class Glm4MoeModelToolParser(ToolParser):
         if has_partial_value:
             key_match = None
             for match in re.finditer(
-                re.escape(self.arg_key_start)
-                + r"(.*?)"
-                + re.escape(self.arg_key_end),
+                re.escape(self.arg_key_start) + r"(.*?)" + re.escape(self.arg_key_end),
                 body[:last_value_start],
                 re.DOTALL,
             ):
@@ -429,9 +427,9 @@ class Glm4MoeModelToolParser(ToolParser):
                     tool_call_deltas.append(
                         DeltaToolCall(
                             index=index,
-                            function=DeltaFunctionCall(
-                                arguments=args_delta
-                            ).model_dump(exclude_none=True),
+                            function=DeltaFunctionCall(arguments=args_delta).model_dump(
+                                exclude_none=True
+                            ),
                         )
                     )
 
@@ -439,6 +437,10 @@ class Glm4MoeModelToolParser(ToolParser):
             self.current_tool_id = len(self.prev_tool_call_arr) - 1
             self.current_tool_name_sent = True
 
-        if content or tool_call_deltas:
+        if tool_call_deltas:
             return DeltaMessage(content=content, tool_calls=tool_call_deltas)
+        if content:
+            # Leave tool_calls unset so exclude_unset serialization does not
+            # signal a tool-call transition to protocol-converting gateways.
+            return DeltaMessage(content=content)
         return None
