@@ -5,6 +5,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from jsonschema.validators import validator_for
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -966,6 +967,642 @@ def test_streaming_multi_token_chunk(glm4_moe_tool_parser, mock_request):
     assert json.loads(streamed_args) == {"city": "Beijing"}
 
 
+def _stream_argument_fragments(parser, request, chunks):
+    previous_text = ""
+    fragments = []
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        previous_text = current_text
+        if delta is None:
+            continue
+        payload = json.loads(delta.model_dump_json(exclude_unset=True))
+        for call in payload.get("tool_calls", []):
+            assert call["index"] == 0
+            arguments = call.get("function", {}).get("arguments")
+            if arguments:
+                fragments.append(arguments)
+    return fragments
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize("chunk_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("task_id_first", [False, True])
+def test_streaming_task_update_preserves_required_id(
+    parser_cls, glm4_moe_tokenizer, chunk_size, task_id_first
+):
+    """An anyOf status must not truncate JSON or swallow the required task ID."""
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(
+                    name="TaskUpdate",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "taskId": {"type": "string"},
+                            "status": {
+                                "anyOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": [
+                                            "pending",
+                                            "in_progress",
+                                            "interrupt",
+                                            "completed",
+                                        ],
+                                    },
+                                    {"type": "string", "const": "deleted"},
+                                ]
+                            },
+                        },
+                        "required": ["taskId"],
+                    },
+                )
+            )
+        ],
+    )
+    status = "<arg_key>status</arg_key><arg_value>in_progress</arg_value>"
+    task_id = "<arg_key>taskId</arg_key><arg_value>1</arg_value>"
+    body = task_id + status if task_id_first else status + task_id
+    text = f"<tool_call>TaskUpdate\n{body}</tool_call>"
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    fragments = _stream_argument_fragments(
+        parser_cls(glm4_moe_tokenizer), request, chunks
+    )
+    assert json.loads("".join(fragments)) == {
+        "status": "in_progress",
+        "taskId": "1",
+    }
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize("chunk_size", [1, 4, 256])
+@pytest.mark.parametrize(
+    "schema, raw_value, expected",
+    [
+        pytest.param({}, "in_progress", "in_progress", id="untyped-string"),
+        pytest.param({"type": "integer"}, " 42 ", 42, id="integer-whitespace"),
+        pytest.param({"type": "number"}, "1e3", 1000.0, id="exponent"),
+        pytest.param({"type": "boolean"}, "True", True, id="python-boolean"),
+        pytest.param({"type": "array"}, "[1,2]", [1, 2], id="array-spacing"),
+        pytest.param(
+            {"type": "object"},
+            '{"ok":true,"values":[1,2]}',
+            {"ok": True, "values": [1, 2]},
+            id="nested-object",
+        ),
+        pytest.param(
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "null",
+            None,
+            id="nullable-string",
+        ),
+        pytest.param(
+            {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            "42",
+            42,
+            id="mixed-union",
+        ),
+    ],
+)
+def test_streaming_serialized_values_preserve_following_args(
+    parser_cls, glm4_moe_tokenizer, chunk_size, schema, raw_value, expected
+):
+    """Partial values must not commit bytes that deserialization will change."""
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(
+                    name="update",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": schema,
+                            "taskId": {"type": "string"},
+                        },
+                    },
+                )
+            )
+        ],
+    )
+    text = (
+        "<tool_call>update\n"
+        f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value>"
+        "<arg_key>taskId</arg_key><arg_value>1</arg_value></tool_call>"
+    )
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    fragments = _stream_argument_fragments(
+        parser_cls(glm4_moe_tokenizer), request, chunks
+    )
+    arguments = json.loads("".join(fragments))
+    assert arguments == {"value": expected, "taskId": "1"}
+    assert type(arguments["value"]) is type(expected)
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize("union_keyword", ["anyOf", "oneOf"])
+@pytest.mark.parametrize("raw_value", ["123", "false", "null"])
+def test_string_union_values_keep_their_type_and_stream_incrementally(
+    parser_cls, glm4_moe_tokenizer, union_keyword, raw_value
+):
+    """String-only unions preserve JSON-looking strings in both API modes."""
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(
+                    name="update",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                union_keyword: [
+                                    {
+                                        "type": "string",
+                                        "enum": ["123", "false", "null"],
+                                    },
+                                    {"type": "string", "const": "deleted"},
+                                ]
+                            }
+                        },
+                    },
+                )
+            )
+        ],
+    )
+    text = (
+        "<tool_call>update\n"
+        f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value></tool_call>"
+    )
+    parser = parser_cls(glm4_moe_tokenizer)
+    extracted = parser.extract_tool_calls(text, request)
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "value": raw_value
+    }
+    fragments = _stream_argument_fragments(parser, request, text)
+    assert json.loads("".join(fragments)) == {"value": raw_value}
+    assert len(fragments) > len(raw_value)
+
+
+def _schema_case(name, schema, raw, expected, incremental=False, **root):
+    parameters = {
+        "type": "object",
+        "properties": {"value": schema, "taskId": {"type": "string"}},
+        "required": ["value", "taskId"],
+        **root,
+    }
+    return pytest.param(parameters, raw, expected, incremental, id=name)
+
+
+@pytest.mark.parametrize(
+    "parameters, raw, expected, incremental",
+    [
+        _schema_case("string-type-array", {"type": ["string"]}, "123", "123", True),
+        _schema_case("nullable-type-array", {"type": ["string", "null"]}, "123", "123"),
+        _schema_case("nullable-false", {"type": ["string", "null"]}, "false", "false"),
+        _schema_case("nullable-null", {"type": ["string", "null"]}, "null", None),
+        _schema_case(
+            "nullable-quoted-null", {"type": ["string", "null"]}, '"null"', "null"
+        ),
+        _schema_case("nullable-empty", {"type": ["string", "null"]}, "", ""),
+        _schema_case(
+            "nullable-whitespace", {"type": ["string", "null"]}, "  text\n", "  text\n"
+        ),
+        _schema_case("nullable-number", {"type": ["number", "null"]}, "1e3", 1000.0),
+        _schema_case(
+            "nullable-object", {"type": ["object", "null"]}, '{"id":"1"}', {"id": "1"}
+        ),
+        _schema_case("nullable-array", {"type": ["array", "null"]}, "null", None),
+        _schema_case(
+            "nullable-anyof-string",
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "123",
+            "123",
+        ),
+        _schema_case(
+            "nullable-anyof-null",
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "null",
+            None,
+        ),
+        _schema_case(
+            "nullable-oneof-string",
+            {"oneOf": [{"type": "null"}, {"type": "string"}]},
+            "false",
+            "false",
+        ),
+        _schema_case(
+            "nullable-oneof-null",
+            {"oneOf": [{"type": "null"}, {"type": "string"}]},
+            "null",
+            None,
+        ),
+        _schema_case(
+            "nullable-constrained",
+            {"type": ["string", "null"], "enum": ["null", "123"]},
+            "null",
+            "null",
+            True,
+        ),
+        _schema_case(
+            "nullable-not-null",
+            {"type": ["string", "null"], "not": {"type": "null"}},
+            "null",
+            "null",
+        ),
+        _schema_case(
+            "string-whitespace", {"type": "string"}, "  text\n", "  text\n", True
+        ),
+        _schema_case(
+            "string-literal-quotes", {"type": "string"}, '"null"', '"null"', True
+        ),
+        _schema_case(
+            "enum-string", {"enum": ["123", "false", "null"]}, "false", "false", True
+        ),
+        _schema_case("enum-null", {"enum": ["123", None]}, "null", None),
+        _schema_case("const-string", {"const": "false"}, "false", "false", True),
+        _schema_case("const-null", {"const": None}, "null", None),
+        _schema_case(
+            "local-defs",
+            {"$ref": "#/$defs/ID"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"ID": {"type": "string"}}},
+        ),
+        _schema_case(
+            "legacy-definitions",
+            {"$ref": "#/definitions/ID"},
+            "123",
+            "123",
+            True,
+            definitions={"ID": {"type": "string"}},
+        ),
+        _schema_case(
+            "escaped-pointer",
+            {"$ref": "#/$defs/a~1b~0c"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"a/b~c": {"type": "string"}}},
+        ),
+        _schema_case(
+            "percent-encoded-pointer",
+            {"$ref": "#/$defs/space%20name"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"space name": {"type": "string"}}},
+        ),
+        _schema_case(
+            "anchor",
+            {"$ref": "#identifier"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"ID": {"$anchor": "identifier", "type": "string"}}},
+        ),
+        _schema_case(
+            "ref-chain",
+            {"$ref": "#/$defs/A"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"type": "string"}}},
+        ),
+        _schema_case(
+            "nullable-ref-string",
+            {"$ref": "#/$defs/ID"},
+            "123",
+            "123",
+            **{"$defs": {"ID": {"type": ["string", "null"]}}},
+        ),
+        _schema_case(
+            "nullable-ref-null",
+            {"$ref": "#/$defs/ID"},
+            "null",
+            None,
+            **{"$defs": {"ID": {"type": ["string", "null"]}}},
+        ),
+        _schema_case(
+            "ref-sibling-intersection",
+            {"$ref": "#/$defs/ID", "type": "string"},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"ID": {"type": ["string", "integer"]}}},
+        ),
+        _schema_case(
+            "draft7-ref-siblings-ignored",
+            {"$ref": "#/definitions/ID", "type": "integer"},
+            "123",
+            "123",
+            True,
+            **{
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "definitions": {"ID": {"type": "string"}},
+            },
+        ),
+        _schema_case(
+            "draft4-unknown-const",
+            {"const": "123"},
+            "123",
+            123,
+            **{"$schema": "http://json-schema.org/draft-04/schema#"},
+        ),
+        _schema_case(
+            "root-ref-literal-percent",
+            {},
+            "123",
+            "123",
+            True,
+            **{
+                "$ref": "#/$defs/Args%2520",
+                "$defs": {"Args%20": {"properties": {"value": {"type": "string"}}}},
+            },
+        ),
+        _schema_case(
+            "allof-string-constraint",
+            {"allOf": [{"type": "string"}, {"pattern": "^[0-9]+$"}]},
+            "123",
+            "123",
+            True,
+        ),
+        _schema_case(
+            "allof-intersection",
+            {"allOf": [{"type": ["string", "null"]}, {"type": ["string", "integer"]}]},
+            "123",
+            "123",
+            True,
+        ),
+        _schema_case(
+            "allof-ref",
+            {"allOf": [{"$ref": "#/$defs/ID"}, {"minLength": 3}]},
+            "123",
+            "123",
+            True,
+            **{"$defs": {"ID": {"type": "string"}}},
+        ),
+        _schema_case(
+            "nested-compositions",
+            {
+                "allOf": [
+                    {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    {"oneOf": [{"enum": ["123"]}, {"const": "false"}]},
+                ]
+            },
+            "123",
+            "123",
+            True,
+        ),
+        _schema_case(
+            "anyof-constraint-selects-string",
+            {
+                "anyOf": [
+                    {"type": "integer", "minimum": 200},
+                    {"type": "string", "pattern": "^123$"},
+                ]
+            },
+            "123",
+            "123",
+        ),
+        _schema_case(
+            "oneof-exclusive-selects-string",
+            {"oneOf": [{"type": "integer"}, {"type": "number"}, {"type": "string"}]},
+            "123",
+            "123",
+        ),
+        _schema_case(
+            "allof-not-selects-string",
+            {"allOf": [{"type": ["string", "integer"]}, {"not": {"type": "integer"}}]},
+            "123",
+            "123",
+        ),
+        _schema_case(
+            "mixed-union-keeps-integer", {"type": ["string", "integer"]}, "123", 123
+        ),
+        _schema_case(
+            "mixed-union-quoted-string", {"type": ["string", "integer"]}, '"123"', "123"
+        ),
+        _schema_case(
+            "anyof-unconstrained-branch",
+            {"anyOf": [{"type": "string"}, {}]},
+            "123",
+            123,
+        ),
+        _schema_case(
+            "allof-number-integer",
+            {"allOf": [{"type": "number"}, {"type": "integer"}]},
+            "123",
+            123,
+        ),
+        _schema_case("true-schema", True, "123", 123),
+        _schema_case(
+            "root-allof",
+            {},
+            "123",
+            "123",
+            True,
+            allOf=[{"properties": {"value": {"type": "string"}}}],
+        ),
+        _schema_case(
+            "root-anyof",
+            {},
+            "123",
+            "123",
+            True,
+            anyOf=[
+                {"properties": {"value": {"const": "123"}}},
+                {"properties": {"value": {"const": "false"}}},
+            ],
+        ),
+        _schema_case(
+            "root-oneof",
+            {},
+            "123",
+            "123",
+            True,
+            oneOf=[
+                {"properties": {"value": {"const": "123"}}},
+                {"properties": {"value": {"const": "false"}}},
+            ],
+        ),
+        _schema_case(
+            "root-ref",
+            {},
+            "123",
+            "123",
+            True,
+            **{
+                "$ref": "#/$defs/Args",
+                "$defs": {"Args": {"properties": {"value": {"type": "string"}}}},
+            },
+        ),
+        _schema_case(
+            "pattern-property",
+            {},
+            "123",
+            "123",
+            True,
+            patternProperties={"^val": {"type": "string"}},
+        ),
+        _schema_case(
+            "additional-property",
+            {},
+            "123",
+            "123",
+            True,
+            properties={"taskId": {"type": "string"}},
+            additionalProperties={"type": "string"},
+        ),
+        _schema_case(
+            "property-pattern-intersection",
+            {"type": ["string", "integer"]},
+            "123",
+            "123",
+            True,
+            patternProperties={"^value$": {"type": "string"}},
+        ),
+        _schema_case(
+            "additional-does-not-override-property",
+            {"type": "integer"},
+            "123",
+            123,
+            additionalProperties={"type": "string"},
+        ),
+        _schema_case(
+            "recursive-object",
+            {"$ref": "#/$defs/Node"},
+            '{"id":"1","child":{"id":"2"}}',
+            {"id": "1", "child": {"id": "2"}},
+            **{
+                "$defs": {
+                    "Node": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "child": {"$ref": "#/$defs/Node"},
+                        },
+                    }
+                }
+            },
+        ),
+        _schema_case(
+            "embedded-resource",
+            {"$ref": "#/$defs/Inner"},
+            "123",
+            "123",
+            True,
+            **{
+                "$id": "https://example.test/root",
+                "$defs": {
+                    "Inner": {
+                        "$id": "inner/",
+                        "$defs": {"ID": {"type": "string"}},
+                        "$ref": "#/$defs/ID",
+                    }
+                },
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+def test_schema_types_match_in_streaming_and_nonstreaming(
+    parser_cls, glm4_moe_tokenizer, parameters, raw, expected, incremental, chunk_size
+):
+    validator = validator_for(parameters)(parameters)
+    validator.check_schema(parameters)
+    expected_args = {"value": expected, "taskId": "1"}
+    validator.validate(expected_args)
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(name="update", parameters=parameters)
+            )
+        ],
+    )
+    prefix = "<tool_call>update\n<arg_key>value</arg_key><arg_value>" + raw
+    suffix = "</arg_value><arg_key>taskId</arg_key><arg_value>1</arg_value></tool_call>"
+    text = prefix + suffix
+    parser = parser_cls(glm4_moe_tokenizer)
+    result = parser.extract_tool_calls(text, request)
+    nonstreamed = json.loads(result.tool_calls[0].function.arguments)
+    assert nonstreamed == expected_args
+    assert type(nonstreamed["value"]) is type(expected)
+    validator.validate(nonstreamed)
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    arguments = json.loads("".join(_stream_argument_fragments(parser, request, chunks)))
+    assert arguments == expected_args
+    assert type(arguments["value"]) is type(expected)
+    validator.validate(arguments)
+    if chunk_size == 1:
+        # An ambiguous value must not emit irreversible raw bytes before its
+        # closing tag; a string-only schema must still stream long content.
+        partial = _stream_argument_fragments(
+            parser_cls(glm4_moe_tokenizer), request, [prefix]
+        )
+        assert bool(partial) is incremental
+
+
+@pytest.mark.parametrize(
+    "parser_cls", [Glm4MoeModelToolParser, Glm47MoeModelToolParser]
+)
+@pytest.mark.parametrize(
+    "reference", ["#/$defs/missing", "https://example.invalid/schema", "#/$defs/Cycle"]
+)
+def test_unresolvable_schema_keeps_following_arguments(
+    parser_cls, glm4_moe_tokenizer, reference
+):
+    parameters = {
+        "type": "object",
+        "properties": {"value": {"$ref": reference}, "taskId": {"type": "string"}},
+        "$defs": {"Cycle": {"$ref": "#/$defs/Cycle"}},
+    }
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            ChatCompletionToolsParam(
+                function=FunctionDefinition(name="update", parameters=parameters)
+            )
+        ],
+    )
+    text = (
+        "<tool_call>update\n<arg_key>value</arg_key><arg_value>123</arg_value>"
+        "<arg_key>taskId</arg_key><arg_value>1</arg_value></tool_call>"
+    )
+    parser = parser_cls(glm4_moe_tokenizer)
+    arguments = "".join(_stream_argument_fragments(parser, request, text))
+    assert json.loads(arguments) == {"value": 123, "taskId": "1"}
+    result = parser.extract_tool_calls(text, request)
+    assert json.loads(result.tool_calls[0].function.arguments) == json.loads(arguments)
+
+
 def test_streaming_content_between_tool_calls(glm4_moe_tool_parser, mock_request):
     """Text between completed tool calls is emitted exactly once."""
     _reset_streaming_state(glm4_moe_tool_parser)
@@ -1006,7 +1643,7 @@ def test_remaining_unstreamed_args_uses_a_strict_prefix(glm4_moe_tool_parser):
     glm4_moe_tool_parser.prev_tool_call_arr = [
         {"arguments": '{"city":"Beijing","unit":"celsius"}'},
     ]
-    glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}']
+    glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"']
     assert glm4_moe_tool_parser.get_remaining_unstreamed_args() == ',"unit":"celsius"}'
 
     glm4_moe_tool_parser.streamed_args_for_tool = ['{"city":"Beijing"}junk']
