@@ -57,7 +57,11 @@ def schedule_allocation(length=81665, **overrides):
             setattr(request, key[8:], overrides.pop(key))
     allocate = Mock(return_value=object())
     ns = dict(
-        self=NS(block_size=128, kv_cache_manager=NS(allocate_slots=allocate)),
+        self=NS(
+            block_size=128,
+            connector=None,
+            kv_cache_manager=NS(allocate_slots=allocate),
+        ),
         request=request,
         request_id="r",
         dsa_compact_external_load=True,

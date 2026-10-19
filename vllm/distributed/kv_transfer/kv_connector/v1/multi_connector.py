@@ -377,6 +377,24 @@ class MultiConnector(KVConnectorBase_V1):
                 to_return = (toks, load_async)
         return to_return
 
+    def is_dsa_cold_compact_load(self, request_id: str) -> bool | None:
+        """Return the child's request layout, or None for the legacy policy."""
+        selected = self._requests_to_connector.get(request_id)
+        if selected is None:
+            return None
+        query = getattr(self._connectors[selected], "is_dsa_cold_compact_load", None)
+        return query(request_id) if callable(query) else None
+
+    def get_dsa_cold_load_num_tokens(self, request_id: str) -> int:
+        """Return the selected child's exact restore extent when available."""
+        selected = self._requests_to_connector.get(request_id)
+        if selected is None:
+            return 0
+        query = getattr(
+            self._connectors[selected], "get_dsa_cold_load_num_tokens", None
+        )
+        return int(query(request_id)) if callable(query) else 0
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

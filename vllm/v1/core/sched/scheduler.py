@@ -793,11 +793,23 @@ class Scheduler(SchedulerInterface):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
-                        dsa_compact_external_load = load_kv_async and bool(
-                            getattr(
-                                self.connector,
-                                "supports_dsa_compact_external_load",
-                                False,
+                        compact_load_query = (
+                            getattr(self.connector, "is_dsa_cold_compact_load", None)
+                            if load_kv_async else None
+                        )
+                        request_compact_load = (
+                            compact_load_query(request.request_id)
+                            if callable(compact_load_query) else None
+                        )
+                        dsa_compact_external_load = load_kv_async and (
+                            bool(request_compact_load)
+                            if request_compact_load is not None
+                            else bool(
+                                getattr(
+                                    self.connector,
+                                    "supports_dsa_compact_external_load",
+                                    False,
+                                )
                             )
                         )
 
@@ -905,6 +917,7 @@ class Scheduler(SchedulerInterface):
                     compact_external_load=dsa_compact_external_load or (
                         bootstrap_full_hit and num_external_computed_tokens > 0
                         and num_new_local_computed_tokens == 0
+                        and (not load_kv_async or request_compact_load is None)
                     ),
                 ):
                     continue
@@ -996,6 +1009,7 @@ class Scheduler(SchedulerInterface):
 
                 compact_external_load = dsa_compact_external_load or (
                     bootstrap_full_hit
+                    and (not load_kv_async or request_compact_load is None)
                     and (
                         request.dsa_compact_allocated
                         or (
@@ -1004,6 +1018,21 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                 )
+                if load_kv_async:
+                    restore_extent_query = getattr(
+                        self.connector, "get_dsa_cold_load_num_tokens", None
+                    )
+                    if callable(restore_extent_query):
+                        # Restore storage may extend beyond the reusable prefix.
+                        # Reserving it must not schedule any model computation.
+                        restore_tokens = int(restore_extent_query(request.request_id))
+                        effective_lookahead_tokens = max(
+                            effective_lookahead_tokens,
+                            restore_tokens
+                            - num_new_local_computed_tokens
+                            - num_external_computed_tokens,
+                        )
+
                 if (
                     compact_external_load
                     and load_kv_async
