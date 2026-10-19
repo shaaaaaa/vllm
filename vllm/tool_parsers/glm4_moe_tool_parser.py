@@ -36,6 +36,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
+from vllm.tool_parsers.glm_tool_schema import GlmToolArgumentSchema, GlmToolSchema
 from vllm.tool_parsers.utils import partial_tag_overlap
 
 logger = init_logger(__name__)
@@ -90,6 +91,7 @@ class Glm4MoeModelToolParser(ToolParser):
         self._streaming_text: str = ""
         self._sent_content_idx: int = 0
         self._tool_call_ids: list[str] = []
+        self._tool_schemas: dict[str, tuple[dict[str, Any], GlmToolSchema]] = {}
 
     @staticmethod
     def _deserialize(value: str) -> Any:
@@ -116,27 +118,51 @@ class Glm4MoeModelToolParser(ToolParser):
             return ""
         return json.dumps(s, ensure_ascii=False)[1:-1]
 
-    @staticmethod
+    def _argument_schema(
+        self,
+        tool_name: str,
+        arg_name: str,
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> GlmToolArgumentSchema | None:
+        if tools is None:
+            return None
+        for tool in tools:
+            if tool.function.name != tool_name:
+                continue
+            parameters = tool.function.parameters
+            if not isinstance(parameters, dict):
+                return None
+            cached = self._tool_schemas.get(tool_name)
+            if cached is None or cached[0] is not parameters:
+                cached = (parameters, GlmToolSchema(parameters))
+                self._tool_schemas[tool_name] = cached
+            return cached[1].argument(arg_name)
+        logger.debug("No tool named '%s'.", tool_name)
+        return None
+
     def _is_string_type(
+        self,
         tool_name: str,
         arg_name: str,
         tools: list[ChatCompletionToolsParam] | None,
     ) -> bool:
-        if tools is None:
-            return False
-        for tool in tools:
-            if tool.function.name != tool_name:
-                continue
-            if tool.function.parameters is None:
-                return False
-            arg_type = (
-                tool.function.parameters.get("properties", {})
-                .get(arg_name, {})
-                .get("type", None)
-            )
-            return arg_type == "string"
-        logger.debug("No tool named '%s'.", tool_name)
-        return False
+        schema = self._argument_schema(tool_name, arg_name, tools)
+        return schema is not None and schema.is_string
+
+    def _deserialize_argument(
+        self,
+        tool_name: str,
+        arg_name: str,
+        value: str,
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> Any:
+        schema = self._argument_schema(tool_name, arg_name, tools)
+        if schema is not None and schema.is_string:
+            return value
+        deserialized = self._deserialize(value.strip())
+        if schema is not None:
+            return schema.select_value(value, deserialized)
+        return deserialized
 
     @staticmethod
     def _tools_enabled(request: ChatCompletionRequest) -> bool:
@@ -183,9 +209,9 @@ class Glm4MoeModelToolParser(ToolParser):
                 arg_dct: dict[str, Any] = {}
                 for key, value in pairs:
                     arg_key = key.strip()
-                    arg_val = value.strip()
-                    if not self._is_string_type(tc_name, arg_key, request.tools):
-                        arg_val = self._deserialize(arg_val)
+                    arg_val = self._deserialize_argument(
+                        tc_name, arg_key, value, request.tools
+                    )
                     logger.debug("arg_key = %s, arg_val = %s", arg_key, arg_val)
                     arg_dct[arg_key] = arg_val
                 tool_calls.append(
@@ -238,6 +264,7 @@ class Glm4MoeModelToolParser(ToolParser):
         self.prev_tool_call_arr.clear()
         self.streamed_args_for_tool.clear()
         self._tool_call_ids.clear()
+        self._tool_schemas.clear()
 
     def _extract_content(self, text: str) -> str | None:
         """Return newly available text outside tool-call regions."""
@@ -317,12 +344,10 @@ class Glm4MoeModelToolParser(ToolParser):
         pairs = self.func_arg_regex.findall(body)
         for key, value in pairs:
             key = key.strip()
-            if self._is_string_type(tool_name, key, request.tools):
-                value_json = json.dumps(value, ensure_ascii=False)
-            else:
-                value_json = json.dumps(
-                    self._deserialize(value.strip()), ensure_ascii=False
-                )
+            value_json = json.dumps(
+                self._deserialize_argument(tool_name, key, value, request.tools),
+                ensure_ascii=False,
+            )
             parts.append(f"{json.dumps(key, ensure_ascii=False)}: {value_json}")
 
         last_value_start = body.rfind(self.arg_val_start)
@@ -348,19 +373,21 @@ class Glm4MoeModelToolParser(ToolParser):
                     value = value[:-overlap]
                 key_json = json.dumps(key, ensure_ascii=False)
 
+                # Only known strings have stable incremental JSON prefixes.
+                # Other values must wait for completion: deserialization can
+                # change quotes, whitespace or number formats, which cannot be
+                # repaired by appending to already-streamed raw value bytes.
                 if is_complete:
-                    if self._is_string_type(tool_name, key, request.tools):
-                        value_json = json.dumps(value, ensure_ascii=False)
-                    else:
-                        value_json = json.dumps(
-                            self._deserialize(value.strip()), ensure_ascii=False
-                        )
+                    value_json = json.dumps(
+                        self._deserialize_argument(
+                            tool_name, key, value, request.tools
+                        ),
+                        ensure_ascii=False,
+                    )
                     parts.append(f"{key_json}: {value_json}")
                 elif self._is_string_type(tool_name, key, request.tools):
                     escaped = self._json_escape_string_content(value)
                     parts.append(f'{key_json}: "{escaped}')
-                else:
-                    parts.append(f"{key_json}: {value}")
 
         if not parts:
             return "{}" if is_complete else ""

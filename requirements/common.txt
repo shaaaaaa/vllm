@@ -28,6 +28,8 @@ xgrammar >= 0.1.32, < 1.0.0; platform_machine == "x86_64" or platform_machine ==
 typing_extensions >= 4.10
 filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
 partial-json-parser # used for parsing partial JSON outputs
+jsonschema >= 4.23.0 # Preserve GLM tool argument types from JSON Schema.
+referencing >= 0.35.1 # Resolve tool schema references without network retrieval.
 pyzmq >= 25.0.0
 msgspec
 gguf >= 0.17.0
