@@ -63,6 +63,74 @@ def make_pool(code, prefill=False, owner="LATENT"):
     )
 
 
+@pytest.mark.parametrize("banks", [1, 2, 3, 8])
+@pytest.mark.parametrize("owner", ["LATENT", "INDEXER"])
+def test_configured_prefill_banks_allocate_disjoint_blocks_and_recycle(
+    code, monkeypatch, banks, owner
+):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.delenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", raising=False)
+    monkeypatch.setenv("NUM_BANK", str(banks))
+    pool = make_pool(code, prefill=True, owner=owner)
+    assert pool.allocator.bank_count == banks
+    initial = pool.get_num_free_blocks()
+    first = pool.get_new_blocks(1)
+    second = pool.get_new_blocks(1)
+    physical = [b for block in first + second for b in block.bank_block_ids]
+    assert len(set(physical)) == len(physical)
+    assert all(len(block.bank_block_ids) == banks for block in first + second)
+    pool.free_blocks(first)
+    pool.free_blocks(second)
+    assert pool.get_num_free_blocks() == initial
+
+
+def test_prefill_bank_environment_defaults_precedence_and_d_isolation(
+    code, monkeypatch
+):
+    name = "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("NUM_BANK", raising=False)
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    count = code["layerwise_prefill_bank_count"]
+    assert count() == 2
+    monkeypatch.setenv("NUM_BANK", "8")
+    assert count() == 8
+    monkeypatch.setenv(name, "3")
+    assert count() == 3
+    monkeypatch.setenv(name, "invalid")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    assert count() == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "2.5", "eight", ""])
+def test_invalid_bank_count_fails_before_allocation(code, monkeypatch, value):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", value)
+    with pytest.raises(ValueError, match="positive integer"):
+        make_pool(code, prefill=True)
+
+
+@pytest.mark.parametrize("banks", [1, 2, 3, 8])
+def test_bank_count_used_by_capacity_and_unequal_layer_groups(code, monkeypatch, banks):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", str(banks))
+    required = load_node("vllm/v1/core/kv_cache_utils.py", "dsa_required_bundles", code)
+    code["cdiv"] = lambda a, b: (a + b - 1) // b
+    assert required(
+        "prefill_child",
+        4096,
+        latent_block_size=128,
+        indexer_block_size=128,
+        latent_blocks_per_bundle=4,
+        indexer_blocks_per_bundle=18,
+    ) == banks * (8 + 2)
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(19)]
+    indices = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in (0, 3, 8)]
+    refs = code["build_prefill_layer_refs"](names, indices)
+    assert [refs[name].bank for name in names] == [i % banks for i in range(19)]
+    assert [refs[name].bank for name in indices] == [i % banks for i in range(3)]
+
+
 @pytest.mark.parametrize("owner", ["LATENT", "INDEXER"])
 def test_decode_partial_release_and_reallocation(code, owner):
     pool = make_pool(code, owner=owner)

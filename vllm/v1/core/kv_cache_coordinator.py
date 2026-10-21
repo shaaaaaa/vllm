@@ -10,13 +10,13 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
 from vllm.v1.core.dsa_shared_pool import (
-    LAYERWISE_PREFILL_BANK_COUNT,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
     PrefillLayerBundlePool,
     dsa_block_pool_index,
     dsa_scratch_blocks_for_topk,
     dsa_shared_block_layout,
+    layerwise_prefill_bank_count,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -141,7 +141,7 @@ class KVCacheCoordinator(ABC):
                 self.dsa_shared_allocator = PrefillLayerBundlePool(
                     parent_allocator,
                     self.dsa_shared_num_layer_pairs,
-                    bank_count=LAYERWISE_PREFILL_BANK_COUNT,
+                    bank_count=layerwise_prefill_bank_count(),
                 )
             else:
                 self.dsa_shared_allocator = parent_allocator
