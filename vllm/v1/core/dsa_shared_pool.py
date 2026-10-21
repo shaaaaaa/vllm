@@ -74,6 +74,7 @@ class DSABlockAllocationMode(str, Enum):
     PREFILL_CHILD = "prefill_child"
 
 
+# Preserve the legacy fallback when the P-node feature is disabled.
 LAYERWISE_PREFILL_BANK_COUNT = 2
 LAYERWISE_PREFILL_BUNDLE_MULTIPLIER = 2
 
@@ -82,12 +83,12 @@ def layerwise_prefill_bank_count() -> int:
     """Return the P-node rotation depth, ignoring the setting on other nodes.
 
     Configure VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS before startup.
-    The default is two; valid values are positive integers.
+    The P-node default is four; valid values are positive integers.
     """
     if layerwise_prefill_bundle_multiplier() == 1:
         return LAYERWISE_PREFILL_BANK_COUNT
     name = "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"
-    raw = os.environ.get(name, "2")
+    raw = os.environ.get(name, "4")
     try:
         count = int(raw)
     except ValueError:

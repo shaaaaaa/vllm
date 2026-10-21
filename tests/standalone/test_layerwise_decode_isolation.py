@@ -63,7 +63,7 @@ def make_pool(code, prefill=False, owner="LATENT"):
     )
 
 
-@pytest.mark.parametrize("banks", [1, 2, 3, 8])
+@pytest.mark.parametrize("banks", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("owner", ["LATENT", "INDEXER"])
 def test_configured_prefill_banks_allocate_disjoint_blocks_and_recycle(
     code, monkeypatch, banks, owner
@@ -88,7 +88,7 @@ def test_prefill_bank_environment_defaults_and_d_isolation(code, monkeypatch):
     monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
     count = code["layerwise_prefill_bank_count"]
-    assert count() == 2
+    assert count() == 4
     monkeypatch.setenv(name, "8")
     assert count() == 8
     monkeypatch.setenv(name, "3")
@@ -106,7 +106,7 @@ def test_invalid_bank_count_fails_before_allocation(code, monkeypatch, value):
         make_pool(code, prefill=True)
 
 
-@pytest.mark.parametrize("banks", [1, 2, 3, 8])
+@pytest.mark.parametrize("banks", [1, 2, 3, 4, 8])
 def test_bank_count_used_by_capacity_and_unequal_layer_groups(code, monkeypatch, banks):
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", str(banks))
