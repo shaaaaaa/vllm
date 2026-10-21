@@ -69,8 +69,7 @@ def test_configured_prefill_banks_allocate_disjoint_blocks_and_recycle(
     code, monkeypatch, banks, owner
 ):
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
-    monkeypatch.delenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", raising=False)
-    monkeypatch.setenv("NUM_BANK", str(banks))
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", str(banks))
     pool = make_pool(code, prefill=True, owner=owner)
     assert pool.allocator.bank_count == banks
     initial = pool.get_num_free_blocks()
@@ -84,16 +83,13 @@ def test_configured_prefill_banks_allocate_disjoint_blocks_and_recycle(
     assert pool.get_num_free_blocks() == initial
 
 
-def test_prefill_bank_environment_defaults_precedence_and_d_isolation(
-    code, monkeypatch
-):
+def test_prefill_bank_environment_defaults_and_d_isolation(code, monkeypatch):
     name = "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"
     monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("NUM_BANK", raising=False)
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
     count = code["layerwise_prefill_bank_count"]
     assert count() == 2
-    monkeypatch.setenv("NUM_BANK", "8")
+    monkeypatch.setenv(name, "8")
     assert count() == 8
     monkeypatch.setenv(name, "3")
     assert count() == 3

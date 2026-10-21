@@ -81,21 +81,19 @@ LAYERWISE_PREFILL_BUNDLE_MULTIPLIER = 2
 def layerwise_prefill_bank_count() -> int:
     """Return the P-node rotation depth, ignoring the setting on other nodes.
 
-    Configure before startup. The namespaced setting takes precedence over
-    the NUM_BANK alias; both default to two and accept positive integers.
+    Configure VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS before startup.
+    The default is two; valid values are positive integers.
     """
     if layerwise_prefill_bundle_multiplier() == 1:
         return LAYERWISE_PREFILL_BANK_COUNT
     name = "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"
-    raw = os.environ.get(name, os.environ.get("NUM_BANK", "2"))
+    raw = os.environ.get(name, "2")
     try:
         count = int(raw)
     except ValueError:
-        raise ValueError(
-            f"{name}/NUM_BANK must be a positive integer, got {raw!r}"
-        ) from None
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
     if count <= 0:
-        raise ValueError(f"{name}/NUM_BANK must be a positive integer, got {raw!r}")
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
     return count
 
 
