@@ -65,7 +65,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs.data import ProcessorInputs
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
@@ -569,8 +569,8 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
                 tool_parsers: list[ToolParser | None] = [
-                    self.tool_parser(tokenizer)
-                ] * num_choices
+                    self.tool_parser(tokenizer) for _ in range(num_choices)
+                ]
             else:
                 tool_parsers = [None] * num_choices
         except Exception as e:
@@ -1089,71 +1089,28 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason='error' indicates a retryable error
                         self._raise_if_error(output.finish_reason, request_id)
 
-                        # check to make sure we haven't "forgotten" to stream
-                        #   any tokens that were generated but previously
-                        #   matched by partial json parsing
-                        # only happens if we are NOT using structured outputs
-                        auto_tools_called = False
-                        if tool_parser:
-                            auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
-                            index = (
-                                len(tool_parser.prev_tool_call_arr) - 1
-                                if auto_tools_called
-                                else 0
-                            )
-                        else:
-                            index = 0
-
+                        # Flush parser state that was recognized but not yet
+                        # emitted.  Only merge into an existing tool-call
+                        # delta so final chunks never lose id/type/name or
+                        # create a metadata-less standalone tool call.
+                        auto_tools_called = bool(
+                            tool_parser and tool_parser.prev_tool_call_arr
+                        )
                         if (
-                            self._should_check_for_unstreamed_tool_arg_tokens(
-                                delta_message, output
-                            )
+                            self.enable_auto_tools
                             and tool_parser
+                            and delta_message
+                            and delta_message.tool_calls
+                            and auto_tools_called
                         ):
-                            latest_delta_len = 0
-                            if (
-                                isinstance(
-                                    delta_message.tool_calls[0].function,
-                                    DeltaFunctionCall,
-                                )
-                            ) and isinstance(
-                                delta_message.tool_calls[0].function.arguments, str
-                            ):
-                                latest_delta_len = len(
-                                    delta_message.tool_calls[0].function.arguments
-                                )
-
-                            # get the expected call based on partial JSON
-                            # parsing which "autocompletes" the JSON.
-                            # Tool parsers (e.g. Qwen3Coder) store
-                            # arguments as a JSON string in
-                            # prev_tool_call_arr. Calling json.dumps()
-                            # on an already-serialized string would
-                            # double-serialize it (e.g. '{"k":1}' becomes
-                            # '"{\\"k\\":1}"'), which then causes the
-                            # replace() below to fail and append the
-                            # entire double-serialized string as a
-                            # spurious final delta.
-                            args = tool_parser.prev_tool_call_arr[index].get(
-                                "arguments", {}
+                            remaining_call = (
+                                tool_parser.get_remaining_unstreamed_args()
                             )
-                            if isinstance(args, str):
-                                expected_call = args
-                            else:
-                                expected_call = json.dumps(args, ensure_ascii=False)
-
-                            # get what we've streamed so far for arguments
-                            # for the current tool
-                            actual_call = tool_parser.streamed_args_for_tool[index]
-                            if latest_delta_len > 0:
-                                actual_call = actual_call[:-latest_delta_len]
-
-                            # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                            if remaining_call:
+                                index = len(tool_parser.prev_tool_call_arr) - 1
+                                self._append_remaining_tool_args(
+                                    delta_message, remaining_call, index
+                                )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1760,55 +1717,18 @@ class OpenAIServingChat(OpenAIServing):
             and request.tool_choice in ["auto", None]
         )
 
-    def _should_check_for_unstreamed_tool_arg_tokens(
-        self,
-        delta_message: DeltaMessage | None,
-        output: CompletionOutput,
-    ) -> bool:
-        """
-        Check to see if we should check for unstreamed tool arguments tokens.
-        This is only applicable when auto tool parsing is enabled, the delta
-        is a tool call with arguments.
-        """
-
-        return bool(
-            # if there is a delta message that includes tool calls which
-            # include a function that has arguments
-            output.finish_reason is not None
-            and self.enable_auto_tools
-            and self.tool_parser
-            and delta_message
-            and delta_message.tool_calls
-            and delta_message.tool_calls[0]
-            and delta_message.tool_calls[0].function
-            and delta_message.tool_calls[0].function.arguments is not None
-        )
-
     @staticmethod
-    def _create_remaining_args_delta(
+    def _append_remaining_tool_args(
         delta_message: DeltaMessage,
         remaining_call: str,
         index: int,
-    ) -> DeltaMessage:
-        """
-        Create a delta message for remaining tool arguments, preserving
-        id/type/name from the original delta.
-        """
-        original_tc = next(
-            (tc for tc in delta_message.tool_calls if tc.index == index),
-            None,
-        )
-        original_fn = original_tc.function if original_tc else None
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=index,
-                    id=original_tc.id if original_tc else None,
-                    type=original_tc.type if original_tc else None,
-                    function=DeltaFunctionCall(
-                        name=original_fn.name if original_fn else None,
-                        arguments=remaining_call,
-                    ),
-                )
-            ]
-        )
+    ) -> None:
+        """Merge a parser suffix into an existing indexed tool-call delta."""
+        if not remaining_call:
+            return
+        for tool_call_delta in delta_message.tool_calls:
+            if tool_call_delta.index == index and tool_call_delta.function:
+                tool_call_delta.function.arguments = (
+                    tool_call_delta.function.arguments or ""
+                ) + remaining_call
+                return

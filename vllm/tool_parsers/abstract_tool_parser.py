@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import json
 import os
 from collections.abc import Callable, Sequence
 from functools import cached_property
@@ -46,6 +47,36 @@ class ToolParser:
         self.streamed_args_for_tool: list[str] = []
 
         self.model_tokenizer = tokenizer
+
+    def get_remaining_unstreamed_args(self) -> str:
+        """Return parsed tool arguments that have not been streamed yet.
+
+        Tool parsers may keep a completed or partially completed argument
+        representation in ``prev_tool_call_arr`` while only a prefix has
+        been emitted through ``streamed_args_for_tool``.  Keep this
+        calculation in the parser so the serving layer does not need to
+        understand whether a parser stores arguments as a dict or a JSON
+        string.
+        """
+        if not self.prev_tool_call_arr:
+            return ""
+
+        index = len(self.prev_tool_call_arr) - 1
+        args = self.prev_tool_call_arr[index].get("arguments", {})
+        expected = (
+            args
+            if isinstance(args, str)
+            else json.dumps(args, ensure_ascii=False)
+        )
+
+        if index >= len(self.streamed_args_for_tool):
+            actual = ""
+        else:
+            actual = self.streamed_args_for_tool[index]
+
+        if not expected.startswith(actual):
+            return ""
+        return expected[len(actual) :]
 
     @cached_property
     def vocab(self) -> dict[str, int]:

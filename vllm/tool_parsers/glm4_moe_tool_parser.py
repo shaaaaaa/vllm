@@ -36,6 +36,8 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
+from vllm.tool_parsers.glm_tool_schema import GlmToolArgumentSchema, GlmToolSchema
+from vllm.tool_parsers.utils import partial_tag_overlap
 
 logger = init_logger(__name__)
 
@@ -81,17 +83,15 @@ class Glm4MoeModelToolParser(ToolParser):
 
         self.tool_call_start_token_id = self.vocab.get(self.tool_call_start_token)
         self.tool_call_end_token_id = self.vocab.get(self.tool_call_end_token)
-        self._buffer: str = ""
 
-        # Streaming state for incremental tool-call streaming
-        self._in_tool_call: bool = False
-        self._current_tool_name: str | None = None
-        self._pending_key: str | None = None
-        self._streaming_string_value: bool = False
+        # Streaming state for re-parse-and-diff.  The serving layer can
+        # deliver several model tokens in one delta (MTP or stream_interval),
+        # so parsing only the new delta can leave complete tags stranded in a
+        # buffer at the end of generation.
+        self._streaming_text: str = ""
+        self._sent_content_idx: int = 0
         self._tool_call_ids: list[str] = []
-        self._args_started: list[bool] = []
-        self._args_closed: list[bool] = []
-        self._seen_keys: list[set[str]] = []
+        self._tool_schemas: dict[str, tuple[dict[str, Any], GlmToolSchema]] = {}
 
     @staticmethod
     def _deserialize(value: str) -> Any:
@@ -118,27 +118,51 @@ class Glm4MoeModelToolParser(ToolParser):
             return ""
         return json.dumps(s, ensure_ascii=False)[1:-1]
 
-    @staticmethod
+    def _argument_schema(
+        self,
+        tool_name: str,
+        arg_name: str,
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> GlmToolArgumentSchema | None:
+        if tools is None:
+            return None
+        for tool in tools:
+            if tool.function.name != tool_name:
+                continue
+            parameters = tool.function.parameters
+            if not isinstance(parameters, dict):
+                return None
+            cached = self._tool_schemas.get(tool_name)
+            if cached is None or cached[0] is not parameters:
+                cached = (parameters, GlmToolSchema(parameters))
+                self._tool_schemas[tool_name] = cached
+            return cached[1].argument(arg_name)
+        logger.debug("No tool named '%s'.", tool_name)
+        return None
+
     def _is_string_type(
+        self,
         tool_name: str,
         arg_name: str,
         tools: list[ChatCompletionToolsParam] | None,
     ) -> bool:
-        if tools is None:
-            return False
-        for tool in tools:
-            if tool.function.name != tool_name:
-                continue
-            if tool.function.parameters is None:
-                return False
-            arg_type = (
-                tool.function.parameters.get("properties", {})
-                .get(arg_name, {})
-                .get("type", None)
-            )
-            return arg_type == "string"
-        logger.debug("No tool named '%s'.", tool_name)
-        return False
+        schema = self._argument_schema(tool_name, arg_name, tools)
+        return schema is not None and schema.is_string
+
+    def _deserialize_argument(
+        self,
+        tool_name: str,
+        arg_name: str,
+        value: str,
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> Any:
+        schema = self._argument_schema(tool_name, arg_name, tools)
+        if schema is not None and schema.is_string:
+            return value
+        deserialized = self._deserialize(value.strip())
+        if schema is not None:
+            return schema.select_value(value, deserialized)
+        return deserialized
 
     @staticmethod
     def _tools_enabled(request: ChatCompletionRequest) -> bool:
@@ -185,9 +209,9 @@ class Glm4MoeModelToolParser(ToolParser):
                 arg_dct: dict[str, Any] = {}
                 for key, value in pairs:
                     arg_key = key.strip()
-                    arg_val = value.strip()
-                    if not self._is_string_type(tc_name, arg_key, request.tools):
-                        arg_val = self._deserialize(arg_val)
+                    arg_val = self._deserialize_argument(
+                        tc_name, arg_key, value, request.tools
+                    )
                     logger.debug("arg_key = %s, arg_val = %s", arg_key, arg_val)
                     arg_dct[arg_key] = arg_val
                 tool_calls.append(
@@ -214,6 +238,173 @@ class Glm4MoeModelToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
+    def _update_streaming_text(self, current_text: str, delta_text: str) -> str:
+        """Maintain cumulative text for callers that do not provide it.
+
+        ``current_text`` is authoritative in the serving path.  The fallback
+        to ``delta_text`` keeps the parser compatible with older direct unit
+        callers that did not provide cumulative text.
+        """
+        if current_text:
+            if self._streaming_text and not current_text.startswith(
+                self._streaming_text
+            ):
+                self._reset_reparse_state()
+            self._streaming_text = current_text
+        elif delta_text:
+            self._streaming_text += delta_text
+        return self._streaming_text
+
+    def _reset_reparse_state(self) -> None:
+        """Reset all state used by one re-parse-and-diff stream."""
+        self._streaming_text = ""
+        self._sent_content_idx = 0
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
+        self._tool_call_ids.clear()
+        self._tool_schemas.clear()
+
+    def _extract_content(self, text: str) -> str | None:
+        """Return newly available text outside tool-call regions."""
+        content_segments: list[str] = []
+        position = self._sent_content_idx
+
+        while position < len(text):
+            start = text.find(self.tool_call_start_token, position)
+            if start == -1:
+                tail = text[position:]
+                overlap = partial_tag_overlap(tail, self.tool_call_start_token)
+                if overlap:
+                    tail = tail[:-overlap]
+                    position = len(text) - overlap
+                else:
+                    position = len(text)
+                if tail:
+                    content_segments.append(tail)
+                break
+
+            if start > position:
+                content_segments.append(text[position:start])
+
+            end = text.find(self.tool_call_end_token, start)
+            if end == -1:
+                position = start
+                break
+            position = end + len(self.tool_call_end_token)
+
+        if position > self._sent_content_idx:
+            self._sent_content_idx = position
+        return "".join(content_segments) or None
+
+    def _extract_tool_call_regions(self, text: str) -> list[tuple[str, bool]]:
+        """Extract tool-call bodies and whether their closing tag arrived."""
+        regions: list[tuple[str, bool]] = []
+        position = 0
+        while True:
+            start = text.find(self.tool_call_start_token, position)
+            if start == -1:
+                break
+            body_start = start + len(self.tool_call_start_token)
+            end = text.find(self.tool_call_end_token, body_start)
+            if end == -1:
+                body = text[body_start:]
+                overlap = partial_tag_overlap(body, self.tool_call_end_token)
+                if overlap:
+                    body = body[:-overlap]
+                regions.append((body, False))
+                break
+            regions.append((text[body_start:end], True))
+            position = end + len(self.tool_call_end_token)
+        return regions
+
+    def _extract_tool_name_from_region(
+        self, body: str, is_complete: bool
+    ) -> str | None:
+        newline = body.find("\n")
+        key_start = body.find(self.arg_key_start)
+        positions = [position for position in (newline, key_start) if position != -1]
+        if not positions:
+            if is_complete:
+                return body.strip() or None
+            return None
+        name = body[: min(positions)].strip()
+        return name or None
+
+    def _build_args_json_so_far(
+        self,
+        tool_name: str,
+        body: str,
+        is_complete: bool,
+        request: ChatCompletionRequest,
+    ) -> str:
+        """Build the JSON argument prefix represented by a tool-call body."""
+        parts: list[str] = []
+        pairs = self.func_arg_regex.findall(body)
+        for key, value in pairs:
+            key = key.strip()
+            value_json = json.dumps(
+                self._deserialize_argument(tool_name, key, value, request.tools),
+                ensure_ascii=False,
+            )
+            parts.append(f"{json.dumps(key, ensure_ascii=False)}: {value_json}")
+
+        last_value_start = body.rfind(self.arg_val_start)
+        last_value_end = body.rfind(self.arg_val_end)
+        has_partial_value = last_value_start != -1 and (
+            last_value_end == -1 or last_value_end < last_value_start
+        )
+
+        if has_partial_value:
+            key_match = None
+            for match in re.finditer(
+                re.escape(self.arg_key_start) + r"(.*?)" + re.escape(self.arg_key_end),
+                body[:last_value_start],
+                re.DOTALL,
+            ):
+                key_match = match
+
+            if key_match:
+                key = key_match.group(1).strip()
+                value = body[last_value_start + len(self.arg_val_start) :]
+                overlap = partial_tag_overlap(value, self.arg_val_end)
+                if overlap:
+                    value = value[:-overlap]
+                key_json = json.dumps(key, ensure_ascii=False)
+
+                # Only known strings have stable incremental JSON prefixes.
+                # Other values must wait for completion: deserialization can
+                # change quotes, whitespace or number formats, which cannot be
+                # repaired by appending to already-streamed raw value bytes.
+                if is_complete:
+                    value_json = json.dumps(
+                        self._deserialize_argument(
+                            tool_name, key, value, request.tools
+                        ),
+                        ensure_ascii=False,
+                    )
+                    parts.append(f"{key_json}: {value_json}")
+                elif self._is_string_type(tool_name, key, request.tools):
+                    escaped = self._json_escape_string_content(value)
+                    parts.append(f'{key_json}: "{escaped}')
+
+        if not parts:
+            return "{}" if is_complete else ""
+
+        result = "{" + ", ".join(parts)
+        return result + "}" if is_complete else result
+
+    def _ensure_tool_state_for(self, index: int) -> None:
+        while len(self._tool_call_ids) <= index:
+            self._tool_call_ids.append(
+                make_tool_call_id(id_type="random", func_name=None, idx=None)
+            )
+        while len(self.streamed_args_for_tool) <= index:
+            self.streamed_args_for_tool.append("")
+        while len(self.prev_tool_call_arr) <= index:
+            self.prev_tool_call_arr.append({})
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -227,293 +418,56 @@ class Glm4MoeModelToolParser(ToolParser):
         if not self._tools_enabled(request):
             return DeltaMessage(content=delta_text) if delta_text else None
 
-        self._buffer += delta_text
+        text = self._update_streaming_text(current_text, delta_text)
+        content = self._extract_content(text)
+        regions = self._extract_tool_call_regions(text)
+        tool_call_deltas: list[DeltaToolCall] = []
 
-        while True:
-            if not self._in_tool_call:
-                start_idx = self._buffer.find(self.tool_call_start_token)
-                if start_idx == -1:
-                    # Check for partial start token at end of buffer
-                    for i in range(1, len(self.tool_call_start_token)):
-                        if self._buffer.endswith(self.tool_call_start_token[:i]):
-                            out = self._buffer[:-i]
-                            self._buffer = self._buffer[-i:]
-                            return DeltaMessage(content=out) if out else None
-                    out = self._buffer
-                    self._buffer = ""
-                    return DeltaMessage(content=out) if out else None
-
-                if start_idx > 0:
-                    out = self._buffer[:start_idx]
-                    self._buffer = self._buffer[start_idx:]
-                    return DeltaMessage(content=out) if out else None
-
-                self._buffer = self._buffer[len(self.tool_call_start_token) :]
-                self._begin_tool_call()
+        for index, (body, is_complete) in enumerate(regions):
+            tool_name = self._extract_tool_name_from_region(body, is_complete)
+            if not tool_name:
                 continue
 
-            # Parse tool name first
-            if not self.current_tool_name_sent:
-                nl = self._buffer.find("\n")
-                ak = self._buffer.find(self.arg_key_start)
-                end = self._buffer.find(self.tool_call_end_token)
-                candidates = [i for i in [nl, ak, end] if i != -1]
-                if not candidates:
-                    return None
-                cut = min(candidates)
-                tool_name = self._buffer[:cut].strip()
-                if tool_name == "" and cut == end:
-                    # Handle empty tool call like `<tool_call></tool_call>`.
-                    # Consume the tokens and reset state to avoid infinite loop.
-                    self._buffer = self._buffer[end + len(self.tool_call_end_token) :]
-                    self._finish_tool_call()
-                    self._revert_last_tool_call_state()
-                    continue
-
-                if cut == nl:
-                    self._buffer = self._buffer[nl + 1 :]
-                else:
-                    self._buffer = self._buffer[cut:]
-
-                self._current_tool_name = tool_name
-                self.current_tool_name_sent = True
-                return self._emit_tool_name_delta(tool_name)
-
-            assert self._current_tool_name is not None
-
-            # Handle incremental string value streaming
-            if self._streaming_string_value:
-                val_end = self._buffer.find(self.arg_val_end)
-                if val_end != -1:
-                    raw_content = self._buffer[:val_end]
-                    self._buffer = self._buffer[val_end + len(self.arg_val_end) :]
-                    self._streaming_string_value = False
-                    self._pending_key = None
-
-                    escaped = self._json_escape_string_content(raw_content)
-                    frag = escaped + '"'
-                    self.streamed_args_for_tool[self.current_tool_id] += frag
-                    return self._emit_tool_args_delta(frag)
-                else:
-                    # Check for partial </arg_value> at end
-                    safe_len = len(self._buffer)
-                    for i in range(1, len(self.arg_val_end)):
-                        if self._buffer.endswith(self.arg_val_end[:i]):
-                            safe_len = len(self._buffer) - i
-                            break
-
-                    if safe_len > 0:
-                        to_emit = self._buffer[:safe_len]
-                        self._buffer = self._buffer[safe_len:]
-                        escaped = self._json_escape_string_content(to_emit)
-                        if escaped:
-                            self.streamed_args_for_tool[self.current_tool_id] += escaped
-                            return self._emit_tool_args_delta(escaped)
-                    return None
-
-            # If we have a pending key, parse its value
-            if self._pending_key is not None:
-                val_pos = self._buffer.find(self.arg_val_start)
-                if val_pos == -1:
-                    return None
-                if val_pos > 0:
-                    self._buffer = self._buffer[val_pos:]
-
-                key = (self._pending_key or "").strip()
-
-                is_string = self._is_string_type(
-                    self._current_tool_name, key, request.tools
+            self._ensure_tool_state_for(index)
+            if self.prev_tool_call_arr[index].get("name") != tool_name:
+                self.prev_tool_call_arr[index]["name"] = tool_name
+                tool_call_deltas.append(
+                    DeltaToolCall(
+                        index=index,
+                        id=self._tool_call_ids[index],
+                        type="function",
+                        function=DeltaFunctionCall(
+                            name=tool_name, arguments=""
+                        ).model_dump(exclude_none=True),
+                    )
                 )
 
-                if is_string:
-                    # String type: stream incrementally
-                    self._buffer = self._buffer[len(self.arg_val_start) :]
-
-                    if key in self._seen_keys[self.current_tool_id]:
-                        self._pending_key = None
-                        continue
-
-                    self._seen_keys[self.current_tool_id].add(key)
-                    key_json = json.dumps(key, ensure_ascii=False)
-
-                    if not self._args_started[self.current_tool_id]:
-                        frag = "{" + key_json + ': "'
-                        self._args_started[self.current_tool_id] = True
-                    else:
-                        frag = ", " + key_json + ': "'
-
-                    self.streamed_args_for_tool[self.current_tool_id] += frag
-                    self._streaming_string_value = True
-                    return self._emit_tool_args_delta(frag)
-                else:
-                    # Non-string type: wait for complete value
-                    val_end = self._buffer.find(self.arg_val_end)
-                    if val_end == -1:
-                        return None
-
-                    raw_val = self._buffer[len(self.arg_val_start) : val_end].strip()
-                    self._buffer = self._buffer[val_end + len(self.arg_val_end) :]
-                    self._pending_key = None
-
-                    frag_or_none = self._append_arg_fragment(key=key, raw_val=raw_val)
-                    if frag_or_none:
-                        return self._emit_tool_args_delta(frag_or_none)
-                    continue
-
-            # Parse next arg or close
-            end_pos = self._buffer.find(self.tool_call_end_token)
-            key_pos = self._buffer.find(self.arg_key_start)
-            if end_pos != -1 and (key_pos == -1 or end_pos < key_pos):
-                self._buffer = self._buffer[end_pos + len(self.tool_call_end_token) :]
-                frag_or_none = self._close_args_if_needed()
-                # Finalize prev_tool_call_arr with complete parsed arguments
-                if self._current_tool_name:
-                    try:
-                        full_args_str = self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ]
-                        args_dict = json.loads(full_args_str)
-                        self.prev_tool_call_arr[self.current_tool_id] = {
-                            "name": self._current_tool_name,
-                            "arguments": args_dict,
-                        }
-                    except (json.JSONDecodeError, IndexError) as e:
-                        logger.warning(
-                            "Failed to finalize tool call state for tool %d: %s",
-                            self.current_tool_id,
-                            e,
-                        )
-                self._finish_tool_call()
-                return (
-                    self._emit_tool_args_delta(frag_or_none) if frag_or_none else None
-                )
-
-            if key_pos == -1:
-                return None
-            if key_pos > 0:
-                self._buffer = self._buffer[key_pos:]
-            key_end = self._buffer.find(self.arg_key_end)
-            if key_end == -1:
-                return None
-            key = self._buffer[len(self.arg_key_start) : key_end]
-            self._buffer = self._buffer[key_end + len(self.arg_key_end) :]
-            self._pending_key = key
-            continue
-
-    def _ensure_tool_state(self) -> None:
-        while len(self._tool_call_ids) <= self.current_tool_id:
-            self._tool_call_ids.append(
-                make_tool_call_id(id_type="random", func_name=None, idx=None)
+            args_so_far = self._build_args_json_so_far(
+                tool_name, body, is_complete, request
             )
-        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-            self.streamed_args_for_tool.append("")
-        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({})
-        while len(self._args_started) <= self.current_tool_id:
-            self._args_started.append(False)
-        while len(self._args_closed) <= self.current_tool_id:
-            self._args_closed.append(False)
-        while len(self._seen_keys) <= self.current_tool_id:
-            self._seen_keys.append(set())
+            previous_args = self.streamed_args_for_tool[index]
+            if args_so_far and args_so_far.startswith(previous_args):
+                args_delta = args_so_far[len(previous_args) :]
+                self.streamed_args_for_tool[index] = args_so_far
+                self.prev_tool_call_arr[index]["arguments"] = args_so_far
+                if args_delta:
+                    tool_call_deltas.append(
+                        DeltaToolCall(
+                            index=index,
+                            function=DeltaFunctionCall(arguments=args_delta).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    )
 
-    def _begin_tool_call(self) -> None:
-        if self.current_tool_id == -1:
-            self.current_tool_id = 0
-        else:
-            self.current_tool_id += 1
-        self._ensure_tool_state()
-        self.current_tool_name_sent = False
-        self._current_tool_name = None
-        self._pending_key = None
-        self._streaming_string_value = False
-        self._in_tool_call = True
+        if self.prev_tool_call_arr:
+            self.current_tool_id = len(self.prev_tool_call_arr) - 1
+            self.current_tool_name_sent = True
 
-    def _finish_tool_call(self) -> None:
-        self._in_tool_call = False
-        self._current_tool_name = None
-        self._pending_key = None
-        self._streaming_string_value = False
-
-    def _revert_last_tool_call_state(self) -> None:
-        """Revert the state allocation for the last tool call."""
-        if self.current_tool_id < 0:
-            return
-        self._tool_call_ids.pop()
-        self.streamed_args_for_tool.pop()
-        self.prev_tool_call_arr.pop()
-        self._args_started.pop()
-        self._args_closed.pop()
-        self._seen_keys.pop()
-        self.current_tool_id -= 1
-
-    def _emit_tool_name_delta(self, tool_name: str) -> DeltaMessage:
-        self.prev_tool_call_arr[self.current_tool_id] = {
-            "name": self._current_tool_name,
-            "arguments": {},
-        }
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=self.current_tool_id,
-                    id=self._tool_call_ids[self.current_tool_id],
-                    type="function",
-                    function=DeltaFunctionCall(
-                        name=tool_name,
-                        arguments="",
-                    ).model_dump(exclude_none=True),
-                )
-            ]
-        )
-
-    def _emit_tool_args_delta(self, fragment: str) -> DeltaMessage:
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=self.current_tool_id,
-                    function=DeltaFunctionCall(arguments=fragment).model_dump(
-                        exclude_none=True
-                    ),
-                )
-            ]
-        )
-
-    def _append_arg_fragment(
-        self,
-        *,
-        key: str,
-        raw_val: str,
-    ) -> str | None:
-        key = key.strip()
-        if not key:
-            return None
-        if key in self._seen_keys[self.current_tool_id]:
-            return None
-
-        # This function is only called for non-string types (already checked
-        # by _is_string_type in the caller), so we always deserialize.
-        val_obj: Any = self._deserialize(raw_val)
-
-        key_json = json.dumps(key, ensure_ascii=False)
-        val_json = json.dumps(val_obj, ensure_ascii=False)
-
-        if not self._args_started[self.current_tool_id]:
-            fragment = "{" + key_json + ": " + val_json
-            self._args_started[self.current_tool_id] = True
-        else:
-            fragment = "," + key_json + ": " + val_json
-
-        self._seen_keys[self.current_tool_id].add(key)
-        self.streamed_args_for_tool[self.current_tool_id] += fragment
-        return fragment
-
-    def _close_args_if_needed(self) -> str | None:
-        if self._args_closed[self.current_tool_id]:
-            return None
-        self._args_closed[self.current_tool_id] = True
-        if not self._args_started[self.current_tool_id]:
-            fragment = "{}"
-            self.streamed_args_for_tool[self.current_tool_id] = fragment
-        else:
-            fragment = "}"
-            self.streamed_args_for_tool[self.current_tool_id] += fragment
-        return fragment
+        if tool_call_deltas:
+            return DeltaMessage(content=content, tool_calls=tool_call_deltas)
+        if content:
+            # Leave tool_calls unset so exclude_unset serialization does not
+            # signal a tool-call transition to protocol-converting gateways.
+            return DeltaMessage(content=content)
+        return None
