@@ -34,6 +34,8 @@ class Phase(str, Enum):
 TERMINAL = frozenset((Phase.STOPPED, Phase.DISARMED, Phase.ABORTED))
 MEMBER_TRANSITIONS = frozenset(
     {
+        (Phase.BOOT, Phase.COMMITTING),
+        (Phase.BOOT, Phase.DISARMING),
         (Phase.COMMITTING, Phase.ACTIVE),
         (Phase.ACTIVE, Phase.QUIESCING),
         (Phase.QUIESCING, Phase.DRAINING),
@@ -227,8 +229,8 @@ class MemberState:
         if self.phase not in TERMINAL:
             self.phase, self.reason = Phase.ABORTED, reason[:256]
 
-    def receive(self, message: dict[str, Any], now: float) -> str | None:
-        """Apply leader state, returning a required startup acknowledgement."""
+    def receive(self, message: dict[str, Any], now: float) -> None:
+        """Apply leader state; the executor acknowledges after worker setup."""
         if self.phase in TERMINAL or message.get("epoch") != self.epoch:
             return None
         seq = message.get("seq")
@@ -242,12 +244,6 @@ class MemberState:
             return None
         if phase == Phase.ABORTED:
             self.abort(str(message.get("reason", "Peer failed")))
-        elif phase == Phase.COMMITTING and self.phase in (Phase.BOOT, Phase.COMMITTING):
-            self.phase = phase
-            return "COMMIT_ACK"
-        elif phase == Phase.DISARMING and self.phase in (Phase.BOOT, Phase.DISARMING):
-            self.phase = phase
-            return "FALLBACK_ACK"
         elif (self.phase, phase) in MEMBER_TRANSITIONS:
             self.phase = phase
         elif phase == Phase.STOPPING and self.phase in (Phase.DRAINING, Phase.STOPPING):

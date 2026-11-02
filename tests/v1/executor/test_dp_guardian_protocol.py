@@ -143,10 +143,8 @@ def test_member_cannot_stop_without_matching_local_drain():
 
 def test_member_activation_and_replayed_leader_heartbeat():
     member = MemberState("epoch", 30, 5, 0)
-    assert (
-        member.receive(dict(epoch="epoch", seq=1, phase="committing"), 1)
-        == "COMMIT_ACK"
-    )
+    member.receive(dict(epoch="epoch", seq=1, phase="committing"), 1)
+    assert member.phase == Phase.COMMITTING
     member.receive(dict(epoch="epoch", seq=2, phase="active"), 2)
     assert member.phase == Phase.ACTIVE
     member.receive(dict(epoch="epoch", seq=2, phase="active"), 6)
