@@ -1414,28 +1414,7 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
-            shutdown_timeout = self.vllm_config.shutdown_timeout
-
-            logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
-
-            if shutdown_timeout == 0:
-                num_requests = self.scheduler.get_num_unfinished_requests()
-                if num_requests > 0:
-                    logger.info("Aborting %d requests", num_requests)
-                aborted_reqs = self.scheduler.finish_requests(
-                    None, RequestStatus.FINISHED_ABORTED
-                )
-                self._send_abort_outputs(aborted_reqs)
-            else:
-                num_requests = self.scheduler.get_num_unfinished_requests()
-                if num_requests > 0:
-                    logger.info(
-                        "Draining %d in-flight requests (timeout=%ds)",
-                        num_requests,
-                        shutdown_timeout,
-                    )
-
-            self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
+            self._start_shutdown()
 
         # Exit when no work remaining
         if not self.has_work():
@@ -1443,6 +1422,26 @@ class EngineCoreProc(EngineCore):
             return False
 
         return True
+
+    def _start_shutdown(self) -> None:
+        """Close admission using the configured abort/drain policy, exactly once."""
+        shutdown_timeout = self.vllm_config.shutdown_timeout
+        logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
+        num_requests = self.scheduler.get_num_unfinished_requests()
+        if shutdown_timeout == 0:
+            if num_requests > 0:
+                logger.info("Aborting %d requests", num_requests)
+            aborted_reqs = self.scheduler.finish_requests(
+                None, RequestStatus.FINISHED_ABORTED
+            )
+            self._send_abort_outputs(aborted_reqs)
+        elif num_requests > 0:
+            logger.info(
+                "Draining %d in-flight requests (timeout=%ds)",
+                num_requests,
+                shutdown_timeout,
+            )
+        self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
@@ -1904,6 +1903,13 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             engine_index=dp_rank,
         )
+        guardian = getattr(self.model_executor, "dp_guardian", None)
+        if guardian is not None:
+            inputs = self.input_queue
+            guardian.drain_callback = lambda: inputs.put_nowait(
+                (EngineCoreRequestType.WAKEUP, b"")
+            )
+        self._guardian_stop_requested = self._guardian_drained = False
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -1919,11 +1925,61 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_rank = dp_rank
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
+        if hasattr(vllm_config, "_sfa_independent_options"):
+            from vllm.v1.executor.dp_guardian_client import prepare_dp_guardian
+
+            vllm_config._dp_guardian_bootstrap = prepare_dp_guardian(
+                vllm_config, dp_group, dp_store
+            )
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+
+    def _handle_shutdown(self) -> bool:
+        guardian = getattr(self.model_executor, "dp_guardian", None)
+        if guardian is None:
+            return super()._handle_shutdown()
+        phase = guardian.phase.value
+        if guardian.fatal or phase == "aborted":
+            raise RuntimeError(guardian.fatal or guardian.reason)
+        if (
+            self.shutdown_state == EngineShutdownState.REQUESTED
+            and not self._guardian_stop_requested
+        ):
+            guardian.command("STOP_REQUEST")
+            self._guardian_stop_requested = True
+        if (
+            phase in ("quiescing", "draining", "stopping", "stopped")
+            and self.shutdown_state == EngineShutdownState.RUNNING
+        ):
+            self.shutdown_state = EngineShutdownState.REQUESTED
+        if self.shutdown_state == EngineShutdownState.RUNNING:
+            return True
+        if self.shutdown_state == EngineShutdownState.REQUESTED:
+            self._start_shutdown()  # Preserve configured abort/drain and ADD rejection.
+        if phase == "quiescing":
+            guardian.quiescent_wave = (
+                self.current_wave
+                if not self.has_work() and self.input_queue.empty()
+                else None
+            )
+        elif phase == "draining" and not self._guardian_drained:
+            # Consume phase-wakeup/late ADD traffic before closing resource owners.
+            self._process_input_queue()
+            if self.has_work():
+                guardian.fail("Work appeared after common model quiescence")
+                raise RuntimeError(guardian.fatal)
+            self.model_executor.drain_independent_dp(self.current_wave)
+            self._guardian_drained = True
+        elif phase == "stopped":
+            logger.info("Independent DP group shutdown complete")
+            return False
+        if not self.has_work():
+            with guardian.condition:
+                guardian.condition.wait(guardian.config["interval"])
+        return True
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
@@ -1953,6 +2009,13 @@ class DPEngineCoreProc(EngineCoreProc):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
+            guardian = getattr(self.model_executor, "dp_guardian", None)
+            if guardian is not None and guardian.phase.value in (
+                "draining",
+                "stopping",
+                "stopped",
+            ):
+                return  # All peers closed admission and completed this model wave.
             new_wave, exclude_eng_index = request
             if exclude_eng_index != self.engine_index and (
                 new_wave >= self.current_wave
@@ -2037,7 +2100,19 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        guardian = getattr(self.model_executor, "dp_guardian", None)
+        if guardian is None:
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        operation = guardian.begin(
+            time.monotonic() + envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+        )
+        try:
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        except BaseException:
+            guardian.fail("DP finish coordination failed")
+            raise
+        finally:
+            guardian.end(operation)
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest

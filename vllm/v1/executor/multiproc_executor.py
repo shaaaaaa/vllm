@@ -63,6 +63,16 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
+_GUARD_READ_ONLY_RPCS = frozenset(
+    {
+        "list_loras",
+        "check_health",
+        "get_supported_tasks",
+        "get_kv_connector_handshake_metadata",
+        "get_mooncake_placement_info",
+    }
+)
+
 
 class FutureWrapper(Future):
     def __init__(
@@ -106,6 +116,17 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        self._failure_lock = threading.Lock()
+        self.dp_guardian = None
+        if bootstrap := getattr(self.vllm_config, "_dp_guardian_bootstrap", None):
+            from vllm.v1.executor.dp_guardian_client import start_dp_guardian
+
+            self.dp_guardian = start_dp_guardian(bootstrap)
+            self.dp_guardian.failure_callback = self._handle_worker_failure
+            self.vllm_config._dp_guardian_worker = self.dp_guardian.worker_info()
+            self.vllm_config._dp_guardian_bootstrap = (
+                None  # Workers need only their local error endpoint.
+            )
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -150,7 +171,11 @@ class MultiprocExecutor(Executor):
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
-        context = get_mp_context()
+        context = (
+            multiprocessing.get_context("spawn")
+            if self.dp_guardian
+            else get_mp_context()
+        )
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
@@ -166,6 +191,8 @@ class MultiprocExecutor(Executor):
             )
 
             for local_rank in range(self.local_world_size):
+                if self.is_failed:
+                    raise RuntimeError("Worker cohort failed during startup")
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
                 unready_worker_handle = WorkerProc.make_worker_process(
@@ -188,6 +215,8 @@ class MultiprocExecutor(Executor):
 
             # Wait for all local workers to be ready.
             self.workers = WorkerProc.wait_for_ready(unready_workers)
+            if self.is_failed:
+                raise RuntimeError("Worker cohort failed before readiness")
 
             # Start background thread to monitor worker health if not in headless mode.
             if self.monitor_workers:
@@ -251,6 +280,61 @@ class MultiprocExecutor(Executor):
     def _post_init_executor(self) -> None:
         pass
 
+    def initialize_from_config(self, kv_cache_configs) -> None:
+        super().initialize_from_config(kv_cache_configs)
+        if self.dp_guardian is not None:
+            contracts = self.collective_rpc("independent_dp_contract")
+            digests = {item.get("digest") for item in contracts}
+            if None not in digests and len(digests) > 1:
+                self.dp_guardian.fail("TP execution contracts differ")
+                raise RuntimeError(
+                    "Independent SFA execution contracts differ within TP"
+                )
+            enabled = self.dp_guardian.activate(
+                None if None in digests else digests.pop(),
+                lambda enabled: self.collective_rpc(
+                    "activate_independent_dp", args=(enabled,)
+                ),
+            )
+            if enabled:
+                logger.info(
+                    "[SFA independent DP] active: local graph buckets, "
+                    "TP-only host agreement, MC2 capacity=%s",
+                    contracts[0]["capacity"],
+                )
+            if not enabled:
+                logger.warning(
+                    "[SFA independent DP] retaining existing execution: %s",
+                    [item.get("reason", "peer ineligible") for item in contracts],
+                )
+                self.dp_guardian.close()
+                self.dp_guardian = None
+
+    def _handle_worker_failure(self) -> None:
+        with self._failure_lock:
+            if self.is_failed:
+                return
+            self.is_failed = True
+            callback, self.failure_callback = self.failure_callback, None
+        guardian = getattr(self, "dp_guardian", None)
+        if guardian is not None:
+            logger.error(
+                "[SFA independent DP] epoch failed: %s",
+                guardian.fatal or guardian.reason,
+            )
+        try:
+            self.shutdown()
+        finally:
+            if callback is not None:
+                callback()
+
+    def drain_independent_dp(self, wave: int) -> None:
+        """Acknowledge shutdown only after the existing resource owners drain."""
+        assert self.dp_guardian is not None
+        self.collective_rpc("drain_independent_dp")
+        self._guardian_drained = True
+        self.dp_guardian.command("DRAINED", wave=wave, complete=True)
+
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
 
@@ -268,16 +352,15 @@ class MultiprocExecutor(Executor):
             if not _self or getattr(_self, "shutting_down", False):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
-            _self.is_failed = True
+            if getattr(_self, "_guardian_drained", False):
+                # The guardian still distinguishes expected STOPPING exits from
+                # unexpected loss; do not turn its completed stop into failure.
+                return
             proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
             logger.error(
                 "Worker proc %s died unexpectedly, shutting down executor.", proc_name
             )
-            _self.shutdown()
-            callback = _self.failure_callback
-            if callback is not None:
-                _self.failure_callback = None
-                callback()
+            _self._handle_worker_failure()
 
         if not inline:
             Thread(
@@ -318,7 +401,13 @@ class MultiprocExecutor(Executor):
         )
 
     def execute_dummy_batch(self) -> None:
-        self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
+        self.collective_rpc(
+            "execute_dummy_batch",
+            unique_reply_rank=self.output_rank,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+            if self.dp_guardian
+            else None,
+        )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         # OPTIMIZATION: Get output only from a single worker (output_rank)
@@ -344,6 +433,12 @@ class MultiprocExecutor(Executor):
         if self.is_failed:
             raise RuntimeError("Executor failed.")
 
+        if self.dp_guardian is not None and timeout is None:
+            timeout = (
+                envs.VLLM_ENGINE_READY_TIMEOUT_S
+                if self.dp_guardian.phase.value != "active"
+                else envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+            )
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
@@ -360,13 +455,23 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        guardian = self.dp_guardian
+        operation = guardian.begin(deadline) if guardian is not None else None
+        try:
+            self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        except BaseException:
+            if guardian is not None:
+                guardian.fail("Worker RPC submission failed")
+            raise
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def get_response():
+        worker_error = False
+
+        def read_response():
+            nonlocal worker_error
             responses = []
             for mq in response_mqs:
                 dequeue_timeout = (
@@ -377,12 +482,33 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
+                    worker_error = True
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
                     )
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
+
+        if guardian is None:
+            get_response = read_response
+        else:
+
+            def get_response():
+                try:
+                    result = read_response()
+                    guardian.end(operation)
+                    return result
+                except BaseException:
+                    if (
+                        worker_error
+                        and isinstance(method, str)
+                        and method in _GUARD_READ_ONLY_RPCS
+                    ):
+                        guardian.end(operation)
+                    else:
+                        guardian.fail("Worker RPC response failed")
+                    raise
 
         if non_block:
             future = FutureWrapper(self.futures_queue, aggregate=aggregate)
@@ -437,6 +563,9 @@ class MultiprocExecutor(Executor):
         if not getattr(self, "shutting_down", False):
             logger.debug("Triggering shutdown of workers")
             self.shutting_down = True
+            guardian = getattr(self, "dp_guardian", None)
+            if guardian is not None:
+                guardian.close()
 
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
@@ -640,7 +769,11 @@ class WorkerProc:
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
-        context = get_mp_context()
+        context = (
+            multiprocessing.get_context("spawn")
+            if getattr(vllm_config, "_dp_guardian_worker", None)
+            else get_mp_context()
+        )
         # Ready pipe to communicate readiness from child to parent
         ready_reader, ready_writer = context.Pipe(duplex=False)
         # Death pipe to let child detect parent process exit
@@ -795,7 +928,7 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        worker = None
+        worker = guardian = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
 
@@ -810,6 +943,10 @@ class WorkerProc:
                 logger.warning("Error closing inherited connection: %s: %s", type(e), e)
 
         try:
+            if info := getattr(kwargs.get("vllm_config"), "_dp_guardian_worker", None):
+                from vllm.v1.executor.dp_guardian_client import WorkerGuard
+
+                guardian = WorkerGuard(info, kwargs.get("rank", 0))
             # Initialize tracer
             rank = kwargs.get("rank", 0)
             maybe_init_worker_tracer(
@@ -819,6 +956,8 @@ class WorkerProc:
             )
 
             worker = WorkerProc(*args, **kwargs)
+            if guardian is not None:
+                worker.worker.worker.dp_guardian = guardian
             assert worker.worker_response_mq is not None
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
@@ -842,7 +981,20 @@ class WorkerProc:
 
             worker.worker_busy_loop()
 
-        except Exception:
+        except BaseException as error:
+            active_guard = (
+                guardian
+                if worker is None
+                else getattr(worker.worker, "dp_guardian", None)
+            )
+            if active_guard is not None:
+                # Before logging or cleanup: either can wait on the failed
+                # device/collective. Common startup fallback has detached it.
+                active_guard.fail(error)
+            if not isinstance(error, Exception):
+                if isinstance(error, SystemExit):
+                    logger.warning("WorkerProc was terminated")
+                raise
             # NOTE: if an Exception arises in busy_loop, we send
             # a FAILURE message over the MQ RPC to notify the Executor,
             # which triggers system shutdown.
@@ -859,13 +1011,6 @@ class WorkerProc:
             # any worker dies. Set this value so we don't re-throw
             # SystemExit() to avoid zmq exceptions in __del__.
             shutdown_requested.set()
-
-        except SystemExit as e:
-            # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
-            # the graceful shutdown process did not succeed
-            logger.warning("WorkerProc was terminated")
-            # SystemExit must never be ignored
-            raise e
 
         finally:
             if ready_writer is not None:
@@ -909,7 +1054,12 @@ class WorkerProc:
         """Entrypoint for the thread which handles outputs asynchronously."""
         while True:
             output = self.async_output_queue.get()
-            self.enqueue_output(output)
+            try:
+                self.enqueue_output(output)
+            except BaseException as exc:
+                if guardian := getattr(self.worker, "dp_guardian", None):
+                    guardian.fail(exc)
+                raise
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
@@ -926,6 +1076,10 @@ class WorkerProc:
 
                 output = func(*args, **kwargs)
             except Exception as e:
+                if (guardian := getattr(self.worker, "dp_guardian", None)) and (
+                    not isinstance(method, str) or method not in _GUARD_READ_ONLY_RPCS
+                ):
+                    guardian.fail(e)
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
