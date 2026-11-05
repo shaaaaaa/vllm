@@ -220,12 +220,32 @@ class WorkerGuard:
         """Exit on fatal work even if notification cannot be sent immediately."""
         notified = False
         try:
+            reason = type(error).__name__
+            try:
+                # Preserve useful evidence before the supervisor can kill us.
+                # Read only builtin exception/traceback metadata: custom __str__
+                # or repr of an argument may block. Never serialize live frames.
+                origin = BaseException.__traceback__.__get__(error)
+                while origin is not None and origin.tb_next is not None:
+                    origin = origin.tb_next
+                location = (
+                    f" at {Path(origin.tb_frame.f_code.co_filename).name[:80]}"
+                    f":{origin.tb_lineno}"
+                    if origin is not None
+                    else ""
+                )
+                args = BaseException.args.__get__(error)
+                detail = args[0][:256] if args and type(args[0]) is str else ""
+                reason = f"{self.session} {reason[:64]}{location}: {detail}"[:256]
+                reason = reason.replace("\n", " ").replace("\r", " ")
+            except BaseException:
+                pass  # Metadata reporting must not prevent failure notification.
             message = dict(
                 epoch=self.epoch,
                 session=self.session,
                 seq=1,
                 kind="ABORT",
-                reason=type(error).__name__,
+                reason=reason,
             )
             data = encode_frame(self.key, message)
             notified = self.sock.send(data) == len(data)

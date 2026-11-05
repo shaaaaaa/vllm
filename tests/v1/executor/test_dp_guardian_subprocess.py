@@ -36,6 +36,44 @@ def send(process, data):
     process.stdin.flush()
 
 
+def test_worker_failure_detail_survives_termination_before_traceback(monkeypatch):
+    monkeypatch.syspath_prepend(str(PROBE.parent))
+    from dp_guardian_probe import client
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10)
+        executable = sys._base_executable if sys.platform == "win32" else sys.executable
+        process = subprocess.Popen(
+            [executable, "-u", str(PROBE), "failure_report"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            send(process, dict(endpoint=listener.getsockname()))
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(10)
+                message = client.decode_frame(b"test", client.receive_line(connection))
+            assert process.poll() is None  # Traceback reporting is blocked.
+            process.kill()
+            process.wait(timeout=5)
+            assert process.stderr.read() == b""
+            assert message["kind"] == "ABORT"
+            assert "worker-0" in message["reason"]
+            assert "RuntimeError" in message["reason"]
+            assert "dp_guardian_probe.py:" in message["reason"]
+            assert "injected source validation failure" in message["reason"]
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdin.close()
+            process.stderr.close()
+
+
 def relay(listener, destination, blocked, stopped):
     """A real one-way blackhole: member health still reaches the leader."""
     connections = []

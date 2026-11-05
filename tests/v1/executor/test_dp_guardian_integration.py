@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import traceback
+import weakref
 from collections import deque
 from enum import IntEnum
 from pathlib import Path
@@ -143,6 +144,22 @@ def test_duplicate_failure_notifications_shutdown_once():
         thread.join(3)
     owner.shutdown.assert_called_once()
     callback.assert_called_once()
+
+
+def test_worker_monitor_reports_observed_pid_and_exitcode_before_shutdown():
+    ns = executor_namespace()
+    ns.update(
+        weakref=weakref,
+        multiprocessing=NS(connection=NS(wait=Mock(return_value=[7]))),
+    )
+    monitor = method(EXECUTOR, "MultiprocExecutor", "start_worker_monitor", ns)
+    logger = ns["logger"] = Mock()
+    proc = NS(sentinel=7, name="worker", pid=123, exitcode=-11)
+    owner = Mock(workers=[NS(proc=proc)], shutting_down=False, _guardian_drained=False)
+    owner._handle_worker_failure.side_effect = lambda: logger.error.assert_called_once()
+    monitor(owner, inline=True)
+    assert logger.error.call_args.args[1:] == ("worker", 123, -11)
+    owner._handle_worker_failure.assert_called_once()
 
 
 @pytest.mark.parametrize(

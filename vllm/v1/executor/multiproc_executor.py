@@ -356,9 +356,13 @@ class MultiprocExecutor(Executor):
                 # The guardian still distinguishes expected STOPPING exits from
                 # unexpected loss; do not turn its completed stop into failure.
                 return
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
+            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
             logger.error(
-                "Worker proc %s died unexpectedly, shutting down executor.", proc_name
+                "Worker proc %s (pid=%s, exitcode=%s) died unexpectedly, "
+                "shutting down executor.",
+                proc.name,
+                proc.pid,
+                proc.exitcode,
             )
             _self._handle_worker_failure()
 

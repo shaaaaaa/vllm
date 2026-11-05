@@ -141,6 +141,40 @@ def test_worker_reports_traceback_only_after_nonblocking_failure_notification(
     exit_process.assert_called_once_with(1)
 
 
+@pytest.mark.parametrize("message", ["source layout\n" * 1000, object()])
+def test_failure_summary_is_bounded_and_does_not_format_custom_exception(
+    monkeypatch, guardian, message
+):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from dp_guardian_probe import client
+
+    class Unprintable(RuntimeError):
+        def __str__(self):
+            pytest.fail("custom exception formatting ran before notification")
+
+    worker = client.WorkerGuard.__new__(client.WorkerGuard)
+    worker.key, worker.epoch, worker.session = b"key", "epoch", "worker-0"
+    worker.sock = Mock(send=lambda data: len(data))
+    frames = []
+    worker.sock.send = lambda data: frames.append(data) or len(data)
+    monkeypatch.setattr(client.os, "_exit", Mock(side_effect=SystemExit(1)))
+    monkeypatch.setattr(client.traceback, "print_exception", Mock())
+    with pytest.raises(SystemExit):
+        try:
+            raise Unprintable(message)
+        except Unprintable as error:
+            worker.fail(error)
+    report = client.decode_frame(b"key", frames[0])
+    assert len(report["reason"]) <= 256
+    assert "\n" not in report["reason"]
+    assert "Unprintable at test_dp_guardian.py:" in report["reason"]
+    guardian.local_message(NS(role="worker"), report, time.monotonic())
+    assert guardian.member.phase == Phase.ABORTED
+    assert guardian.member.reason.startswith("Worker failed: worker-0 Unprintable")
+    if type(message) is str:
+        assert "source layout" in guardian.member.reason
+
+
 def test_failed_process_launch_does_not_poison_unallocated_epoch(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parent))
     from dp_guardian_probe import client

@@ -5,6 +5,7 @@ import gc
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -26,6 +27,18 @@ spec.loader.exec_module(client)
 def main():
     gc.disable()
     options = json.loads(sys.stdin.readline())
+    if sys.argv[1] == "failure_report":
+        guard = client.WorkerGuard.__new__(client.WorkerGuard)
+        guard.key, guard.epoch, guard.session = b"test", "epoch", "worker-0"
+        guard.sock = socket.create_connection(options["endpoint"], timeout=5)
+        guard.sock.setblocking(False)
+        # The supervisor may terminate us before a blocked traceback is printed.
+        client.traceback.print_exception = lambda *args, **kwargs: time.sleep(60)
+        try:
+            raise RuntimeError("injected source validation failure")
+        except RuntimeError as error:
+            guard.fail(error)
+        return
     if sys.argv[1] == "worker":
         guard = client.WorkerGuard(options["info"], options["rank"])
         print("registered", flush=True)
