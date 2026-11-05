@@ -754,17 +754,12 @@ class FireRedASR2ForConditionalGeneration(
         self.config = config
         self.dtype = vllm_config.model_config.dtype
 
-        with self._mark_composite_model(
-            vllm_config,
-            language_targets=Qwen2ForCausalLM,
-            tower_targets={"audio": (FireRedASR2Encoder, FireRedASR2Adapter)},
-        ):
-            self.model = FireRedASR2Model(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "model"),
-            )
-
+        self.model = FireRedASR2Model(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+        )
         logit_scale = getattr(config, "logit_scale", 1.0)
+
         self.logits_processor = LogitsProcessor(config.vocab_size, scale=logit_scale)
 
     def forward(
@@ -798,6 +793,7 @@ class FireRedASR2ForConditionalGeneration(
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self.model.decoder.embed_input_ids(input_ids)
 

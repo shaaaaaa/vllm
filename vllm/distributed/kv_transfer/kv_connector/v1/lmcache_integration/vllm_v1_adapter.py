@@ -409,7 +409,7 @@ def _calculate_mtp_layers(vllm_config, model_config):
             "vllm_config.speculative_config: %s", vllm_config.speculative_config
         )
         # TODO(baoloongmao): Support other MTP methods
-        if vllm_config.speculative_config.method == "deepseek_mtp":
+        if vllm_config.speculative_config.method in ("deepseek_mtp", "mtp"):
             num_mtp_layers = getattr(
                 model_config.hf_config, "num_nextn_predict_layers", 0
             )
@@ -778,7 +778,9 @@ class LMCacheConnectorV1Impl:
                 continue
 
             if layer_name not in self.kv_caches:
-                self.kv_caches[layer_name] = attn_layer.kv_cache[0]
+                self.kv_caches[layer_name] = attn_layer.kv_cache[
+                    forward_context.virtual_engine
+                ]
 
     ####################
     # Worker side APIs

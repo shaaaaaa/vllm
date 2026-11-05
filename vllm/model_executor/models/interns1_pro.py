@@ -576,19 +576,20 @@ class InternS1ProForConditionalGeneration(
             multimodal_config.is_multimodal_pruning_enabled()
         )
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
+        if not multimodal_config.get_limit_per_prompt(
+            "image"
+        ) and not multimodal_config.get_limit_per_prompt("video"):
+            self.visual = None
+        else:
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
-        with self._mark_language_model(vllm_config):
-            self.language_model = InternS1ProMoeLLMForCausalLM(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-            )
-
+        self.language_model = InternS1ProMoeLLMForCausalLM(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
+        )
         # Whether to include the gate_up_proj mapping is determined by
         # the language model.
         self.packed_modules_mapping = (

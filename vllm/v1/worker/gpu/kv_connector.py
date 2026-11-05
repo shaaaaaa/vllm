@@ -63,10 +63,11 @@ class ActiveKVConnector(KVConnector):
         if self._disabled:
             return
 
+        if scheduler_output.preempted_req_ids:
+            self.kv_connector.handle_preemptions(scheduler_output.preempted_req_ids)
         kv_connector_metadata = scheduler_output.kv_connector_metadata
         assert kv_connector_metadata is not None
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
-        self.kv_connector.handle_preemptions(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
         if is_forward_context_available():
@@ -91,6 +92,13 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.get_finished(scheduler_output.finished_req_ids)
         )
         output.invalid_block_ids = self.kv_connector.get_block_ids_with_load_errors()
+        get_completed_decode_window_saves = getattr(
+            self.kv_connector, "get_completed_decode_window_saves", None
+        )
+        if get_completed_decode_window_saves is not None:
+            output.completed_decode_window_saves = (
+                get_completed_decode_window_saves()
+            )
         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
         if clear_metadata:

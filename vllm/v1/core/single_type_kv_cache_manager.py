@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -21,8 +24,28 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    dsa_shrink_stage,
+    dsa_two_groups_enabled,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+
+def _decode_window_save_window_size() -> int:
+    raw = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def _mtp_dw_event(stage: str, **fields: object) -> None:
+    if os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") != "1":
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "vllm_kv_manager"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -475,6 +498,435 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
+
+
+class DSALatentManager(FullAttentionManager):
+    """DSA shrink-latent (stage 2): manager for the MLA latent group.
+
+    The fixed compact-scratch prefix remains in the request block table and is
+    never released before request completion. Blocks after that prefix are
+    released only through an LMCache-completed ``committed_end``.
+    """
+
+    scratch_blocks = 0
+
+    def is_compact_external(self, request_id: str) -> bool:
+        compact_requests = getattr(
+            self, "_compact_external_prefix_tokens", None
+        )
+        return compact_requests is not None and request_id in compact_requests
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Per-request state for complete external DSA hits.
+        self._compact_external_prefix_tokens: dict[str, int] = {}
+        self._compact_external_released_blocks: dict[str, int] = {}
+
+    def _blocks_per_bundle(self) -> int:
+        return getattr(self.block_pool, "blocks_per_bundle", 1)
+
+    def _round_up_to_bundle(self, num_blocks: int) -> int:
+        blocks_per_bundle = self._blocks_per_bundle()
+        return cdiv(num_blocks, blocks_per_bundle) * blocks_per_bundle
+
+    def _round_down_to_bundle(self, num_blocks: int) -> int:
+        blocks_per_bundle = self._blocks_per_bundle()
+        return num_blocks // blocks_per_bundle * blocks_per_bundle
+
+    def _compact_required_indices(
+        self,
+        prefix_tokens: int,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        force_compact: bool = False,
+        released_blocks: int = 0,
+    ) -> list[int]:
+        """Return physical latent rows required by the current allocation.
+
+        During compact decode, the first rows are sparse-retrieval scratch and
+        the tail rows hold newly computed decode positions. If an external
+        load later falls back to prefill, num_tokens_main_model moves back
+        inside the prompt and every row up to the current prefill chunk is
+        materialized again.
+        """
+        required_blocks = self._round_up_to_bundle(
+            cdiv(num_tokens, self.block_size)
+        )
+        if not force_compact and num_tokens_main_model <= prefix_tokens:
+            # External lookup/load failed: dense prefill needs a contiguous
+            # latent prefix. Grow it chunk by chunk as scheduling progresses.
+            return list(range(required_blocks))
+
+        scratch_end = self._round_up_to_bundle(self.scratch_blocks)
+        if prefix_tokens < self.scratch_blocks * self.block_size:
+            # A resident short prefix needs no unused sparse scratch rows.
+            # Grow that prefix normally as decode/lookahead consumes more slots.
+            scratch_end = min(scratch_end, required_blocks)
+        tail_start = max(
+            self._round_down_to_bundle(prefix_tokens // self.block_size),
+            released_blocks,
+        )
+        if force_compact:
+            # A bootstrap shadow forward needs the final prompt bundle as well
+            # as every live tail block requested by this scheduler step.
+            final_prompt_idx = max(cdiv(prefix_tokens, self.block_size) - 1, 0)
+            tail_start = min(
+                tail_start, self._round_down_to_bundle(final_prompt_idx)
+            )
+        return list(range(scratch_end)) + list(
+            range(max(scratch_end, tail_start), required_blocks)
+        )
+
+    def _get_num_missing_blocks(
+        self,
+        request_id: str,
+        required_indices: Sequence[int],
+    ) -> int:
+        req_blocks = self.req_to_blocks.get(request_id, ())
+        return sum(
+            idx >= len(req_blocks) or req_blocks[idx] == self._null_block
+            for idx in required_indices
+        )
+
+    def get_num_blocks_to_allocate_compact_external(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        """Admission cost for an initial complete external DSA hit."""
+        self._compact_external_prefix_tokens[request_id] = total_computed_tokens
+        self._compact_external_released_blocks.setdefault(request_id, 0)
+        required_indices = self._compact_required_indices(
+            total_computed_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            force_compact=True,
+        )
+        return self._get_num_missing_blocks(
+            request_id, required_indices
+        ) + self._get_num_evictable_blocks(new_computed_blocks)
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        prefix_tokens = self._compact_external_prefix_tokens.get(request_id)
+        if prefix_tokens is None:
+            return super().get_num_blocks_to_allocate(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                total_computed_tokens,
+                num_tokens_main_model,
+            )
+        required_indices = self._compact_required_indices(
+            prefix_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            released_blocks=self._compact_external_released_blocks.get(
+                request_id, 0
+            ),
+        )
+        return self._get_num_missing_blocks(
+            request_id, required_indices
+        ) + self._get_num_evictable_blocks(new_computed_blocks)
+
+    def allocate_new_computed_blocks_compact_external(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """Create a prompt-sized logical table backed only by scratch rows."""
+        if request_id in self.num_cached_block:
+            assert len(new_computed_blocks) == 0
+            return
+
+        assert not new_computed_blocks, (
+            "DSA compact external allocation does not support local "
+            "prefix-cache blocks"
+        )
+        assert num_external_computed_tokens > 0
+        prefix_tokens = num_local_computed_tokens + num_external_computed_tokens
+        self._compact_external_prefix_tokens[request_id] = prefix_tokens
+        self._compact_external_released_blocks.setdefault(request_id, 0)
+
+        scratch_blocks = self._round_up_to_bundle(self.scratch_blocks)
+        if prefix_tokens < self.scratch_blocks * self.block_size:
+            scratch_blocks = min(
+                scratch_blocks,
+                self._round_up_to_bundle(cdiv(prefix_tokens, self.block_size)),
+            )
+        allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
+        assert len(allocated_blocks) == scratch_blocks
+
+        logical_blocks = max(cdiv(prefix_tokens, self.block_size), scratch_blocks)
+        req_blocks = self.req_to_blocks[request_id]
+        assert not req_blocks
+        req_blocks.extend(allocated_blocks)
+        req_blocks.extend([self._null_block] * (logical_blocks - scratch_blocks))
+        self.num_cached_block[request_id] = len(req_blocks)
+        logger.info(
+            "[DSA_COMPACT_TABLE_CREATED] req=%s prefix_tokens=%d "
+            "logical_blocks=%d resident_blocks=%d null_blocks=%d "
+            "scratch_blocks=%d blocks_per_bundle=%d resident_bundles=%d "
+            "free_blocks_after=%d resident_ids=%s",
+            request_id,
+            prefix_tokens,
+            len(req_blocks),
+            sum(not block.is_null for block in req_blocks),
+            sum(block.is_null for block in req_blocks),
+            scratch_blocks,
+            self._blocks_per_bundle(),
+            cdiv(
+                sum(not block.is_null for block in req_blocks),
+                self._blocks_per_bundle(),
+            ),
+            self.block_pool.get_num_free_blocks(),
+            [block.block_id for block in allocated_blocks],
+        )
+
+    def _allocate_compact_request_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        force_compact: bool = False,
+    ) -> list[KVCacheBlock]:
+        prefix_tokens = self._compact_external_prefix_tokens.get(request_id)
+        assert prefix_tokens is not None
+
+        required_indices = self._compact_required_indices(
+            prefix_tokens,
+            num_tokens,
+            num_tokens_main_model,
+            force_compact=force_compact,
+            released_blocks=self._compact_external_released_blocks.get(
+                request_id, 0
+            ),
+        )
+        req_blocks = self.req_to_blocks[request_id]
+        if required_indices:
+            required_len = required_indices[-1] + 1
+            if len(req_blocks) < required_len:
+                req_blocks.extend(
+                    [self._null_block] * (required_len - len(req_blocks))
+                )
+
+        missing_indices = [
+            idx for idx in required_indices if req_blocks[idx] == self._null_block
+        ]
+        if not missing_indices:
+            return []
+
+        new_blocks = self.block_pool.get_new_blocks(len(missing_indices))
+        assert len(new_blocks) == len(missing_indices)
+        for idx, block in zip(missing_indices, new_blocks):
+            req_blocks[idx] = block
+        return new_blocks
+
+    def allocate_new_blocks_compact_external(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        new_blocks = self._allocate_compact_request_blocks(
+            request_id,
+            num_tokens,
+            num_tokens_main_model,
+            force_compact=True,
+        )
+        req_blocks = self.req_to_blocks[request_id]
+        logger.info(
+            "[DSA_COMPACT_ALLOC] req=%s prompt_tokens=%d logical_blocks=%d "
+            "resident_blocks=%d null_blocks=%d scratch_blocks=%d "
+            "blocks_per_bundle=%d resident_bundles=%d free_blocks_after=%d "
+            "new_blocks=%d new_block_ids=%s head_ids=%s tail_ids=%s",
+            request_id,
+            self._compact_external_prefix_tokens[request_id],
+            len(req_blocks),
+            sum(not block.is_null for block in req_blocks),
+            sum(block.is_null for block in req_blocks),
+            self._round_up_to_bundle(self.scratch_blocks),
+            self._blocks_per_bundle(),
+            cdiv(
+                sum(not block.is_null for block in req_blocks),
+                self._blocks_per_bundle(),
+            ),
+            self.block_pool.get_num_free_blocks(),
+            len(new_blocks),
+            [block.block_id for block in new_blocks],
+            [block.block_id for block in req_blocks[:4]],
+            [block.block_id for block in req_blocks[-4:]],
+        )
+        return new_blocks
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        if not self.is_compact_external(request_id):
+            return super().allocate_new_blocks(
+                request_id, num_tokens, num_tokens_main_model
+            )
+        new_blocks = self._allocate_compact_request_blocks(
+            request_id, num_tokens, num_tokens_main_model
+        )
+        prefix_tokens = self._compact_external_prefix_tokens[request_id]
+        if new_blocks and num_tokens_main_model <= prefix_tokens:
+            logger.warning(
+                "[DSA_COMPACT_EXPAND] req=%s prefill_tokens=%d/%d "
+                "new_blocks=%d resident_blocks=%d",
+                request_id,
+                num_tokens_main_model,
+                prefix_tokens,
+                len(new_blocks),
+                sum(
+                    not block.is_null
+                    for block in self.req_to_blocks[request_id]
+                ),
+            )
+        elif new_blocks:
+            req_blocks = self.req_to_blocks[request_id]
+            logger.info(
+                "[DSA_COMPACT_GROW] req=%s prompt_tokens=%d total_tokens=%d "
+                "main_model_tokens=%d new_blocks=%d new_block_ids=%s "
+                "logical_blocks=%d resident_blocks=%d null_blocks=%d",
+                request_id,
+                prefix_tokens,
+                num_tokens,
+                num_tokens_main_model,
+                len(new_blocks),
+                [block.block_id for block in new_blocks],
+                len(req_blocks),
+                sum(not block.is_null for block in req_blocks),
+                sum(block.is_null for block in req_blocks),
+            )
+        return new_blocks
+
+    def free(self, request_id: str) -> None:
+        prefix_tokens = self._compact_external_prefix_tokens.pop(request_id, None)
+        self._compact_external_released_blocks.pop(request_id, None)
+        if prefix_tokens is not None:
+            req_blocks = self.req_to_blocks.get(request_id, ())
+            logger.info(
+                "[DSA_COMPACT_FREE] req=%s prompt_tokens=%d logical_blocks=%d "
+                "resident_blocks=%d null_blocks=%d",
+                request_id,
+                prefix_tokens,
+                len(req_blocks),
+                sum(not block.is_null for block in req_blocks),
+                sum(block.is_null for block in req_blocks),
+            )
+        super().free(request_id)
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        # Computed/prompt progress does not prove that LMCache persisted KV.
+        # Release is exclusively gated by remove_saved_decode_window_blocks.
+        return
+
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        committed_end: int,
+    ) -> int:
+        if committed_end <= 0:
+            return 0
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+
+        if committed_end % self.block_size:
+            raise ValueError(
+                f"committed_end={committed_end} must be divisible by "
+                f"block_size={self.block_size}"
+            )
+        start = self.scratch_blocks
+        end = min(committed_end // self.block_size, len(blocks))
+        compact_requests = getattr(
+            self, "_compact_external_prefix_tokens", None
+        )
+        if compact_requests is not None and request_id in compact_requests:
+            released_blocks = self._compact_external_released_blocks
+            released_blocks[request_id] = max(
+                released_blocks.get(request_id, 0), end
+            )
+        window_size = _decode_window_save_window_size()
+        window_start = max(0, committed_end - window_size) if window_size else None
+        if end <= start:
+            _mtp_dw_event(
+                "release",
+                req=request_id,
+                frontier=committed_end,
+                window_start=window_start,
+                window_end=committed_end,
+                committed_end=committed_end,
+                release_start_block=start,
+                release_end_block=end,
+                block_size=self.block_size,
+                scratch_blocks=self.scratch_blocks,
+                scratch_reserved_blocks=start,
+                release_gate="enabled",
+                freed_blocks=0,
+            )
+            return 0
+
+        removed_blocks: list[KVCacheBlock] = []
+        for i in range(end - 1, start - 1, -1):
+            if blocks[i] == self._null_block:
+                continue
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
+        _mtp_dw_event(
+            "release",
+            req=request_id,
+            frontier=committed_end,
+            window_start=window_start,
+            window_end=committed_end,
+            committed_end=committed_end,
+            release_start_block=start,
+            release_end_block=end,
+            block_size=self.block_size,
+            scratch_blocks=self.scratch_blocks,
+            scratch_reserved_blocks=start,
+            release_gate="enabled",
+            freed_blocks=len(removed_blocks),
+        )
+        if end * self.block_size > committed_end or start < self.scratch_blocks:
+            _mtp_dw_event(
+                "fail",
+                req=request_id,
+                frontier=committed_end,
+                window_start=window_start,
+                window_end=committed_end,
+                invariant="release_range",
+                release_start_block=start,
+                release_end_block=end,
+                block_size=self.block_size,
+                scratch_blocks=self.scratch_blocks,
+            )
+        if removed_blocks:
+            logger.info(
+                "[DECODE_WINDOW_RELEASE] req=%s committed_end=%d "
+                "freed_latent_blocks=%d keep_blocks=%d release_blocks=%d",
+                request_id,
+                committed_end,
+                len(removed_blocks),
+                start,
+                end,
+            )
+        return len(removed_blocks)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1120,6 +1572,16 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec, **kwargs
 ) -> SingleTypeKVCacheManager:
+    if (
+        dsa_two_groups_enabled()
+        and dsa_shrink_stage() == 2
+        and isinstance(kv_cache_spec, MLAAttentionSpec)
+        and kv_cache_spec.head_size >= 512
+    ):
+        # DSA two-group mode stage 2: the latent group (head 576) frees its
+        # prefill blocks at end of prefill; the indexer group (head 128) stays
+        # a plain FullAttentionManager.
+        return DSALatentManager(kv_cache_spec, **kwargs)
     manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

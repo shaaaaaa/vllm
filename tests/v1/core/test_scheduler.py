@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import base64
 import dataclasses
+import hashlib
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +26,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -32,12 +35,29 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import (
+    Request,
+    RequestStatus,
+    compute_prompt_token_fingerprint,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _make_final_hidden_artifact(scheduler: Scheduler) -> dict:
+    raw = b"\0" * (scheduler.final_hidden_size * 2)
+    return {
+        "version": 1,
+        "dtype": "bfloat16",
+        "shape": [scheduler.final_hidden_size],
+        "encoding": "base64",
+        "data": base64.b64encode(raw).decode("ascii"),
+        "data_sha256": hashlib.sha256(raw).hexdigest(),
+        "model_fingerprint": scheduler.final_hidden_model_fingerprint,
+    }
 
 
 def test_add_requests():
@@ -60,6 +80,274 @@ def test_finish_request():
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
         assert len(scheduler.waiting) == 9 - i
+
+
+def test_finish_request_emits_final_token_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    request.append_output_token_ids([11, 12])
+    request.num_computed_tokens = request.num_tokens - 1
+    request.spec_token_ids = [13, 14]
+    scheduler.add_request(request)
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+
+    stage, payload = events[-1]
+    assert stage == "step"
+    assert payload["event"] == "request_finish"
+    assert payload["req"] == request.request_id
+    assert payload["prompt_tokens"] == request.num_prompt_tokens
+    assert payload["output_tokens"] == 2
+    assert payload["total_tokens"] == request.num_prompt_tokens + 2
+    assert payload["num_computed_tokens"] == request.num_tokens - 1
+    assert payload["finish_reason"] == "stop"
+    assert payload["status"] == "FINISHED_STOPPED"
+    assert payload["remaining_speculative_tokens"] == 2
+
+
+def test_finish_request_does_not_build_diagnostics_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    del request.max_tokens
+    scheduler.add_request(request)
+    monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DIAG", raising=False)
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        Mock(side_effect=AssertionError("diagnostic event must stay gated")),
+    )
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
+
+
+def test_deep_mtp_transition_requires_both_gates_and_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler(num_speculative_tokens=1)
+    request = create_requests(num_requests=1, num_tokens=254, max_tokens=16)[0]
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 2},
+        total_num_scheduled_tokens=2,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, request.request_id, 254, 256
+    )
+    assert not hasattr(scheduler, "_mtp_dw_deep_transition_counts")
+
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    deep_events = [fields for stage, fields in events if stage == "deep"]
+    assert len(deep_events) == 1
+    payload = deep_events[0]
+    assert payload["event"] == "mtp_transition"
+    assert payload["frontier_before"] == 254
+    assert payload["frontier_after"] == 256
+    assert payload["computed_before"] == 254
+    assert payload["computed_after"] == 254
+    assert payload["draft_count"] == 1
+    assert payload["accepted_count"] == 1
+    assert payload["rejected_count"] == 0
+    assert payload["generated_count"] == 2
+    assert payload["appended_count"] == 2
+    assert payload["remaining_speculative_tokens"] == 0
+    assert payload["status"] == "RUNNING"
+    assert payload["stopped"] is False
+    assert payload["crossed_first_window"] is True
+
+    scheduler.update_from_output(scheduler_output, model_output)
+    assert len([event for event in events if event[0] == "deep"]) == 1
+
+    for _ in range(7):
+        assert scheduler_module._mtp_dw_sample_deep_transition(
+            scheduler, request.request_id, 255, 256
+        )
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, request.request_id, 255, 256
+    )
+
+
+def test_deep_finish_and_completed_window_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, num_tokens=256)[0]
+    request.num_computed_tokens = 255
+    request.spec_token_ids = [11]
+    scheduler.add_request(request)
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+    scheduler.kv_cache_manager.remove_saved_decode_window_blocks = Mock(
+        return_value=0
+    )
+
+    completed = KVConnectorOutput(
+        completed_decode_window_saves={request.request_id: 256}
+    )
+    scheduler._update_from_kv_xfer_finished(completed)
+    scheduler._update_from_kv_xfer_finished(completed)
+
+    consumed = [
+        fields
+        for stage, fields in events
+        if stage == "deep" and fields["event"] == "completed_window_consumed"
+    ]
+    assert len(consumed) == 1
+    assert consumed[0]["window_end"] == 256
+    assert consumed[0]["frontier"] == 256
+    assert consumed[0]["request_present"] is True
+    assert consumed[0]["status"] == "WAITING"
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+
+    finish = [
+        fields
+        for stage, fields in events
+        if stage == "deep" and fields["event"] == "finish_state"
+    ]
+    assert len(finish) == 1
+    assert finish[0]["frontier"] == 256
+    assert finish[0]["output_tokens"] == 0
+    assert finish[0]["total_tokens"] == 256
+    assert finish[0]["computed_tokens"] == 255
+    assert finish[0]["max_tokens"] == request.max_tokens
+    assert finish[0]["finish_reason"] == "stop"
+    assert finish[0]["remaining_speculative_tokens"] == 1
+    assert finish[0]["crossed_first_window"] is True
+    assert request.request_id not in scheduler._mtp_dw_deep_completed_requests
+
+
+def test_deep_gates_use_configured_first_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "512")
+
+    assert not scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "req", 255, 256
+    )
+    assert scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "req", 511, 512
+    )
+    assert scheduler_module._mtp_dw_sample_deep_transition(
+        scheduler, "long-prompt", 1023, 1024
+    )
+    assert not scheduler_module._mtp_dw_sample_deep_completion(
+        scheduler, "early", 256
+    )
+    assert scheduler_module._mtp_dw_sample_deep_completion(
+        scheduler, "complete", 512
+    )
+
+
+def test_deep_completed_window_handles_missing_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mtp_dw_event",
+        lambda stage, **fields: events.append((stage, fields)),
+    )
+    completed = KVConnectorOutput(completed_decode_window_saves={"absent": 256})
+
+    scheduler._update_from_kv_xfer_finished(completed)
+    scheduler._update_from_kv_xfer_finished(completed)
+
+    assert events == [
+        (
+            "deep",
+            {
+                "event": "completed_window_consumed",
+                "req": "absent",
+                "worker_rank": None,
+                "tp_rank": None,
+                "tp_world": None,
+                "frontier": None,
+                "window_start": 0,
+                "window_end": 256,
+                "kv_group": None,
+                "request_present": False,
+                "status": None,
+            },
+        )
+    ]
+
+
+def test_deep_state_cleanup_follows_connector_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    scheduler._mtp_dw_deep_transition_counts = {request.request_id: 1}
+    scheduler._mtp_dw_deep_completed_requests = {request.request_id: None}
+
+    def connector_finished(finished_request: Request) -> tuple[bool, None]:
+        assert finished_request is request
+        assert request.request_id in scheduler._mtp_dw_deep_transition_counts
+        assert request.request_id in scheduler._mtp_dw_deep_completed_requests
+        return False, None
+
+    monkeypatch.setattr(scheduler, "_connector_finished", connector_finished)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler._mtp_dw_deep_transition_counts
+    assert request.request_id not in scheduler._mtp_dw_deep_completed_requests
 
 
 def test_get_num_unfinished_requests():
@@ -1288,6 +1576,366 @@ def test_kv_connector_basic(is_async: bool):
     assert (
         scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_TOTAL_BLOCKS
     )
+
+
+def test_final_hidden_full_hit_schedules_sampler_only_bootstrap():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_len, is_async=False),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.bootstrap_sample_req_ids == {request.request_id}
+    assert output.num_scheduled_tokens == {request.request_id: 1}
+    assert output.bootstrap_final_hiddens == {
+        request.request_id: request.bootstrap_final_hidden
+    }
+    assert request.num_computed_tokens == prompt_len
+
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert request.output_token_ids == [1000]
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+
+
+def test_captured_final_hidden_is_bound_to_prompt_and_model():
+    scheduler = create_scheduler(block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=1,
+        block_size=16,
+    )[0]
+    request.capture_final_hidden = True
+    assert request.prompt_token_ids is not None
+    request.final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
+        request.prompt_token_ids
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.capture_final_hidden_req_ids == {request.request_id}
+    payload = {
+        "version": 1,
+        "dtype": "bfloat16",
+        "shape": [4],
+        "encoding": "base64",
+        "data": "AAAAAAAAAAA=",
+        "data_sha256": "0" * 64,
+    }
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    setattr(model_output, "final_hidden_states", {request.request_id: payload})
+    scheduler.update_from_output(output, model_output)
+
+    captured_final_hidden = request.captured_final_hidden
+    assert captured_final_hidden is not None
+    assert isinstance(captured_final_hidden["producer_ready_unix_ns"], int)
+    assert {
+        key: value
+        for key, value in captured_final_hidden.items()
+        if key != "producer_ready_unix_ns"
+    } == {
+        **payload,
+        "prompt_length": request.num_prompt_tokens,
+        "prompt_sha256": request.final_hidden_prompt_fingerprint,
+        "model_fingerprint": scheduler.final_hidden_model_fingerprint,
+    }
+
+
+def test_capture_final_hidden_on_last_chunked_prefill_step():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=32,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        max_tokens=1,
+    )[0]
+    request.capture_final_hidden = True
+    scheduler.add_request(request)
+
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens == {request.request_id: 16}
+    assert first_output.capture_final_hidden_req_ids is None
+    assert "capture_final_hidden_req_ids" not in first_output.__dict__
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    final_output = scheduler.schedule()
+    assert final_output.num_scheduled_tokens == {request.request_id: 4}
+    assert final_output.capture_final_hidden_req_ids == {request.request_id}
+
+
+def test_async_final_hidden_bootstrap_waits_for_remote_load():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_len, is_async=True),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    load_output = scheduler.schedule()
+    assert load_output.bootstrap_sample_req_ids is None
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(
+        load_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    completion_output = scheduler.schedule()
+    scheduler.update_from_output(
+        completion_output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id}
+            ),
+        ),
+    )
+
+    bootstrap_output = scheduler.schedule()
+    assert bootstrap_output.bootstrap_sample_req_ids == {request.request_id}
+    assert request.num_computed_tokens == prompt_len
+
+
+def test_partial_hit_discards_final_hidden_and_prefills_normally():
+    prompt_len = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=16, is_async=False),
+        block_size=16,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.bootstrap_final_hidden = _make_final_hidden_artifact(scheduler)
+    request.bootstrap_sample_pending = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.bootstrap_sample_req_ids is None
+    assert output.num_scheduled_tokens == {request.request_id: 16}
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+
+
+def test_ready_bootstrap_is_not_starved_by_running_decode():
+    prompt_hit = 32
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=prompt_hit, is_async=False),
+        block_size=16,
+    )
+    normal_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        max_tokens=4,
+        block_size=16,
+        req_ids=["normal"],
+    )[0]
+    bootstrap_request = create_requests(
+        num_requests=1,
+        num_tokens=prompt_hit,
+        max_tokens=4,
+        block_size=16,
+        req_ids=["bootstrap"],
+    )[0]
+    bootstrap_request.bootstrap_final_hidden = _make_final_hidden_artifact(
+        scheduler
+    )
+    bootstrap_request.bootstrap_sample_pending = True
+    scheduler.add_request(normal_request)
+    scheduler.add_request(bootstrap_request)
+
+    normal_output = scheduler.schedule()
+    assert set(normal_output.num_scheduled_tokens) == {normal_request.request_id}
+    assert normal_output.bootstrap_sample_req_ids is None
+
+    scheduler.update_from_output(
+        normal_output,
+        ModelRunnerOutput(
+            req_ids=[normal_request.request_id],
+            req_id_to_index={normal_request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    bootstrap_output = scheduler.schedule()
+    assert bootstrap_output.bootstrap_sample_req_ids == {
+        bootstrap_request.request_id
+    }
+    assert set(bootstrap_output.num_scheduled_tokens) == {
+        bootstrap_request.request_id
+    }
+
+
+def test_two_group_invalid_bootstrap_load_clears_artifact():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "stale"}
+    request.bootstrap_sample_pending = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 2], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {12}, evict_blocks=True
+        )
+    )
+
+    assert affected == {request.request_id}
+    assert affected_tokens == 16
+    assert request.num_computed_tokens == 16
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+    assert blocks_to_evict == {2, 12}
+
+
+def test_compact_invalid_load_restarts_dense_prefill_from_zero():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "stale"}
+    request.bootstrap_sample_pending = True
+    request.dsa_compact_allocated = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 2], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {12}, evict_blocks=True
+        )
+    )
+
+    assert affected == {request.request_id}
+    assert affected_tokens == 32
+    assert request.num_computed_tokens == 0
+    assert request.num_cached_tokens == 0
+    assert request.num_external_computed_tokens == 0
+    assert not request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden is None
+    assert not request.dsa_compact_allocated
+    # The compact table was freed as a whole. Passing the same IDs to the
+    # generic eviction path would double-handle them and DSA shared pools do
+    # not implement prefix-cache eviction.
+    assert blocks_to_evict == set()
+
+
+def test_compact_null_block_does_not_trigger_load_fallback():
+    scheduler = create_scheduler(use_kv_connector=True, block_size=16)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=2,
+        block_size=16,
+    )[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 32
+    request.num_cached_tokens = 32
+    request.num_external_computed_tokens = 32
+    request.bootstrap_final_hidden = {"data": "valid"}
+    request.bootstrap_sample_pending = True
+    request.dsa_compact_allocated = True
+    scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=([1, 0], [11, 12])
+    )
+
+    affected, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request], {0}, evict_blocks=True
+        )
+    )
+
+    assert affected == set()
+    assert affected_tokens == 0
+    assert blocks_to_evict == set()
+    assert request.num_computed_tokens == 32
+    assert request.bootstrap_sample_pending
+    assert request.bootstrap_final_hidden == {"data": "valid"}
+    assert request.dsa_compact_allocated
 
 
 @pytest.mark.parametrize("is_async", [False, True])

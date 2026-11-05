@@ -682,11 +682,12 @@ class VllmConfig:
                 self.model_config, self.load_config
             )
 
-        from vllm.v1.executor.abstract import Executor
-
         executor_backend = self.parallel_config.distributed_executor_backend
-        executor_class = Executor.get_class(self)
-        executor_supports_async_sched = executor_class.supports_async_scheduling()
+        executor_supports_async_sched = executor_backend in (
+            "mp",
+            "uni",
+            "external_launcher",
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -710,7 +711,9 @@ class VllmConfig:
                     )
             if not executor_supports_async_sched:
                 raise ValueError(
-                    f"`{executor_backend}` does not support async scheduling yet."
+                    "Currently, async scheduling only supports `mp`, `uni`, or "
+                    "`external_launcher` distributed executor backend, but you chose "
+                    f"`{executor_backend}`."
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
@@ -739,7 +742,8 @@ class VllmConfig:
             elif not executor_supports_async_sched:
                 logger.warning_once(
                     "Async scheduling will be disabled because it is not supported "
-                    "with the `%s` distributed executor backend. ",
+                    "with the `%s` distributed executor backend (only `mp`, `uni`, and "
+                    "`external_launcher` are supported).",
                     executor_backend,
                     scope="local",
                 )
@@ -985,6 +989,8 @@ class VllmConfig:
                 "--kv-sharing-fast-prefill requires changes on model side for "
                 "correctness and to realize prefill savings."
             )
+        # TODO: Move after https://github.com/vllm-project/vllm/pull/26847 lands
+        self._set_compile_ranges()
 
         if (
             self.model_config
@@ -1019,10 +1025,6 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
-
-        # Re-compute compile ranges after platform-specific config updates
-        # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
-        self._set_compile_ranges()
 
         # Do this after all the updates to compilation_config.mode
         effective_dp_size = (

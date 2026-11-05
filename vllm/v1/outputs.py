@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 import torch
@@ -150,6 +150,9 @@ class KVConnectorOutput:
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
     invalid_block_ids: set[int] = field(default_factory=set)
+    # req_id -> token end offset for decode windows that were saved to the
+    # external KV connector and can be evicted from the local latent KV cache.
+    completed_decode_window_saves: dict[str, int] = field(default_factory=dict)
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -164,6 +167,7 @@ class KVConnectorOutput:
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
+            and not self.completed_decode_window_saves
             and not self.kv_connector_worker_meta
         )
 
@@ -188,6 +192,13 @@ class KVConnectorOutput:
             set.union, [output.invalid_block_ids for output in outputs]
         )
         assert invalid_block_ids is not None
+        completed_decode_window_saves: dict[str, int] = {}
+        for output in outputs:
+            for req_id, window_end in output.completed_decode_window_saves.items():
+                completed_decode_window_saves[req_id] = max(
+                    completed_decode_window_saves.get(req_id, 0),
+                    window_end,
+                )
 
         assert all(
             output.expected_finished_count == outputs[0].expected_finished_count
@@ -201,6 +212,7 @@ class KVConnectorOutput:
             kv_connector_stats=kv_connector_stats,
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,
+            completed_decode_window_saves=completed_decode_window_saves,
             expected_finished_count=expected_finished_count,
         )
 
@@ -252,6 +264,11 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Final prompt hidden states requested by a KV producer. The payload is
+    # serialized (rather than a torch.Tensor) because ModelRunnerOutput crosses
+    # the worker/scheduler process boundary.
+    final_hidden_states: ClassVar[dict[str, dict[str, Any]] | None] = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

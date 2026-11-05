@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 set -euxo pipefail
+
 # Nightly e2e test for prefetch offloading with a MoE model.
 # Runs DeepSeek-V2-Lite with prefetch offloading of MoE expert weights
 # and validates GSM8K accuracy matches baseline (no offloading).
 #
 # args: [THRESHOLD] [NUM_QUESTIONS] [START_PORT]
-#
-# Environment variables:
-#   ATTENTION_BACKEND   - attention backend to use (e.g., FLASH_ATTN,
-#                         ROCM_ATTN, FLASHINFER). If unset, uses vllm default.
 THRESHOLD=${1:-0.25}
 NUM_Q=${2:-1319}
 PORT=${3:-8030}
@@ -24,14 +21,6 @@ wait_for_server() {
 }
 
 MODEL="deepseek-ai/DeepSeek-V2-Lite"
-
-# ── Build optional vllm serve flags ─────────────────────────────────────
-
-EXTRA_ARGS=()
-if [[ -n "${ATTENTION_BACKEND:-}" ]]; then
-  echo "Using attention backend: ${ATTENTION_BACKEND}"
-  EXTRA_ARGS+=(--attention-backend "${ATTENTION_BACKEND}")
-fi
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -51,8 +40,7 @@ vllm serve "$MODEL" \
   --offload-num-in-group 2 \
   --offload-prefetch-step 1 \
   --offload-params w13_weight w2_weight \
-  --port "$PORT" \
-  ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"} &
+  --port "$PORT" &
 SERVER_PID=$!
 wait_for_server "$PORT"
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 from dataclasses import dataclass, fields, replace
 from math import prod
 
@@ -14,6 +15,58 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
+
+
+def _parse_dsa_role_env(name: str) -> bool:
+    raw = os.getenv(name, "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
+
+
+def layerwise_prefill_p_node_enabled() -> bool:
+    """Whether this process is a layerwise-prefill P node.
+
+    This is an explicit node marker.  Do not infer it from ``kv_role`` or
+    ``kv_rank``: those values describe connector behavior and are ambiguous
+    for ``kv_both`` deployments.
+    """
+    return _parse_dsa_role_env("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE")
+
+
+
+
+def dsa_two_groups_enabled() -> bool:
+    """vllm-ascend DSA un-bundled latent/indexer (two-group mode).
+
+    When enabled, MLA specs with different head_size (latent 576 vs indexer 128)
+    are routed to SEPARATE KV cache groups backed by per-group block pools,
+    instead of one UniformTypeKVCacheSpecs group with a shared block table.
+    This is the prerequisite for freeing the latent blocks independently of the
+    indexer blocks at the end of prefill (DSA latent offload).
+    """
+    return os.getenv("VLLM_ASCEND_DSA_TWO_GROUPS", "0") == "1"
+
+
+def dsa_shared_pool_enabled() -> bool:
+    """Share one physical DSA bundle pool between latent and indexer groups."""
+    return os.getenv("VLLM_ASCEND_DSA_SHARED_POOL", "1") == "1"
+
+
+def dsa_shrink_stage() -> int:
+    """DSA Step B staging (see vllm-ascend VLLM_ASCEND_DSA_SHRINK_LATENT).
+
+    0 = off; 1 = compact-scratch decode read (no freeing); 2 = additionally
+    FREE the latent blocks [scratch .. prompt) at end of prefill (B1);
+    3 = isolation diagnostic.
+    """
+    try:
+        return int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0"))
+    except ValueError:
+        return 0
 
 
 @dataclass(frozen=True)
@@ -398,6 +451,17 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         """
         Whether all layers have the same type of KV cache spec.
         """
+        if dsa_two_groups_enabled():
+            # DSA un-bundle: MLA latent (576) and indexer (128) specs must form
+            # separate groups (per-group block pools) so the latent blocks can be
+            # freed independently. Do not collapse them into one uniform-type group.
+            head_sizes = {
+                spec.head_size
+                for spec in kv_cache_specs.values()
+                if isinstance(spec, MLAAttentionSpec)
+            }
+            if len(head_sizes) > 1:
+                return False
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
@@ -489,6 +553,21 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+
+    num_blocks_per_group: list[int] | None = None
+    """DSA two-group mode with per-group pools: pool size per group (latent
+    pool sized for its working set, indexer pool gets the rest). None means
+    every pool has num_blocks blocks."""
+
+    dsa_index_topk: int | None = None
+    """DSA sparse-attention index_topk. Used to keep only enough latent blocks
+    for sparse decode after prefill when latent offload/shrink is enabled."""
+
+    dsa_num_speculative_tokens: int = 0
+    """Number of speculative tokens used to size DSA compact scratch rows."""
+
+    dsa_paired_bank_slots: int = 0
+    """Worker-local paired-bank addressing; zero retains the legacy layout."""
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -126,6 +126,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -213,6 +214,91 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _update_request_kv_block_state(
+    req_id: str,
+    req_state: CachedRequestState,
+    new_block_ids: tuple[list[int], ...] | None,
+    new_block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None,
+    new_block_allocation_mode: DSABlockAllocationMode | None,
+    *,
+    resumed_from_preemption: bool,
+) -> None:
+    """Append or replace one request's KV block allocation metadata."""
+    if resumed_from_preemption:
+        assert new_block_ids is not None
+        req_state.block_ids = new_block_ids
+        req_state.block_ids_by_bank = new_block_ids_by_bank
+        req_state.block_allocation_mode = new_block_allocation_mode
+        return
+
+    if (
+        new_block_allocation_mode is not None
+        and req_state.block_allocation_mode != new_block_allocation_mode
+    ):
+        raise RuntimeError(
+            "KV block allocation mode changed during request: "
+            f"request_id={req_id}, "
+            f"current={req_state.block_allocation_mode}, "
+            f"new={new_block_allocation_mode}"
+        )
+    if new_block_ids_by_bank is not None:
+        current_banks = req_state.block_ids_by_bank
+        if current_banks is None:
+            raise RuntimeError(
+                "received banked KV block delta for an ordinary request"
+            )
+        if len(current_banks) != len(new_block_ids_by_bank):
+            raise RuntimeError(
+                "KV block bank count changed during request: "
+                f"request_id={req_id}"
+            )
+        if not current_banks:
+            raise RuntimeError(
+                "banked request has no KV block banks: "
+                f"request_id={req_id}"
+            )
+        expected_group_count = len(current_banks[0])
+        if any(
+            len(bank) != expected_group_count for bank in current_banks
+        ) or any(
+            len(bank) != expected_group_count
+            for bank in new_block_ids_by_bank
+        ):
+            raise RuntimeError(
+                "KV block group count changed during request: "
+                f"request_id={req_id}"
+            )
+        if (
+            new_block_ids is not None
+            and new_block_ids_by_bank[0] != new_block_ids
+        ):
+            raise RuntimeError(
+                "primary KV block delta differs from bank 0: "
+                f"request_id={req_id}"
+            )
+    elif (
+        new_block_ids is not None
+        and req_state.block_allocation_mode
+        == DSABlockAllocationMode.PREFILL_CHILD
+    ):
+        raise RuntimeError(
+            "banked request is missing its KV block bank delta: "
+            f"request_id={req_id}"
+        )
+
+    if new_block_ids is not None:
+        for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+            block_ids.extend(new_ids)
+    if new_block_ids_by_bank is not None:
+        assert req_state.block_ids_by_bank is not None
+        for bank_groups, new_bank_groups in zip(
+            req_state.block_ids_by_bank,
+            new_block_ids_by_bank,
+        ):
+            for block_ids, new_ids in zip(bank_groups, new_bank_groups):
+                block_ids.extend(new_ids)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -420,9 +506,8 @@ class GPUModelRunner(
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
         )
-        # These will be overridden in load_model()
+        # This will be overridden in load_model()
         self.is_multimodal_pruning_enabled = False
-        self.requires_sequential_video_encoding = False
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
@@ -739,19 +824,6 @@ class GPUModelRunner(
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
-
-        # When spec decode is active, the mamba backend classifies requests
-        # with query_len <= reorder_batch_threshold as "decodes". Prefill
-        # chunks that fall under this threshold get processed via the decode
-        # path, which stores intermediate states at sequential slots. We must
-        # set num_accepted_tokens to the chunk's query_len for those requests
-        # so the next iteration reads from the correct final-state slot.
-        # Prefills that went through the actual prefill path should keep the
-        # default value of 1 (the prefill path stores state at slot 0 only).
-        self.needs_prefill_as_decode_slots: bool = False
-        self.prefill_as_decode_num_tokens = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
@@ -1134,6 +1206,8 @@ class GPUModelRunner(
                 pooling_params=pooling_params,
                 generator=generator,
                 block_ids=new_req_data.block_ids,
+                block_ids_by_bank=new_req_data.block_ids_by_bank,
+                block_allocation_mode=new_req_data.block_allocation_mode,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -1190,6 +1264,16 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
+            new_block_ids_by_bank = (
+                req_data.new_block_ids_by_bank[i]
+                if req_data.new_block_ids_by_bank is not None
+                else None
+            )
+            new_block_allocation_mode = (
+                req_data.new_block_allocation_modes[i]
+                if req_data.new_block_allocation_modes is not None
+                else None
+            )
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -1256,8 +1340,24 @@ class GPUModelRunner(
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
-            # Update the block IDs.
-            if not resumed_from_preemption:
+            # Only P-node banked requests use the layerwise metadata helper.
+            if (
+                req_state.block_allocation_mode is not None
+                or new_block_allocation_mode is not None
+                or req_state.block_ids_by_bank is not None
+                or new_block_ids_by_bank is not None
+            ):
+                if resumed_from_preemption:
+                    assert req_index is None
+                _update_request_kv_block_state(
+                    req_id,
+                    req_state,
+                    new_block_ids,
+                    new_block_ids_by_bank,
+                    new_block_allocation_mode,
+                    resumed_from_preemption=resumed_from_preemption,
+                )
+            elif not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -1369,22 +1469,12 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
-        spec_decode_active = bool(scheduler_output.scheduled_spec_decode_tokens)
-        if self.needs_prefill_as_decode_slots and spec_decode_active:
-            mamba_utils.update_accepted_tokens_for_prefill_as_decode(
-                self.input_batch,
-                self.prefill_as_decode_num_tokens,
-                self.num_accepted_tokens.gpu,
-                scheduler_output,
-                self.reorder_batch_threshold,
-                num_reqs,
-            )
-
         if self.cache_config.mamba_cache_mode == "align":
             for i, num_tokens in enumerate(
                 self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
             ):
                 self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+
             mamba_utils.postprocess_mamba(
                 scheduler_output,
                 self.kv_cache_config,
@@ -1423,6 +1513,8 @@ class GPUModelRunner(
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
+        req_state.block_ids_by_bank = new_req_data.block_ids_by_bank
+        req_state.block_allocation_mode = new_req_data.block_allocation_mode
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
@@ -2048,8 +2140,6 @@ class GPUModelRunner(
                 else 0
             )
 
-            if isinstance(builder, Mamba2AttentionMetadataBuilder):
-                self.needs_prefill_as_decode_slots = True
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
@@ -2626,23 +2716,17 @@ class GPUModelRunner(
         ):
             batch_outputs: MultiModalEmbeddings
 
-            # EVS and dynamic res video related change.
+            # EVS-related change.
             # (ekhvedchenia): Temporary hack to limit peak memory usage when
             # processing multimodal data. This solves the issue with scheduler
             # putting too many video samples into a single batch. Scheduler
             # uses pruned vision tokens count to compare it versus compute
             # budget which is incorrect (Either input media size or non-pruned
             # output vision tokens count should be considered)
-            # dynamic res video for nemotron temporarily uses this hack via
-            # requires_sequential_video_encoding
-            # because it doesn't yet support video batching.
             # TODO(ywang96): Fix memory profiling to take EVS into account and
             # remove this hack.
             if (
-                (
-                    self.is_multimodal_pruning_enabled
-                    or self.requires_sequential_video_encoding
-                )
+                self.is_multimodal_pruning_enabled
                 and modality == "video"
                 and num_items > 1
             ):
@@ -2935,10 +3019,7 @@ class GPUModelRunner(
 
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np,
-            seq_lens_cpu,
-            device=hidden_states.device,
-            query_start_loc_gpu=self.query_start_loc.gpu[: num_reqs + 1],
+            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
         )
 
         model = cast(VllmModelForPooling, self.model)
@@ -3604,10 +3685,10 @@ class GPUModelRunner(
                 scheduled_spec_decode_tokens=spec_decode_tokens_copy,
             )
 
-        if has_kv_transfer_group():
-            kv_connector_metadata = scheduler_output.kv_connector_metadata
-            assert kv_connector_metadata is not None
-            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
+            )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -4079,7 +4160,19 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
-            self.finalize_kv_connector()
+            completed_decode_window_saves = self.finalize_kv_connector()
+            if completed_decode_window_saves:
+                if self.kv_connector_output is None:
+                    self.kv_connector_output = KVConnectorOutput()
+                for req_id, window_end in completed_decode_window_saves.items():
+                    self.kv_connector_output.completed_decode_window_saves[
+                        req_id
+                    ] = max(
+                        self.kv_connector_output.completed_decode_window_saves.get(
+                            req_id, 0
+                        ),
+                        window_end,
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -4616,9 +4709,6 @@ class GPUModelRunner(
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         )
-        self.requires_sequential_video_encoding = hasattr(
-            self.get_model(), "requires_sequential_video_encoding"
-        )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
         if (
             is_mixture_of_experts(self.model)
@@ -5523,14 +5613,13 @@ class GPUModelRunner(
                             dummy_modality
                         ]
 
-                        logger.info_once(
+                        logger.info(
                             "Encoder cache will be initialized with a "
                             "budget of %s tokens, and profiled with "
                             "%s %s items of the maximum feature size.",
                             encoder_budget,
                             max_mm_items_per_batch,
                             dummy_modality,
-                            scope="local",
                         )
 
                         # Create dummy batch of multimodal inputs.
@@ -5580,10 +5669,15 @@ class GPUModelRunner(
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
-        minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
-        )
-        self.cache_config.num_gpu_blocks_override = saved_override
+        try:
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config,
+                kv_cache_groups,
+                available_memory=0,
+                for_profiling=True,
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks

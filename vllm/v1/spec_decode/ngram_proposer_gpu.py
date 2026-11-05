@@ -364,9 +364,7 @@ class NgramProposerGPU:
         )
         token_ids_gpu.scatter_(1, write_positions_long, tokens_to_scatter)
 
-        num_tokens_tmp = (num_tokens_no_spec + valid_sampled_tokens_count).to(
-            torch.int32
-        )
+        num_tokens_tmp = num_tokens_no_spec + valid_sampled_tokens_count
 
         # Compute validity masks.
         sampled_flags = valid_sampled_tokens_count > 0
@@ -439,7 +437,7 @@ class NgramProposerGPU:
         )
 
         # Count valid tokens per request.
-        valid_sampled_tokens_count = valid_mask.sum(dim=1).to(torch.int32)
+        valid_sampled_tokens_count = valid_mask.sum(dim=1)
 
         # Rightmost valid index per row.
         last_valid_indices = valid_sampled_tokens_count - 1

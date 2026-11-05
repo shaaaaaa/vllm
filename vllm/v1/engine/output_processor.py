@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +38,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -149,6 +152,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        remote_prefill_cached_tokens: int | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -172,6 +176,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -216,7 +221,21 @@ class RequestState:
         log_stats: bool,
         stream_interval: int,
     ) -> "RequestState":
+        remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
+            # In a remote prefill scenario, report cached tokens
+            # as cache hit rate on the remote P worker.
+            if sampling_params.extra_args:
+                kv_transfer_params = sampling_params.extra_args.get(
+                    "kv_transfer_params"
+                )
+                if kv_transfer_params and (
+                    kv_transfer_params.get("do_remote_prefill")
+                    or kv_transfer_params.get("do_remote_decode")
+                ):
+                    cached = kv_transfer_params.get("remote_prefill_cached_tokens")
+                    if isinstance(cached, int):
+                        remote_prefill_cached_tokens = cached
             if not sampling_params.detokenize:
                 tokenizer = None
             output_kind = sampling_params.output_kind
@@ -264,6 +283,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            remote_prefill_cached_tokens=remote_prefill_cached_tokens,
         )
 
     def make_request_output(
@@ -617,8 +637,11 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
-            req_state.num_cached_tokens = engine_core_output.num_cached_tokens
-            req_state.is_prefilling = False
+            if req_state.is_prefilling:
+                req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+                if req_state.remote_prefill_cached_tokens is not None:
+                    req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
+                req_state.is_prefilling = False
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -772,6 +795,29 @@ class OutputProcessor:
 
         assert engine_core_timestamp is not None
         assert req_state.stats is not None
+        if req_state.is_prefilling:
+            prompt_tokens = req_state.prompt_len
+            cached_tokens = engine_core_output.num_cached_tokens
+            external_tokens = engine_core_output.num_external_computed_tokens
+            recomputed_tokens = int(cached_tokens + 1 == prompt_tokens)
+            local_compute = prompt_tokens - cached_tokens
+            local_cache_hit = (
+                cached_tokens + recomputed_tokens - external_tokens
+            )
+            if local_compute < 0 or local_cache_hit < 0:
+                logger.error(
+                    "[PROMPT_TOKEN_ACCOUNTING_BAD] internal_req=%s "
+                    "external_req=%s prompt=%d cached=%d external=%d "
+                    "recomputed=%d local_compute=%d local_cache_hit=%d",
+                    engine_core_output.request_id,
+                    req_state.external_req_id,
+                    prompt_tokens,
+                    cached_tokens,
+                    external_tokens,
+                    recomputed_tokens,
+                    local_compute,
+                    local_cache_hit,
+                )
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,

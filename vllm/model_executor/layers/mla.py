@@ -27,6 +27,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    skip_topk: bool = False
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -86,11 +87,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.skip_topk = mla_modules.skip_topk
 
+        # The top-k buffer is shared between producers and consumers; it must
+        # stay reachable even when this layer has no local Indexer (shared
+        # consumer), so it cannot only live on the Indexer module.
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
-            self.topk_indices_buffer = mla_modules.topk_indices_buffer
+        elif mla_modules.topk_indices_buffer is not None:
+            self.topk_tokens = mla_modules.topk_indices_buffer.shape[-1]
+        self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
         self.mla_attn = MLAAttention(
             num_heads=self.num_heads,
@@ -106,6 +113,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            topk_indices_buffer=mla_modules.topk_indices_buffer,
+            skip_topk=self.skip_topk,
         )
 
         self.prefix = prefix

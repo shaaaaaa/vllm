@@ -61,10 +61,10 @@ class ResponsesParser:
         # Store the finish_reason from the output
         self.finish_reason = output.finish_reason
 
-        reasoning, content = self.reasoning_parser_instance.extract_reasoning(
+        reasoning_content, content = self.reasoning_parser_instance.extract_reasoning(
             output.text, request=self.request
         )
-        if reasoning:
+        if reasoning_content:
             self.response_messages.append(
                 ResponseReasoningItem(
                     type="reasoning",
@@ -73,7 +73,7 @@ class ResponsesParser:
                     content=[
                         Content(
                             type="reasoning_text",
-                            text=reasoning,
+                            text=reasoning_content,
                         )
                     ],
                 )

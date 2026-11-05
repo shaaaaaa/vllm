@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -102,6 +103,89 @@ class KVCacheBlocks:
         """
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
+    def get_block_ids_by_bank(
+        self,
+        *,
+        allow_none: bool = False,
+    ) -> tuple[tuple[list[int], ...], ...] | None:
+        """Return physical block IDs for each layerwise-prefill bank.
+
+        The outer tuple is bank-major and each inner tuple follows KV-cache
+        group order. Ordinary blocks do not carry bank identities and return
+        ``None``.
+        """
+        allocation_mode = self.get_allocation_mode()
+        if allocation_mode != DSABlockAllocationMode.PREFILL_CHILD:
+            return None
+
+        bank_count: int | None = None
+        for group in self.blocks:
+            for block in group:
+                if block.is_null:
+                    continue
+                if block.bank_block_ids is None:
+                    if bank_count is not None:
+                        raise ValueError(
+                            "KV allocation mixes banked and ordinary blocks"
+                        )
+                    continue
+                current_count = len(block.bank_block_ids)
+                if bank_count is None:
+                    bank_count = current_count
+                elif bank_count != current_count:
+                    raise ValueError(
+                        "KV allocation contains inconsistent bank counts"
+                    )
+        if bank_count is None:
+            return None
+        if allow_none and all(len(group) == 0 for group in self.blocks):
+            return None
+
+        result: list[tuple[list[int], ...]] = []
+        for bank in range(bank_count):
+            bank_groups: list[list[int]] = []
+            for group in self.blocks:
+                ids: list[int] = []
+                for block in group:
+                    if block.is_null:
+                        ids.append(0)
+                    elif block.bank_block_ids is None:
+                        raise ValueError(
+                            "KV allocation mixes banked and ordinary blocks"
+                        )
+                    else:
+                        ids.append(block.bank_block_ids[bank])
+                bank_groups.append(ids)
+            result.append(tuple(bank_groups))
+        return tuple(result)
+
+    def get_allocation_mode(self) -> DSABlockAllocationMode | None:
+        allocation_mode: DSABlockAllocationMode | None = None
+        saw_untyped = False
+        for group in self.blocks:
+            for block in group:
+                if block.is_null:
+                    continue
+                current_mode = block.allocation_mode
+                if current_mode is None:
+                    if allocation_mode is not None:
+                        raise ValueError(
+                            "KV allocation mixes typed and untyped blocks"
+                        )
+                    saw_untyped = True
+                    continue
+                if allocation_mode is None:
+                    if saw_untyped:
+                        raise ValueError(
+                            "KV allocation mixes typed and untyped blocks"
+                        )
+                    allocation_mode = current_mode
+                elif allocation_mode != current_mode:
+                    raise ValueError(
+                        "KV allocation contains mixed allocation modes"
+                    )
+        return allocation_mode
+
 
 class KVCacheManager:
     def __init__(
@@ -157,9 +241,10 @@ class KVCacheManager:
         """Get the KV cache usage.
 
         Returns:
-            The KV cache usage (between 0.0 and 1.0).
+            The KV cache usage (between 0.0 and 1.0). With per-group block
+            pools, the most-occupied pool (it is the scheduling constraint).
         """
-        return self.block_pool.get_usage()
+        return max(pool.get_usage() for pool in self.coordinator.block_pools)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -225,6 +310,7 @@ class KVCacheManager:
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        dsa_compact_external_load: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -332,10 +418,12 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            total_computed_tokens,
+            num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        if not self.coordinator.has_enough_free_blocks(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -343,10 +431,10 @@ class KVCacheManager:
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
-        )
-
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
+            dsa_compact_external_load=dsa_compact_external_load,
+        ):
+            # Cannot allocate new blocks (with per-group block pools, every
+            # group's demand must fit its own pool).
             return None
 
         if (
@@ -360,6 +448,7 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                dsa_compact_external_load=dsa_compact_external_load,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
@@ -367,7 +456,10 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            dsa_compact_external_load,
         )
+        if dsa_compact_external_load:
+            request.dsa_compact_allocated = True
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -410,13 +502,24 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_saved_decode_window_blocks(
+        self,
+        request_id: str,
+        committed_end: int,
+    ) -> int:
+        """Free DSA latent blocks covered by a completed decode-window save."""
+        return self.coordinator.remove_saved_decode_window_blocks(
+            request_id, committed_end
+        )
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        for pool in self.coordinator.block_pools:
+            pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -427,7 +530,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        if not all(pool.reset_prefix_cache() for pool in self.coordinator.block_pools):
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -474,7 +577,11 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        return self.block_pool.take_events()
+        return [
+            event
+            for pool in self.coordinator.block_pools
+            for event in pool.take_events()
+        ]
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
@@ -483,6 +590,9 @@ class KVCacheManager:
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
+
+    def get_external_load_validation_block_ids(self, request_id: str) -> list[int]:
+        return self.coordinator.get_external_load_validation_block_ids(request_id)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
@@ -507,6 +617,20 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def maybe_log_dsa_shared_pool_usage(
+        self,
+        requests: dict[str, Request],
+        running_count: int,
+        waiting_count: int,
+        max_running_count: int,
+    ) -> None:
+        self.coordinator.maybe_log_dsa_shared_pool_usage(
+            requests=requests,
+            running_count=running_count,
+            waiting_count=waiting_count,
+            max_running_count=max_running_count,
+        )
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""

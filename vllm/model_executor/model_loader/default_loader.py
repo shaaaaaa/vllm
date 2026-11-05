@@ -319,7 +319,7 @@ class DefaultModelLoader(BaseModelLoader):
             and parallel_config.enable_ep_weight_filter
         ):
             return
-
+        
         # When EPLB is enabled, redundant physical expert slots may map to
         # logical experts that belong to other ranks in the default partition.
         # The weight loader needs to see ALL logical expert weights so it can

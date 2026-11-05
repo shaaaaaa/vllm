@@ -44,10 +44,7 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.processors.qwen_vl import (
-    QwenVLImageProcessorFast,
-    QwenVLProcessor,
-)
+from vllm.transformers_utils.processors.qwen_vl import QwenVLProcessor
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -435,20 +432,15 @@ class QwenVLModel(QWenModel):
 
 
 class QwenVLProcessingInfo(BaseProcessingInfo):
-    def get_image_processor(self, **kwargs):
+    def get_hf_processor(self, **kwargs: object) -> QwenVLProcessor:
         config = self.get_hf_config()
         vision_config = config.visual
-
         image_size = vision_config["image_size"]
-        kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
-        kwargs.setdefault("size", {"width": image_size, "height": image_size})
 
-        return QwenVLImageProcessorFast(**kwargs)
-
-    def get_hf_processor(self, **kwargs: object) -> QwenVLProcessor:
-        return QwenVLProcessor(
+        return self.ctx.init_processor(
+            QwenVLProcessor,
             tokenizer=self.get_tokenizer(),
-            image_processor=self.get_image_processor(**kwargs),
+            **{**kwargs, "image_size": image_size},
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:

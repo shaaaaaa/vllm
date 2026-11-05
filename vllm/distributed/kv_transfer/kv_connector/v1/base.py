@@ -25,8 +25,8 @@ The class provides the following primitives:
 
     Worker-side: runs in each worker, loads/saves KV cache to/from
     the Connector based on the metadata.
-        handle_preemptions() - called for handling preempted requests
-            or request evicted blocks before they are overwritten
+        handle_preemptions() - called if there are preempted requests,
+            before their blocks are overwritten
 
         start_load_kv() - starts loading all KVs (maybe async)
         wait_for_layer_load() - blocks until layer i load is done
@@ -180,6 +180,31 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether dense layerwise loads can be submitted independently.
+
+        Connectors advertising this capability must implement
+        :meth:`submit_layerwise_prefill_load` and
+        :meth:`finish_layerwise_prefill_save`.  The split hooks let attention
+        enqueue device transfers before the tensor-parallel reduction and
+        defer host-side publication until after that reduction is submitted.
+        """
+        return False
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        """Whether this connector persists the separate DSA index KV group."""
+        return False
+
+    @property
+    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
+        """Whether one connector satisfies the complete two-group protocol."""
+        return bool(
+            self.supports_layerwise_prefill_transfer_window
+            and self.supports_dsa_index_lmcache
+        )
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -288,9 +313,9 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
+    def handle_preemptions(self, preempted_req_ids: set[str]):
         """
-        Handle preempted requests or evicted blocks BEFORE they are overwritten.
+        Handle preempted requests BEFORE their blocks are overwritten.
         Needed for connectors which use async saves (e.g., OffloadingConnector)
         """
         return
@@ -327,6 +352,17 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
+        """Submit the dense load following ``layer_name`` without waiting.
+
+        This method is only called when
+        :attr:`supports_layerwise_prefill_transfer_window` is true.  It is a
+        separate operation from :meth:`wait_for_layer_load` so a connector can
+        wait for the current layer at consumption time while prefetching the
+        following layer in an earlier communication window.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def save_kv_layer(
         self,
@@ -348,6 +384,56 @@ class KVConnectorBase_V1(ABC):
             **kwargs: additional arguments for the save operation.
         """
         pass
+
+    def save_kv_layer_in_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        """Save through connectors participating in the pre-HCOM window.
+
+        The default implementation routes the save only when this connector
+        advertises :attr:`supports_layerwise_prefill_transfer_window`.  Wrapper
+        connectors must recurse through their children so capable and legacy
+        children can keep their respective ordering.
+        """
+        if self.supports_layerwise_prefill_transfer_window:
+            self.save_kv_layer(
+                layer_name,
+                kv_layer,
+                attn_metadata,
+                **kwargs,
+            )
+
+    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
+        """Finish the host-side portion of a pre-HCOM layer save.
+
+        Attention calls this hook immediately after submitting the tensor-
+        parallel reduction.  A capable connector uses it to advance work that
+        must not run in the pre-HCOM callback (for example publishing a D2H-
+        completed CPU buffer to a storage backend).  The next layer's save
+        must not be submitted until this method returns.
+        """
+        if self.supports_layerwise_prefill_transfer_window:
+            raise NotImplementedError
+
+    def save_kv_layer_outside_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        """Save through connectors that must remain after the TP reduction."""
+        if not self.supports_layerwise_prefill_transfer_window:
+            self.save_kv_layer(
+                layer_name,
+                kv_layer,
+                attn_metadata,
+                **kwargs,
+            )
 
     @abstractmethod
     def wait_for_save(self):

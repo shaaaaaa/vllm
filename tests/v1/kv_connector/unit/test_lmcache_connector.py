@@ -1,15 +1,145 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
 )
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.outputs import KVConnectorOutput
+
+pytestmark = pytest.mark.skip_global_cleanup
+
+
+def _config_for_lmcache(use_native: bool = False):
+    transfer_config = MagicMock()
+    transfer_config.kv_connector = "LMCacheConnectorV1"
+    transfer_config.engine_id = "test"
+    transfer_config.get_from_extra_config.return_value = use_native
+    return SimpleNamespace(
+        kv_transfer_config=transfer_config,
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+    )
+
+
+def _kv_cache_config(group_sizes: tuple[int, ...]) -> KVCacheConfig:
+    head_sizes = (576, 128)
+    layer_suffixes = ("attn", "indexer.k_cache")
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=[
+                f"model.layers.{i}.self_attn.{layer_suffixes[group_id]}"
+                for i in range(group_size)
+            ],
+            kv_cache_spec=MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=head_sizes[group_id],
+                dtype=torch.float16,
+            ),
+        )
+        for group_id, group_size in enumerate(group_sizes)
+    ]
+    return KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=groups)
+
+
+def _install_latest_lmcache_impl(monkeypatch, impl) -> None:
+    package = ModuleType("lmcache")
+    integration = ModuleType("lmcache.integration")
+    vllm_integration = ModuleType("lmcache.integration.vllm")
+    adapter = ModuleType("lmcache.integration.vllm.vllm_v1_adapter")
+    adapter.LMCacheConnectorV1Impl = impl
+    package.integration = integration
+    integration.vllm = vllm_integration
+    vllm_integration.vllm_v1_adapter = adapter
+    monkeypatch.setitem(sys.modules, "lmcache", package)
+    monkeypatch.setitem(sys.modules, "lmcache.integration", integration)
+    monkeypatch.setitem(sys.modules, "lmcache.integration.vllm", vllm_integration)
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.integration.vllm.vllm_v1_adapter",
+        adapter,
+    )
+
+
+@pytest.mark.parametrize(
+    "group_sizes",
+    [(79, 79), (79, 22)],
+    ids=["glm51_equal_groups", "glm52_unequal_groups"],
+)
+def test_latest_impl_receives_runtime_kv_cache_config(monkeypatch, group_sizes):
+    observed = {}
+
+    class LatestImpl:
+        def __init__(self, config, role, parent, *, kv_cache_config):
+            observed.update(
+                config=config,
+                role=role,
+                parent=parent,
+                kv_cache_config=kv_cache_config,
+            )
+
+    _install_latest_lmcache_impl(monkeypatch, LatestImpl)
+    config = _config_for_lmcache()
+    role = KVConnectorRole.WORKER
+    cache_config = _kv_cache_config(group_sizes)
+
+    connector = KVConnectorFactory.create_connector(config, role, cache_config)
+
+    assert type(connector) is LMCacheConnectorV1
+    assert connector._kv_cache_config is cache_config
+    assert observed["config"] is config
+    assert observed["role"] is role
+    assert observed["parent"] is connector
+    assert observed["kv_cache_config"] is cache_config
+
+
+def test_old_impl_rejects_multi_group_runtime_layout(monkeypatch):
+    class OldImpl:
+        def __init__(self, config, role, parent):
+            pass
+
+    _install_latest_lmcache_impl(monkeypatch, OldImpl)
+    cache_config = _kv_cache_config((79, 22))
+
+    with pytest.raises(ValueError, match="cannot serve a multi-group model"):
+        KVConnectorFactory.create_connector(
+            _config_for_lmcache(), KVConnectorRole.WORKER, cache_config
+        )
+
+
+def test_old_impl_keeps_single_group_compatibility(monkeypatch):
+    observed = {}
+
+    class OldImpl:
+        def __init__(self, config, role, parent):
+            observed.update(config=config, role=role, parent=parent)
+
+    _install_latest_lmcache_impl(monkeypatch, OldImpl)
+    config = _config_for_lmcache()
+    role = KVConnectorRole.WORKER
+    cache_config = _kv_cache_config((79,))
+
+    connector = KVConnectorFactory.create_connector(config, role, cache_config)
+
+    assert type(connector) is LMCacheConnectorV1
+    assert connector._kv_cache_config is cache_config
+    assert observed["config"] is config
+    assert observed["role"] is role
+    assert observed["parent"] is connector
 
 
 @pytest.fixture

@@ -28,7 +28,7 @@ def server_args(request: pytest.FixtureRequest) -> list[str]:
     >>> @pytest.mark.parametrize(
     >>>     "server_args",
     >>>     [
-    >>>         ["--max-model-len", "10100"],
+    >>>         ["--disable-frontend-multiprocessing"],
     >>>         [
     >>>             "--model=NousResearch/Hermes-3-Llama-3.1-70B",
     >>>             "--enable-auto-tool-choice",
@@ -40,7 +40,7 @@ def server_args(request: pytest.FixtureRequest) -> list[str]:
     >>>     ...
 
     This will run `test_foo` twice with servers with:
-    - `--max-model-len 10100`
+    - `--disable-frontend-multiprocessing`
     - `--model=NousResearch/Hermes-3-Llama-3.1-70B --enable-auto-tool-choice`.
 
     """
@@ -79,6 +79,17 @@ async def client(server):
         yield async_client
 
 
+@pytest.mark.parametrize(
+    "server_args",
+    [
+        pytest.param([], id="default-frontend-multiprocessing"),
+        pytest.param(
+            ["--disable-frontend-multiprocessing"],
+            id="disable-frontend-multiprocessing",
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.asyncio
 async def test_show_version(server: RemoteOpenAIServer):
     response = requests.get(server.url_for("version"))
@@ -87,6 +98,17 @@ async def test_show_version(server: RemoteOpenAIServer):
     assert response.json() == {"version": VLLM_VERSION}
 
 
+@pytest.mark.parametrize(
+    "server_args",
+    [
+        pytest.param([], id="default-frontend-multiprocessing"),
+        pytest.param(
+            ["--disable-frontend-multiprocessing"],
+            id="disable-frontend-multiprocessing",
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.asyncio
 async def test_check_health(server: RemoteOpenAIServer):
     response = requests.get(server.url_for("health"))
@@ -97,7 +119,13 @@ async def test_check_health(server: RemoteOpenAIServer):
 @pytest.mark.parametrize(
     "server_args",
     [
-        pytest.param(["--max-model-len", "10100"]),
+        pytest.param(
+            ["--max-model-len", "10100"], id="default-frontend-multiprocessing"
+        ),
+        pytest.param(
+            ["--disable-frontend-multiprocessing", "--max-model-len", "10100"],
+            id="disable-frontend-multiprocessing",
+        ),
     ],
     indirect=True,
 )

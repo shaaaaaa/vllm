@@ -11,6 +11,12 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.dsa_shared_pool import (
+    DSABlockAllocationMode,
+    DSASharedBlockOwner,
+    DSASharedBundleAllocator,
+    PrefillLayerBundlePool,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -28,6 +34,210 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class DSASharedLogicalBlockPool:
+    """BlockPool-compatible logical view over a DSA shared bundle allocator."""
+
+    dsa_shared_pool = True
+
+    def __init__(
+        self,
+        allocator: DSASharedBundleAllocator | PrefillLayerBundlePool,
+        owner: DSASharedBlockOwner,
+    ) -> None:
+        self.allocator = allocator
+        self.owner = owner
+        self.layout = allocator.layout
+        self.enable_caching = False
+        self.hash_block_size = 0
+        self.num_gpu_blocks = self.layout.row_count(owner)
+        self.blocks_per_bundle = self.layout.blocks_per_bundle(owner)
+        self.blocks: list[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(self.num_gpu_blocks)
+        ]
+        allocation_mode = (
+            DSABlockAllocationMode.PREFILL_CHILD
+            if isinstance(allocator, PrefillLayerBundlePool)
+            else DSABlockAllocationMode.FULL_PARENT
+        )
+        for block in self.blocks:
+            block.allocation_mode = allocation_mode
+        self.null_block = self.blocks[0]
+        self.null_block.is_null = True
+        if isinstance(allocator, PrefillLayerBundlePool):
+            self.null_block.bank_block_ids = (0,) * allocator.bank_count
+        self.kv_event_queue: list[KVCacheEvent] = []
+
+    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        if isinstance(self.allocator, PrefillLayerBundlePool):
+            logical_bundle_count = (
+                self.allocator.logical_bundle_count_for_blocks(
+                    self.owner, num_blocks
+                )
+            )
+            bank_bundle_ids = self.allocator.allocate_banks(
+                self.owner, logical_bundle_count
+            )
+            ret: list[KVCacheBlock] = []
+            bank_bundle_blocks = tuple(
+                tuple(
+                    self.layout.block_ids_for_bundle(self.owner, bundle_id)
+                    for bundle_id in bundle_ids
+                )
+                for bundle_ids in bank_bundle_ids
+            )
+            for bundle_idx in range(logical_bundle_count):
+                for intra_idx in range(self.blocks_per_bundle):
+                    bank_block_ids = tuple(
+                        bank_bundle_blocks[bank][bundle_idx][intra_idx]
+                        for bank in range(self.allocator.bank_count)
+                    )
+                    for block_id in bank_block_ids:
+                        block = self.blocks[block_id]
+                        assert block.ref_cnt == 0
+                        block.ref_cnt = 1
+                    primary = self.blocks[bank_block_ids[0]]
+                    primary.bank_block_ids = bank_block_ids
+                    ret.append(primary)
+            return ret
+
+        bundle_count = self.allocator.bundle_count_for_blocks(
+            self.owner, num_blocks
+        )
+        bundle_ids = self.allocator.allocate(self.owner, bundle_count)
+        block_ids: list[int] = []
+        for bundle_id in bundle_ids:
+            block_ids.extend(self.layout.block_ids_for_bundle(self.owner, bundle_id))
+        ret = [self.blocks[block_id] for block_id in block_ids]
+        for block in ret:
+            assert block.ref_cnt == 0
+            block.ref_cnt = 1
+        return ret
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        if isinstance(self.allocator, PrefillLayerBundlePool):
+            self._free_prefill_blocks(ordered_blocks)
+            return
+        blocks_list = [block for block in ordered_blocks if not block.is_null]
+        if not blocks_list:
+            return
+        affected_bundle_ids: set[int] = set()
+        for block in blocks_list:
+            if block.ref_cnt <= 0:
+                raise ValueError(
+                    f"DSA {self.owner.value} block {block.block_id} is already free"
+                )
+            block.ref_cnt -= 1
+            affected_bundle_ids.add(
+                self.layout.bundle_id_for_block(self.owner, block.block_id)
+            )
+
+        # Logical blocks may become unused across several release calls. The
+        # shared allocator owns physical bundles, so return a bundle only after
+        # every logical block in it has reached ref_cnt == 0.
+        bundle_ids: list[int] = []
+        for bundle_id in affected_bundle_ids:
+            bundle_blocks = (
+                self.blocks[block_id]
+                for block_id in self.layout.block_ids_for_bundle(
+                    self.owner, bundle_id
+                )
+            )
+            if all(block.ref_cnt == 0 for block in bundle_blocks):
+                bundle_ids.append(bundle_id)
+        self.allocator.free(self.owner, bundle_ids)
+
+    def _free_prefill_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        blocks_list = [block for block in ordered_blocks if not block.is_null]
+        if not blocks_list:
+            return
+        logical_block_ids = [block.block_id for block in blocks_list]
+        if len(logical_block_ids) != len(set(logical_block_ids)):
+            raise ValueError(
+                f"duplicate DSA {self.owner.value} logical blocks in free: "
+                f"{logical_block_ids}"
+            )
+
+        # Validate the whole release before mutating any refcount. Otherwise an
+        # invalid entry late in the input can leave earlier blocks partially
+        # freed even though the operation raises.
+        physical_ids = [
+            block_id
+            for logical_block in blocks_list
+            for block_id in (
+                logical_block.bank_block_ids or (logical_block.block_id,)
+            )
+        ]
+        if len(physical_ids) != len(set(physical_ids)):
+            raise ValueError(
+                f"duplicate DSA {self.owner.value} physical blocks in free: "
+                f"{physical_ids}"
+            )
+        for block_id in physical_ids:
+            block = self.blocks[block_id]
+            if block.ref_cnt <= 0:
+                raise ValueError(
+                    f"DSA {self.owner.value} block {block.block_id} "
+                    "is already free"
+                )
+
+        affected_bundle_ids: set[int] = set()
+        for block_id in physical_ids:
+            block = self.blocks[block_id]
+            block.ref_cnt -= 1
+            affected_bundle_ids.add(
+                self.layout.bundle_id_for_block(
+                    self.owner, block.block_id
+                )
+            )
+
+        # Logical blocks may become unused across several release calls. The
+        # shared allocator owns physical bundles, so return a bundle only after
+        # every logical block in it has reached ref_cnt == 0.
+        bundle_ids: list[int] = []
+        for bundle_id in affected_bundle_ids:
+            bundle_blocks = (
+                self.blocks[block_id]
+                for block_id in self.layout.block_ids_for_bundle(
+                    self.owner, bundle_id
+                )
+            )
+            if all(block.ref_cnt == 0 for block in bundle_blocks):
+                bundle_ids.append(bundle_id)
+        self.allocator.free(self.owner, bundle_ids)
+
+    def get_num_bundles_to_allocate(self, num_blocks: int) -> int:
+        return self.allocator.bundle_count_for_blocks(self.owner, num_blocks)
+
+    def get_num_free_blocks(self) -> int:
+        bundle_count = self.allocator.free_bundle_count
+        if isinstance(self.allocator, PrefillLayerBundlePool):
+            bundle_count //= self.allocator.bank_count
+        return bundle_count * self.blocks_per_bundle
+
+    def get_usage(self) -> float:
+        total = self.layout.capacity_bundles
+        if total == 0:
+            return 0.0
+        return 1.0 - (self.allocator.free_bundle_count / total)
+
+    def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        raise NotImplementedError("DSA shared pool does not support prefix caching")
+
+    def reset_prefix_cache(self) -> bool:
+        return True
+
+    def take_events(self) -> list[KVCacheEvent]:
+        return []
 
 
 class BlockHashToBlockMap:

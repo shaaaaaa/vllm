@@ -316,6 +316,47 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
+def test_prefill_exports_cached_tokens_in_kv_transfer_params():
+    """P-side cached tokens are included in the handoff to the D worker."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+
+    block_size = vllm_config.cache_config.block_size
+    num_tokens = block_size * 3
+    warmup = create_request(
+        request_id=1,
+        num_tokens=num_tokens,
+        common_prefix_len=num_tokens,
+        block_size=block_size,
+    )
+    scheduler.add_request(warmup)
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output([warmup], use_eos=True)
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    request = create_request(
+        request_id=2,
+        num_tokens=num_tokens,
+        common_prefix_len=num_tokens,
+        block_size=block_size,
+        do_remote_decode=True,
+    )
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    assert request.num_cached_tokens == num_tokens - block_size
+
+    model_runner_output = create_model_runner_output([request])
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output, model_runner_output
+    )
+    output = engine_core_outputs[0].outputs[0]
+    assert output.finish_reason is not None
+    assert output.kv_transfer_params is not None
+    assert output.kv_transfer_params["remote_prefill_cached_tokens"] == (
+        num_tokens - block_size
+    )
+
+
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
     FakeNixlWrapper,
@@ -599,6 +640,7 @@ class TestNixlHandshake:
             dummy_ctx = ForwardContext(
                 no_compile_layers={},
                 attn_metadata={},
+                virtual_engine=0,
                 slot_mapping={},
             )
             _before_load = time.perf_counter()
@@ -671,6 +713,7 @@ class TestNixlHandshake:
             dummy_ctx = ForwardContext(
                 no_compile_layers={},
                 attn_metadata={},
+                virtual_engine=0,
                 slot_mapping={},
             )
             _before_load = time.perf_counter()
@@ -692,18 +735,16 @@ class TestNixlHandshake:
     )
     @pytest.mark.parametrize("local_tp_size", [1, 2])
     def test_prefill_tp_size_greater_than_decode_tp_size(
-        self, local_tp_size: int, default_vllm_config, dist_init, monkeypatch
+        self, local_tp_size: int, default_vllm_config, dist_init
     ):
         """
         Verify remote TP > local TP handshake succeeds with different
         remote configurations.
         """
-        monkeypatch.setattr(
-            "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.get_tensor_model_parallel_world_size",
-            lambda: local_tp_size,
-        )
 
         vllm_config = create_vllm_config()
+        local_tp_size = 1
+        vllm_config.parallel_config.tensor_parallel_size = local_tp_size
 
         connector = NixlConnector(
             vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
@@ -738,10 +779,10 @@ class TestNixlHandshake:
         remote_agents = worker._nixl_handshake(
             host="localhost",
             port=1234,
-            remote_tp_size=4,
+            remote_tp_size=2,
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
-        check_handshake(4)
+        check_handshake(2)
 
         # NOTE flexibility: a second remote with higher number of ranks is
         # discovered. This is not a scenario we actively support right now, but
@@ -759,8 +800,9 @@ class TestNixlHandshake:
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
         FakeNixlWrapper,
     )
+    @pytest.mark.parametrize("local_tp_size", [1, 2])
     def test_prefill_tp_size_greater_than_decode_tp_size_mla(
-        self, default_vllm_config, dist_init
+        self, local_tp_size: int, default_vllm_config, dist_init
     ):
         """
         Verify remote TP > local TP handshake succeeds with different
@@ -906,6 +948,7 @@ class TestNixlHandshake:
             dummy_ctx = ForwardContext(
                 no_compile_layers={},
                 attn_metadata={},
+                virtual_engine=0,
                 slot_mapping={},
             )
             _before_load = time.perf_counter()
@@ -1076,6 +1119,7 @@ def test_kv_connector_stats(default_vllm_config, dist_init):
     dummy_ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
+        virtual_engine=0,
         slot_mapping={},
     )
     connector.start_load_kv(dummy_ctx)
@@ -1366,13 +1410,7 @@ def test_abort_timeout_on_prefiller(monkeypatch, distributed_executor_backend):
                     "NIXL_TELEMETRY_ENABLE": "1",
                 },
             }
-            # On XPU/ROCm, vLLM expects Ray's device key to be "GPU".
-            # Explicitly reserving GPU resources here prevents false negatives
-            # when Ray cannot auto-detect accelerator resources in test envs.
-            ray_init_kwargs: dict[str, Any] = {"runtime_env": runtime_env}
-            if not current_platform.is_cuda():
-                ray_init_kwargs["num_gpus"] = 1
-            ray.init(**ray_init_kwargs)
+            ray.init(runtime_env=runtime_env)
             try:
                 run_test_and_cleanup()
             finally:
@@ -1886,6 +1924,7 @@ def test_aborted_request_removed_from_worker_in_batch(default_vllm_config, dist_
     dummy_ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
+        virtual_engine=0,
         slot_mapping={},
     )
     connector.start_load_kv(dummy_ctx)
@@ -2007,7 +2046,7 @@ def test_transfer_failure_logging(
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=16, swa_enabled=enable_hma),
+        make_kv_cache_config(block_size=16, hma_enabled=enable_hma),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config,
@@ -2054,6 +2093,7 @@ def test_transfer_failure_logging(
     dummy_ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
+        virtual_engine=0,
         slot_mapping={},
     )
 
@@ -2156,6 +2196,7 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     dummy_ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
+        virtual_engine=0,
         slot_mapping={},
     )
     connector.start_load_kv(dummy_ctx)
@@ -2208,6 +2249,7 @@ def test_transfer_setup_failure_returns_finished(default_vllm_config, dist_init)
     dummy_ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
+        virtual_engine=0,
         slot_mapping={},
     )
     connector.start_load_kv(dummy_ctx)

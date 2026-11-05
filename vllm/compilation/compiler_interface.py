@@ -373,15 +373,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
                 break
 
         if input_fake_mode is not None:
-            # Use patch.object on the actual module from sys.modules
-            # because in Python <=3.10 the string-based patch() resolves
-            # torch._inductor.standalone_compile to the wrapper function
-            # (defined in __init__.py) instead of the module.
-            import sys
-
-            fake_mode_ctx: Any = patch.object(
-                sys.modules["torch._inductor.standalone_compile"],
-                "FakeTensorMode",
+            fake_mode_ctx: Any = patch(
+                "torch._inductor.standalone_compile.FakeTensorMode",
                 lambda *a, **kw: input_fake_mode,
             )
         else:

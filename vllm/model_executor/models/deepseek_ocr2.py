@@ -76,10 +76,8 @@ class DeepseekOCR2ProcessingInfo(BaseProcessingInfo):
             crop_mode=CROP_MODE,
             strategy="v2",
         )
-
         return self.ctx.get_hf_processor(
-            DeepseekOCRProcessor,
-            **{**v2_processor_config, **kwargs},
+            DeepseekOCRProcessor, **{**kwargs, **v2_processor_config}
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:

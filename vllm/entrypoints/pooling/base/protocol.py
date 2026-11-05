@@ -11,7 +11,6 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
 )
 from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
-from vllm.exceptions import VLLMValidationError
 from vllm.renderers import ChatParams, merge_kwargs
 from vllm.utils import random_uuid
 from vllm.utils.serial_utils import EmbedDType, EncodingFormat, Endianness
@@ -148,9 +147,9 @@ class ChatRequestMixin(OpenAIBaseModel):
     @classmethod
     def check_generation_prompt(cls, data):
         if data.get("continue_final_message") and data.get("add_generation_prompt"):
-            raise VLLMValidationError(
+            raise ValueError(
                 "Cannot set both `continue_final_message` and "
-                "`add_generation_prompt` to True.",
+                "`add_generation_prompt` to True."
             )
         return data
 

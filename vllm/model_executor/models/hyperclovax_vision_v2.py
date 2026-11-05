@@ -470,6 +470,15 @@ class HCXVisionV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.vision_config = vision_config
         self.text_config = text_config
         self.vllm_config = vllm_config
+        self.dtype = vllm_config.model_config.dtype
+
+        # Initialize Qwen2.5 Vision Transformer
+        self.visual = Qwen2_5_VisionTransformer(
+            vision_config=vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "visual"),
+        )
 
         # Linear projector (vision_hidden_size -> text_hidden_size)
         # For V2 model: mm_projector_type is "linear"
@@ -483,21 +492,18 @@ class HCXVisionV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         else:
             out_hidden = vision_hidden_size
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen2_5_VisionTransformer(
-                vision_config=vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
-            self.mm_projector = nn.Linear(out_hidden, text_hidden_size)
+        # Always create Linear projector since HF checkpoint has mm_projector weights
+        self.mm_projector = nn.Linear(out_hidden, text_hidden_size)
 
-        with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-            )
+        # Language model
+        self.lm_head_vocab_size = getattr(
+            text_config, "padded_vocab_size", text_config.vocab_size
+        )
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config,
+            hf_config=text_config,
+            prefix=maybe_prefix(prefix, "language_model"),
+        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -626,6 +632,9 @@ class HCXVisionV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 modalities["video"] = self._parse_and_validate_video_input(**kwargs)
 
         return modalities
+
+    def get_language_model(self) -> torch.nn.Module:
+        return self.language_model
 
     def embed_multimodal(
         self,

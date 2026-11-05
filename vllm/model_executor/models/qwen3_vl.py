@@ -767,7 +767,7 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
         sampled_num_frames: int | None = None,
     ) -> list[int]:
         video_processor = self.get_video_processor()
-        temporal_patch_size = video_processor.temporal_patch_size
+        merge_size = video_processor.merge_size
         indices = metadata["frames_indices"]
 
         # metadata["fps"] refers to the true fps of the input video.
@@ -806,7 +806,7 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
                 .astype(int)
                 .tolist()
             )
-        timestamps = self._calculate_timestamps(indices, video_fps, temporal_patch_size)
+        timestamps = self._calculate_timestamps(indices, video_fps, merge_size)
         return timestamps
 
 
@@ -931,30 +931,20 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
         height: int,
         num_frames: int,
         num_videos: int,
-        overrides: VideoDummyOptions | None = None,
     ) -> list[VideoItem]:
-        videos = super()._get_dummy_videos(
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            num_videos=num_videos,
-            overrides=overrides,
-        )
-        videos = [v.copy() for v in videos]
-
+        video = np.full((num_frames, width, height, 3), 255, dtype=np.uint8)
         video_items = []
-        for video in videos:
-            video_num_frames = video.shape[0]
+        for i in range(num_videos):
             video_metadata = {
                 "fps": 2.0,
-                "duration": video_num_frames / 2.0,
-                "total_num_frames": video_num_frames,
-                "frames_indices": list(range(video_num_frames)),
+                "duration": num_frames / 2.0,
+                "total_num_frames": num_frames,
+                "frames_indices": [i for i in range(num_frames)],
                 "video_backend": "opencv",
                 "do_sample_frames": False,
             }
-            video_items.append((video, video_metadata))
-
+            video_item = (video.copy(), video_metadata)
+            video_items.append(video_item)
         return video_items
 
 

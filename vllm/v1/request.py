@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import base64
+import binascii
 import enum
+import hashlib
+import hmac
+import sys
 import time
+from array import array
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,10 +16,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -26,6 +34,60 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
+
+
+_FINAL_HIDDEN_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
+_MAX_FINAL_HIDDEN_BYTES = 16 * 1024 * 1024
+_MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
+
+
+def validate_final_hidden_payload(
+    payload: object, expected_hidden_size: int | None = None
+) -> bool:
+    """Validate the bounded, bit-exact final-hidden transport payload."""
+    if not isinstance(payload, dict):
+        return False
+    dtype_size = _FINAL_HIDDEN_DTYPE_BYTES.get(payload.get("dtype"))
+    shape = payload.get("shape")
+    data = payload.get("data")
+    if (
+        payload.get("version") != 1
+        or payload.get("encoding") != "base64"
+        or dtype_size is None
+        or not isinstance(shape, list)
+        or len(shape) != 1
+        or type(shape[0]) is not int
+        or shape[0] <= 0
+        or (expected_hidden_size is not None and shape[0] != expected_hidden_size)
+        or not isinstance(data, str)
+        or len(data) > _MAX_FINAL_HIDDEN_BASE64_CHARS
+        or not isinstance(payload.get("data_sha256"), str)
+    ):
+        return False
+    expected_bytes = shape[0] * dtype_size
+    if expected_bytes > _MAX_FINAL_HIDDEN_BYTES:
+        return False
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    return len(raw) == expected_bytes and hmac.compare_digest(
+        hashlib.sha256(raw).hexdigest(), payload["data_sha256"]
+    )
+
+
+def compute_prompt_token_fingerprint(token_ids: list[int]) -> str:
+    """Return a stable hash binding a hidden-state artifact to its prompt."""
+    packed = array("q", token_ids)
+    if sys.byteorder != "little":
+        packed.byteswap()
+    digest = hashlib.sha256()
+    digest.update(b"vllm-final-hidden-prompt-v1\0")
+    digest.update(len(token_ids).to_bytes(8, "little"))
+    digest.update(packed.tobytes())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -56,6 +118,19 @@ class StreamingUpdate:
 
 
 class Request:
+    # Independent lifetime fences, recorded only when the request finishes.
+    kv_transfer_pending_recv: bool = False
+    kv_transfer_pending_send: bool = False
+
+    # Final-hidden handoff state is intentionally lazy. Ordinary requests use
+    # these immutable class defaults and do not grow their instance __dict__.
+    capture_final_hidden = False
+    bootstrap_final_hidden: dict[str, Any] | None = None
+    bootstrap_sample_pending = False
+    dsa_compact_allocated = False
+    captured_final_hidden: dict[str, Any] | None = None
+    final_hidden_prompt_fingerprint: str | None = None
+
     def __init__(
         self,
         request_id: str,
@@ -73,8 +148,11 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        # Preserve unknown provenance for direct/internal request construction.
+        self.external_req_id = external_req_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -93,6 +171,8 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        capture_final_hidden = False
+        bootstrap_final_hidden: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -108,6 +188,68 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                if self.kv_transfer_params is not None:
+                    capture_final_hidden = bool(
+                        self.kv_transfer_params.get("ret_final_hidden", False)
+                    )
+                    final_hidden = self.kv_transfer_params.get("bootstrap_final_hidden")
+                    if validate_final_hidden_payload(final_hidden):
+                        bootstrap_final_hidden = final_hidden
+                        if SERVING_PERF_ENABLED:
+                            decoder_engine_received_unix_ns = time.time_ns()
+                            producer_ready_unix_ns = final_hidden.get(
+                                "producer_ready_unix_ns"
+                            )
+                            proxy_decoder_send_unix_ns = final_hidden.get(
+                                "proxy_decoder_send_unix_ns"
+                            )
+                            final_hidden["decoder_engine_received_unix_ns"] = (
+                                decoder_engine_received_unix_ns
+                            )
+                            producer_to_engine_ms = (
+                                (
+                                    decoder_engine_received_unix_ns
+                                    - producer_ready_unix_ns
+                                )
+                                / 1e6
+                                if isinstance(producer_ready_unix_ns, int)
+                                else None
+                            )
+                            proxy_to_engine_ms = (
+                                (
+                                    decoder_engine_received_unix_ns
+                                    - proxy_decoder_send_unix_ns
+                                )
+                                / 1e6
+                                if isinstance(proxy_decoder_send_unix_ns, int)
+                                else None
+                            )
+                            logger.info(
+                                "[FINAL_HIDDEN_REQUEST_ARTIFACT] req=%s "
+                                "basic_validation=ok dtype=%s shape=%s "
+                                "prompt_length=%s checksum=%s "
+                                "producer_to_engine_ms=%s proxy_to_engine_ms=%s "
+                                "clock_sync_required=true "
+                                "proxy_to_engine_includes=http_upload_json_"
+                                "tokenization_ipc",
+                                request_id,
+                                final_hidden.get("dtype"),
+                                final_hidden.get("shape"),
+                                final_hidden.get("prompt_length"),
+                                str(final_hidden.get("data_sha256", ""))[:16],
+                                f"{producer_to_engine_ms:.3f}"
+                                if producer_to_engine_ms is not None
+                                else "unknown",
+                                f"{proxy_to_engine_ms:.3f}"
+                                if proxy_to_engine_ms is not None
+                                else "unknown",
+                            )
+                    elif final_hidden is not None:
+                        logger.warning(
+                            "[FINAL_HIDDEN_REQUEST_ARTIFACT] req=%s "
+                            "basic_validation=failed action=normal_path",
+                            request_id,
+                        )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -119,6 +261,91 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        handoff_requested = capture_final_hidden or bootstrap_final_hidden is not None
+        if handoff_requested:
+            handoff_inputs_supported = (
+                prompt_token_ids is not None
+                and prompt_embeds is None
+                and not mm_features
+                and lora_request is None
+                and not resumable
+                and (sampling_params is None or sampling_params.prompt_logprobs is None)
+            )
+            if not handoff_inputs_supported:
+                logger.warning(
+                    "[FINAL_HIDDEN_REQUEST_UNSUPPORTED] req=%s "
+                    "prompt_token_ids=%s prompt_embeds=%s multimodal=%s "
+                    "lora=%s resumable=%s prompt_logprobs=%s "
+                    "action=disable_handoff",
+                    request_id,
+                    prompt_token_ids is not None,
+                    prompt_embeds is not None,
+                    bool(mm_features),
+                    lora_request is not None,
+                    resumable,
+                    sampling_params.prompt_logprobs
+                    if sampling_params is not None
+                    else None,
+                )
+                capture_final_hidden = False
+                bootstrap_final_hidden = None
+                handoff_requested = False
+
+        final_hidden_prompt_fingerprint: str | None = None
+        if handoff_requested and prompt_token_ids is not None:
+            final_hidden_prompt_fingerprint = compute_prompt_token_fingerprint(
+                prompt_token_ids
+            )
+        if capture_final_hidden:
+            self.capture_final_hidden = True
+            self.final_hidden_prompt_fingerprint = final_hidden_prompt_fingerprint
+
+        if SERVING_PERF_ENABLED and capture_final_hidden:
+            logger.info(
+                "[FINAL_HIDDEN_REQUEST_CAPTURE] req=%s enabled=true "
+                "prompt_tokens=%d prompt_hash=%s max_tokens=%d",
+                request_id,
+                self.num_prompt_tokens,
+                self.final_hidden_prompt_fingerprint[:16]
+                if self.final_hidden_prompt_fingerprint is not None
+                else None,
+                self.max_tokens,
+            )
+        if bootstrap_final_hidden is not None:
+            payload_matches_prompt = (
+                final_hidden_prompt_fingerprint is not None
+                and bootstrap_final_hidden.get("prompt_length")
+                == self.num_prompt_tokens
+                and bootstrap_final_hidden.get("prompt_sha256")
+                == final_hidden_prompt_fingerprint
+            )
+            if payload_matches_prompt:
+                self.final_hidden_prompt_fingerprint = final_hidden_prompt_fingerprint
+                self.bootstrap_final_hidden = bootstrap_final_hidden
+                self.bootstrap_sample_pending = True
+                if SERVING_PERF_ENABLED:
+                    logger.info(
+                        "[FINAL_HIDDEN_REQUEST_ACCEPTED] req=%s prompt_tokens=%d "
+                        "prompt_hash=%s bootstrap_pending=true",
+                        request_id,
+                        self.num_prompt_tokens,
+                        final_hidden_prompt_fingerprint[:16]
+                        if final_hidden_prompt_fingerprint is not None
+                        else None,
+                    )
+            else:
+                logger.warning(
+                    "[FINAL_HIDDEN_REQUEST_REJECTED] req=%s reason=prompt_mismatch "
+                    "request_prompt_tokens=%d artifact_prompt_tokens=%s "
+                    "request_hash=%s artifact_hash=%s action=normal_prefill",
+                    request_id,
+                    self.num_prompt_tokens,
+                    bootstrap_final_hidden.get("prompt_length"),
+                    final_hidden_prompt_fingerprint[:16]
+                    if final_hidden_prompt_fingerprint is not None
+                    else None,
+                    str(bootstrap_final_hidden.get("prompt_sha256", ""))[:16],
+                )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
@@ -198,6 +425,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            external_req_id=request.external_req_id,
         )
 
     def append_output_token_ids(

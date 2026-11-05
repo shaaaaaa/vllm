@@ -6,7 +6,6 @@ import pytest
 
 from .utils import (
     MESSAGES_WITHOUT_TOOLS,
-    SEED,
     WEATHER_TOOL,
     ServerConfig,
     ensure_system_prompt,
@@ -28,7 +27,6 @@ async def test_chat_completion_without_tools(
         max_completion_tokens=150,
         model=model_name,
         logprobs=False,
-        seed=SEED,
     )
     choice = chat_completion.choices[0]
     stop_reason = chat_completion.choices[0].finish_reason
@@ -49,7 +47,6 @@ async def test_chat_completion_without_tools(
         max_completion_tokens=150,
         model=model_name,
         logprobs=False,
-        seed=SEED,
         stream=True,
     )
     chunks: list[str] = []
@@ -100,7 +97,6 @@ async def test_chat_completion_with_tools(
         model=model_name,
         tools=[WEATHER_TOOL],
         logprobs=False,
-        seed=SEED,
     )
     choice = chat_completion.choices[0]
     stop_reason = chat_completion.choices[0].finish_reason
@@ -122,7 +118,6 @@ async def test_chat_completion_with_tools(
         model=model_name,
         logprobs=False,
         tools=[WEATHER_TOOL],
-        seed=SEED,
         stream=True,
     )
 

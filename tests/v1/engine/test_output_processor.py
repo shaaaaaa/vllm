@@ -22,6 +22,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
@@ -138,6 +139,46 @@ def test_incremental_detokenization(
 
     assert output_processor.get_num_unfinished_requests() == 0
     assert not output_processor.has_unfinished_requests()
+
+
+@pytest.mark.parametrize(
+    "remote_flag", ["do_remote_prefill", "do_remote_decode", None]
+)
+def test_remote_prefill_cached_tokens_override(remote_flag: str | None):
+    """Report the P worker's cache hits instead of the D worker's KV hits."""
+    output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+    prompt_tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    kv_transfer_params = {remote_flag: True} if remote_flag is not None else {}
+    kv_transfer_params["remote_prefill_cached_tokens"] = 5
+    request = EngineCoreRequest(
+        request_id="request-0-int",
+        external_req_id="request-0",
+        prompt_token_ids=prompt_tokens,
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(
+            detokenize=False,
+            extra_args={
+                "kv_transfer_params": kv_transfer_params,
+            },
+        ),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, prompt=None)
+    processed = output_processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="request-0-int",
+                new_token_ids=[42],
+                num_cached_tokens=len(prompt_tokens) - 1,
+            )
+        ]
+    )
+    cached = 5 if remote_flag is not None else len(prompt_tokens) - 1
+    assert processed.request_outputs[0].num_cached_tokens == cached
 
 
 def _validate_logprobs(

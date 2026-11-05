@@ -9,6 +9,7 @@ implemented with the old signature continue to work:
 - New signature: __init__(self, vllm_config, role, kv_cache_config)
 """
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -174,6 +175,26 @@ def test_external_new_signature_factory_instantiation(role):
     assert connector.role == role
     assert connector._kv_cache_config is not None
     assert connector._kv_cache_config == kv_cache_config
+
+
+@pytest.mark.skip_global_cleanup
+def test_external_old_signature_keeps_multi_group_compatibility():
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="OldStyleTestConnector",
+            kv_connector_module_path=__name__,
+            engine_id="test",
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+    )
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[object(), object()])
+
+    connector = KVConnectorFactory.create_connector(
+        vllm_config, KVConnectorRole.WORKER, kv_cache_config
+    )
+
+    assert isinstance(connector, OldStyleTestConnector)
+    assert connector._kv_cache_config is None
 
 
 @pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])

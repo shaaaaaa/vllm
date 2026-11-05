@@ -16,7 +16,8 @@ from vllm.model_executor.models.mistral3 import (
     Mistral3ForConditionalGeneration,
     Mistral3MultiModalProjector,
     Mistral3ProcessingInfo,
-    init_vision_tower_for_mistral3,
+    _build_mistral3_info,
+    init_vision_tower_for_llava,
 )
 from vllm.model_executor.models.pixtral import PixtralHFEncoderInfo
 from vllm.model_executor.models.utils import (
@@ -26,9 +27,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import BaseMultiModalProcessorCache
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     PromptReplacement,
     PromptUpdate,
@@ -125,9 +128,19 @@ class LightOnOCRMultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingIn
         ]
 
 
+def _build_LightOnOCR_processor(
+    info: _I,
+    dummy_inputs: BaseDummyInputsBuilder[_I],
+    *,
+    cache: BaseMultiModalProcessorCache | None = None,
+):
+    assert isinstance(info, Mistral3ProcessingInfo)
+    return LightOnOCRMultiModalProcessor(info, dummy_inputs, cache=cache)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    LightOnOCRMultiModalProcessor,
-    info=Mistral3ProcessingInfo,
+    _build_LightOnOCR_processor,
+    info=_build_mistral3_info,
     dummy_inputs=Mistral3DummyInputsBuilder,
 )
 class LightOnOCRForConditionalGeneration(Mistral3ForConditionalGeneration):
@@ -150,30 +163,29 @@ class LightOnOCRForConditionalGeneration(Mistral3ForConditionalGeneration):
         self.config = config
         self.multimodal_config = multimodal_config
 
-        with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = init_vision_tower_for_mistral3(
-                config,
-                quant_config=quant_config,
-                require_post_norm=False,
-                prefix=maybe_prefix(prefix, "vision_tower"),
-            )
-            self.multi_modal_projector = Mistral3MultiModalProjector(
-                vision_hidden_size=config.vision_config.hidden_size,
-                text_hidden_size=config.text_config.hidden_size,
-                projector_hidden_act=config.projector_hidden_act,
-                spatial_merge_size=config.spatial_merge_size,
-                patch_size=config.vision_config.patch_size,
-                multimodal_projector_bias=config.multimodal_projector_bias,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "multi_modal_projector"),
-            )
+        self.vision_tower = init_vision_tower_for_llava(
+            config,
+            quant_config=quant_config,
+            require_post_norm=False,
+            prefix=maybe_prefix(prefix, "vision_tower"),
+        )
 
-        with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=config.text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-            )
+        self.multi_modal_projector = Mistral3MultiModalProjector(
+            vision_hidden_size=config.vision_config.hidden_size,
+            text_hidden_size=config.text_config.hidden_size,
+            projector_hidden_act=config.projector_hidden_act,
+            spatial_merge_size=config.spatial_merge_size,
+            patch_size=config.vision_config.patch_size,
+            multimodal_projector_bias=config.multimodal_projector_bias,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "multi_modal_projector"),
+        )
+
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config,
+            hf_config=config.text_config,
+            prefix=maybe_prefix(prefix, "language_model"),
+        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors

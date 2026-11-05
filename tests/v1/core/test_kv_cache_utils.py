@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,7 +44,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
-    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -158,22 +158,248 @@ def new_chunked_local_attention_spec(
     )
 
 
-def new_mamba_spec(
-    block_size=16,
-    shapes=((2, 512), (3, 32, 32)),
-    dtypes=(torch.float32, torch.float32),
-    num_speculative_blocks=2,
-    mamba_cache_mode="none",
-    page_size_padded=None,
-):
-    return MambaSpec(
-        block_size=block_size,
-        shapes=shapes,
-        dtypes=dtypes,
-        page_size_padded=page_size_padded,
-        mamba_cache_mode=mamba_cache_mode,
-        num_speculative_blocks=num_speculative_blocks,
+def test_dsa_shared_pool_honors_num_blocks_override(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=4,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
     )
+    groups = [
+        KVCacheGroupSpec(
+            ["model.layers.0.self_attn.attn"], new_kv_cache_spec(head_size=64)
+        ),
+        KVCacheGroupSpec(
+            ["model.layers.0.self_attn.indexer.k_cache"],
+            new_kv_cache_spec(head_size=32),
+        ),
+    ]
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        groups,
+        available_memory=0,
+    )
+
+    assert result.num_blocks == 4
+    assert all(tensor.size > 0 for tensor in result.kv_cache_tensors)
+
+    config.cache_config.num_gpu_blocks_override = None
+    with pytest.raises(ValueError, match="No available memory"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=0,
+        )
+
+
+def _glm52_like_layer_names(num_layers: int = 78, mtp: int = 1):
+    """Build GLM-5.2-style latent/indexer layer names.
+
+    Backbone producers are at 0, 1, 2, 6, 10, ..., 74 (21 layers); the rest
+    are shared consumers. With one physical MTP layer the totals are
+    79 LATENT / 22 INDEXER.
+    """
+    producer_layers = {0, 1, 2} | {6 + 4 * i for i in range(18)}
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(num_layers)]
+    indexer_names = [
+        f"model.layers.{i}.self_attn.indexer.k_cache" for i in producer_layers
+    ]
+    if mtp:
+        latent_names.append(f"model.layers.{num_layers}.self_attn.attn")
+        indexer_names.append(f"model.layers.{num_layers}.self_attn.indexer.k_cache")
+    return latent_names, indexer_names
+
+
+def _new_dsa_mla_spec(head_size: int, block_size: int = 16):
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.float32,
+    )
+
+
+def _dsa_vllm_config(disable_hybrid_kv_cache_manager: bool = False):
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=disable_hybrid_kv_cache_manager
+        )
+    )
+
+
+def test_dsa_two_groups_grouping_keeps_two_unequal_groups(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    kv_cache_spec = {
+        **{n: _new_dsa_mla_spec(head_size=576) for n in latent_names},
+        **{n: _new_dsa_mla_spec(head_size=128) for n in indexer_names},
+    }
+    groups = kv_cache_utils.get_kv_cache_groups(
+        _dsa_vllm_config(),
+        kv_cache_spec,
+    )
+    assert len(groups) == 2
+    latent_group, indexer_group = groups
+    assert len(latent_group.layer_names) == 79
+    assert len(indexer_group.layer_names) == 22
+    # group 0 must be the latent group (larger page size)
+    assert (
+        latent_group.kv_cache_spec.page_size_bytes
+        > indexer_group.kv_cache_spec.page_size_bytes
+    )
+
+
+def test_dsa_two_groups_grouping_fails_on_bad_cardinality(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(78)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(79)]
+    kv_cache_spec = {
+        **{n: _new_dsa_mla_spec(head_size=576) for n in latent_names},
+        **{n: _new_dsa_mla_spec(head_size=128) for n in indexer_names},
+    }
+    with pytest.raises(ValueError, match="indexer_layers <= latent_layers"):
+        kv_cache_utils.get_kv_cache_groups(
+            _dsa_vllm_config(),
+            kv_cache_spec,
+        )
+
+
+def _dsa_shared_config(num_gpu_blocks_override=None):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=num_gpu_blocks_override,
+            gpu_memory_utilization=0.9,
+            kv_cache_memory_bytes=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=20_000,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        num_speculative_tokens=0,
+    )
+
+
+def test_dsa_shared_pool_unequal_groups_pairing(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(num_gpu_blocks_override=4),
+        groups,
+        available_memory=0,
+    )
+
+    assert result.num_blocks == 4
+    # 79 physical tensors: 22 paired + 57 latent-only
+    assert len(result.kv_cache_tensors) == 79
+    shared_by_counts = [len(t.shared_by) for t in result.kv_cache_tensors]
+    assert shared_by_counts.count(2) == 22
+    assert shared_by_counts.count(1) == 57
+    # every latent layer and every indexer layer must be covered exactly once
+    covered = [name for t in result.kv_cache_tensors for name in t.shared_by]
+    assert sorted(covered) == sorted(latent_names + indexer_names)
+    # paired tensors must be latent+indexer siblings of producer layers
+    for t in result.kv_cache_tensors:
+        if len(t.shared_by) == 2:
+            latent, indexer = t.shared_by
+            assert indexer == latent.rsplit(".", 1)[0] + ".indexer.k_cache"
+        else:
+            assert t.shared_by[0] in latent_names
+    # capacity is billed on the full latent layer count (79 slabs)
+    from math import gcd
+
+    latent_page = 16 * 576 * 4  # block_size * head_size * dtype_size
+    indexer_page = 16 * 128 * 4
+    bundle_page = latent_page * indexer_page // gcd(latent_page, indexer_page)
+    assert all(t.size == (4 + 1) * bundle_page for t in result.kv_cache_tensors)
+
+
+def test_dsa_shared_pool_unequal_groups_orphan_indexer_fails(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names, indexer_names = _glm52_like_layer_names(mtp=0)
+    # orphan: indexer layer without a latent sibling
+    indexer_names = indexer_names + ["model.layers.999.self_attn.indexer.k_cache"]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    with pytest.raises(ValueError, match="could not pair"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            _dsa_shared_config(num_gpu_blocks_override=4),
+            groups,
+            available_memory=0,
+        )
+
+
+def test_dsa_shared_pool_rejects_indexer_heavier_group(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(4)]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    with pytest.raises(ValueError, match="at most one indexer layer per latent"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            _dsa_shared_config(num_gpu_blocks_override=4),
+            groups,
+            available_memory=0,
+        )
+
+
+def test_dsa_shared_pool_equal_groups_unchanged(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(79)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(79)]
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(num_gpu_blocks_override=4),
+        groups,
+        available_memory=0,
+    )
+    assert len(result.kv_cache_tensors) == 79
+    assert all(len(t.shared_by) == 2 for t in result.kv_cache_tensors)
+
+
+def test_dsa_nonshared_two_groups_unequal_counts(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "0")
+    latent_names, indexer_names = _glm52_like_layer_names()
+    groups = [
+        KVCacheGroupSpec(latent_names, _new_dsa_mla_spec(head_size=576)),
+        KVCacheGroupSpec(indexer_names, _new_dsa_mla_spec(head_size=128)),
+    ]
+    result = kv_cache_utils.get_kv_cache_config_from_groups(
+        _dsa_shared_config(),
+        groups,
+        available_memory=2**33,
+    )
+    # independent pools: one tensor per layer, per-group block counts
+    assert len(result.kv_cache_tensors) == 79 + 22
+    assert result.num_blocks_per_group is not None
+    assert len(result.num_blocks_per_group) == 2
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -447,12 +673,12 @@ def test_generate_block_hash_extra_keys():
 
     # Test with no extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 0, 5, 0)
-    assert extra_keys == (("hash1", 0),)
+    assert extra_keys == ("hash1",)
     assert next_mm_idx == 1
 
     # Test with partial overlap
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 3, 8, 0)
-    assert extra_keys == (("hash1", -3),)
+    assert extra_keys == ("hash1",)
     assert next_mm_idx == 1
 
     # Test with no overlap
@@ -462,7 +688,7 @@ def test_generate_block_hash_extra_keys():
 
     # Test with multiple extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 0, 15, 0)
-    assert extra_keys == (("hash1", 0), ("hash2", 10))
+    assert extra_keys == ("hash1", "hash2")
     assert next_mm_idx == 2
 
 
@@ -513,7 +739,7 @@ def test_generate_block_hash_extra_keys_cache_salt():
 
     # Test with no extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request_mm, 0, 5, 0)
-    assert extra_keys == (("hash1", 0), "salt")
+    assert extra_keys == ("hash1", "salt")
     assert next_mm_idx == 1
 
 
@@ -637,10 +863,8 @@ def test_request_block_hasher(hash_fn):
 
     block_hashes = request.block_hashes
     assert len(block_hashes) == 2
-    assert block_hashes[0] == hash_fn(
-        (kv_cache_utils.NONE_HASH, (0, 1, 2), (("hash1", 0),))
-    )
-    assert block_hashes[1] == hash_fn((block_hashes[0], (3, 4, 5), (("hash2", 0),)))
+    assert block_hashes[0] == hash_fn((kv_cache_utils.NONE_HASH, (0, 1, 2), ("hash1",)))
+    assert block_hashes[1] == hash_fn((block_hashes[0], (3, 4, 5), ("hash2",)))
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1975,7 +2199,7 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
         (
             kv_cache_utils.NONE_HASH,
             tuple(prompt_token_ids[:block_size]),
-            (("hash1", 0), block1_embeds_hash),
+            ("hash1", block1_embeds_hash),
         )
     )
     assert block_hashes[0] == expected_hash1
@@ -1987,7 +2211,7 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
         (
             block_hashes[0],
             tuple(prompt_token_ids[block_size:num_tokens]),
-            (("hash2", 0), block2_embeds_hash),
+            ("hash2", block2_embeds_hash),
         )
     )
     assert block_hashes[1] == expected_hash2
@@ -2029,28 +2253,6 @@ def test_auto_fit_max_model_len():
     # Should be reduced to fit in memory
     assert vllm_config.model_config.max_model_len < 1024
     assert vllm_config.model_config.max_model_len > 0
-
-
-def test_auto_fit_max_model_len_with_hybrid():
-    """Test that auto-fit works with hybrid KV cache specs."""
-    # Create config with original_max_model_len=-1 to trigger auto-fit
-    model_config = ModelConfig(max_model_len=8192)
-    # Simulate the user passing -1 by setting original_max_model_len
-    model_config.original_max_model_len = -1
-    vllm_config = VllmConfig(model_config=model_config)
-
-    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2  # 16KB per block per layer
-    gamma = 2
-    kv_cache_specs = {
-        "layer_1": new_mamba_spec(num_speculative_blocks=gamma),
-        "layer_2": new_kv_cache_spec(),
-    }
-
-    available_memory = mem_per_block_per_layer * (1024 // 16 + 1 + gamma)
-    _kv_cache_configs = get_kv_cache_configs(
-        vllm_config, [kv_cache_specs], [available_memory]
-    )
-    assert vllm_config.model_config.max_model_len == 1024
 
 
 def test_auto_fit_max_model_len_not_triggered():

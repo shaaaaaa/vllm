@@ -168,7 +168,8 @@ class StaticSinkAttention(Attention, CustomOp):
             "sink_key and sink_value have not been prepared"
         )
         if not self.sink_populated:
-            self_kv_cache = self.kv_cache[0]
+            forward_context: ForwardContext = get_forward_context()
+            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
             torch.ops.vllm.maybe_populate_sink(self_kv_cache, self.layer_name)
 
         return super().forward(query, key, value, output_shape)

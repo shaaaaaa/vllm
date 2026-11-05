@@ -5,8 +5,7 @@ import pytest
 import pytest_asyncio
 from openai import OpenAI
 
-from tests.utils import RemoteOpenAIServer
-
+from ....utils import RemoteOpenAIServer
 from .conftest import validate_streaming_event_stack
 
 MODEL_NAME = "Qwen/Qwen3-8B"

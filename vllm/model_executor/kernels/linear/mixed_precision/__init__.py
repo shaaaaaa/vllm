@@ -30,7 +30,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearLayerConfig,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-    XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
 )
 
@@ -45,6 +44,5 @@ __all__ = [
     "ExllamaLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
-    "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
 ]

@@ -57,13 +57,11 @@ class CPUWorker(Worker):
         def check_preloaded_libs(name: str):
             ld_preload_list = os.environ.get("LD_PRELOAD", "")
             if name not in ld_preload_list:
-                logger.warning(
-                    "%s is not found in LD_PRELOAD. "
-                    "For best performance, please follow the section "
-                    "`set LD_PRELOAD` in "
+                raise RuntimeError(
+                    f"{name} is not found in LD_PRELOAD. "
+                    "Please follow the section `set LD_PRELOAD` in "
                     "https://docs.vllm.ai/en/latest/getting_started/installation/cpu/ "
-                    "to setup required pre-loaded libraries.",
-                    name,
+                    "to setup required pre-loaded libraries."
                 )
 
         if sys.platform.startswith("linux"):

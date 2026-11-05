@@ -29,8 +29,13 @@ class GLM4VProcessor(ProcessorMixin):
 
     def __init__(
         self,
-        image_processor: GLM4VImageProcessorFast,
         tokenizer: PreTrainedTokenizer,
+        image_size: int,
+        image_processor: GLM4VImageProcessorFast | None = None,
     ) -> None:
-        self.image_processor = image_processor
         self.tokenizer = tokenizer
+        if image_processor is None:
+            image_processor = GLM4VImageProcessorFast(
+                size={"width": image_size, "height": image_size}
+            )
+        self.image_processor = image_processor

@@ -1570,24 +1570,20 @@ def test_mm_prefix_caching():
     block_hashes = req0.block_hashes
     assert len(block_hashes) == 3
     assert block_hashes[0] == sha256(
-        (
-            kv_cache_utils.NONE_HASH,
-            tuple(all_token_ids[:block_size]),
-            (("aaa", 11),),
-        )
+        (kv_cache_utils.NONE_HASH, tuple(all_token_ids[:block_size]), ("aaa",))
     )
     assert block_hashes[1] == sha256(
         (
             block_hashes[0],
             tuple(all_token_ids[block_size : block_size * 2]),
-            (("aaa", -5), ("bbb", 14)),
+            ("aaa", "bbb"),
         )
     )
     assert block_hashes[2] == sha256(
         (
             block_hashes[1],
             tuple(all_token_ids[block_size * 2 : block_size * 3]),
-            (("bbb", -2),),
+            ("bbb",),
         )
     )
 
@@ -1607,11 +1603,7 @@ def test_mm_prefix_caching():
     assert new_blocks is not None and len(new_blocks.blocks[0]) == 0
     assert len(block_hashes) == 4
     assert block_hashes[3] == sha256(
-        (
-            block_hashes[2],
-            tuple(all_token_ids[3 * block_size :] + [8] * 5),
-            (("ccc", 0),),
-        )
+        (block_hashes[2], tuple(all_token_ids[3 * block_size :] + [8] * 5), ("ccc",))
     )
 
     # Cache hit.

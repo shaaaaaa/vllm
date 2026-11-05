@@ -307,6 +307,13 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
             num_submods = len(submod_names)
             num_artifacts = standalone_compile_artifacts.num_artifacts()
 
+            logger.info(
+                "reconstructing serializable fn from standalone compile "
+                "artifacts. num_artifacts=%d num_submods=%d",
+                num_artifacts,
+                num_submods,
+            )
+
             with functorch_ctx:
                 fn = reconstruct_serializable_fn_from_mega_artifact(
                     state=state,
@@ -317,10 +324,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
                 )
 
             logger.info(
-                "reconstructed serializable fn from standalone compile "
-                "artifacts. num_artifacts=%d num_submods=%d",
-                num_artifacts,
-                num_submods,
+                "reconstructed serializable fn from standalone compile artifacts"
             )
 
             return fn

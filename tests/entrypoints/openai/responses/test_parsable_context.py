@@ -9,8 +9,7 @@ import pytest
 import pytest_asyncio
 from openai import OpenAI
 
-from tests.utils import RemoteOpenAIServer
-
+from ....utils import RemoteOpenAIServer
 from .conftest import (
     BASE_TEST_ENV,
     has_output_type,

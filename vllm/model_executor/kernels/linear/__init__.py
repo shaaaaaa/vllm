@@ -48,7 +48,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-    XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm import (
@@ -139,7 +138,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.XPU: [
-        XPUW4A8IntLinearKernel,
         XPUwNa16LinearKernel,
     ],
     PlatformEnum.CPU: [
@@ -393,6 +391,5 @@ __all__ = [
     "ExllamaLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
-    "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
 ]
