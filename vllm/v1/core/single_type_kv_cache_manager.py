@@ -533,6 +533,11 @@ class DSALatentManager(FullAttentionManager):
         blocks_per_bundle = self._blocks_per_bundle()
         return num_blocks // blocks_per_bundle * blocks_per_bundle
 
+    def _dcp_compact_block_offset(self) -> int:
+        if (getattr(self.kv_cache_spec, "dsa_dcp_size", None) or 1) > 1:
+            return self._round_up_to_bundle(self.scratch_blocks)
+        return 0
+
     def _compact_required_indices(
         self,
         prefix_tokens: int,
@@ -552,13 +557,14 @@ class DSALatentManager(FullAttentionManager):
         required_blocks = self._round_up_to_bundle(
             cdiv(num_tokens, self.block_size)
         )
+        offset = self._dcp_compact_block_offset()
         if not force_compact and num_tokens_main_model <= prefix_tokens:
             # External lookup/load failed: dense prefill needs a contiguous
             # latent prefix. Grow it chunk by chunk as scheduling progresses.
-            return list(range(required_blocks))
+            return list(range(offset + required_blocks))
 
-        scratch_end = self._round_up_to_bundle(self.scratch_blocks)
-        if prefix_tokens < self.scratch_blocks * self.block_size:
+        scratch_end = offset or self._round_up_to_bundle(self.scratch_blocks)
+        if not offset and prefix_tokens < self.scratch_blocks * self.block_size:
             # A resident short prefix needs no unused sparse scratch rows.
             # Grow that prefix normally as decode/lookahead consumes more slots.
             scratch_end = min(scratch_end, required_blocks)
@@ -574,7 +580,7 @@ class DSALatentManager(FullAttentionManager):
                 tail_start, self._round_down_to_bundle(final_prompt_idx)
             )
         return list(range(scratch_end)) + list(
-            range(max(scratch_end, tail_start), required_blocks)
+            range(max(scratch_end, offset + tail_start), offset + required_blocks)
         )
 
     def _get_num_missing_blocks(
@@ -597,8 +603,14 @@ class DSALatentManager(FullAttentionManager):
         num_tokens_main_model: int,
     ) -> int:
         """Admission cost for an initial complete external DSA hit."""
-        self._compact_external_prefix_tokens[request_id] = total_computed_tokens
-        self._compact_external_released_blocks.setdefault(request_id, 0)
+        if self._dcp_compact_block_offset():
+            # A capacity probe can fail. Only allocation establishes a shifted table.
+            total_computed_tokens = self._compact_external_prefix_tokens.get(
+                request_id, total_computed_tokens
+            )
+        else:
+            self._compact_external_prefix_tokens[request_id] = total_computed_tokens
+            self._compact_external_released_blocks.setdefault(request_id, 0)
         required_indices = self._compact_required_indices(
             total_computed_tokens,
             num_tokens,
@@ -656,11 +668,9 @@ class DSALatentManager(FullAttentionManager):
         )
         assert num_external_computed_tokens > 0
         prefix_tokens = num_local_computed_tokens + num_external_computed_tokens
-        self._compact_external_prefix_tokens[request_id] = prefix_tokens
-        self._compact_external_released_blocks.setdefault(request_id, 0)
-
-        scratch_blocks = self._round_up_to_bundle(self.scratch_blocks)
-        if prefix_tokens < self.scratch_blocks * self.block_size:
+        offset = self._dcp_compact_block_offset()
+        scratch_blocks = offset or self._round_up_to_bundle(self.scratch_blocks)
+        if not offset and prefix_tokens < self.scratch_blocks * self.block_size:
             scratch_blocks = min(
                 scratch_blocks,
                 self._round_up_to_bundle(cdiv(prefix_tokens, self.block_size)),
@@ -668,11 +678,15 @@ class DSALatentManager(FullAttentionManager):
         allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
         assert len(allocated_blocks) == scratch_blocks
 
-        logical_blocks = max(cdiv(prefix_tokens, self.block_size), scratch_blocks)
+        logical_blocks = max(
+            cdiv(prefix_tokens, self.block_size) + offset, scratch_blocks
+        )
         req_blocks = self.req_to_blocks[request_id]
         assert not req_blocks
         req_blocks.extend(allocated_blocks)
         req_blocks.extend([self._null_block] * (logical_blocks - scratch_blocks))
+        self._compact_external_prefix_tokens[request_id] = prefix_tokens
+        self._compact_external_released_blocks.setdefault(request_id, 0)
         self.num_cached_block[request_id] = len(req_blocks)
         logger.info(
             "[DSA_COMPACT_TABLE_CREATED] req=%s prefix_tokens=%d "
@@ -851,15 +865,17 @@ class DSALatentManager(FullAttentionManager):
                 f"committed_end={committed_end} must be divisible by "
                 f"block_size={self.block_size}"
             )
-        start = self.scratch_blocks
-        end = min(committed_end // self.block_size, len(blocks))
         compact_requests = getattr(
             self, "_compact_external_prefix_tokens", None
         )
-        if compact_requests is not None and request_id in compact_requests:
+        compact = compact_requests is not None and request_id in compact_requests
+        offset = self._dcp_compact_block_offset() if compact else 0
+        start = offset or self.scratch_blocks
+        end = min(offset + committed_end // self.block_size, len(blocks))
+        if compact:
             released_blocks = self._compact_external_released_blocks
             released_blocks[request_id] = max(
-                released_blocks.get(request_id, 0), end
+                released_blocks.get(request_id, 0), end - offset
             )
         window_size = _decode_window_save_window_size()
         window_start = max(0, committed_end - window_size) if window_size else None
@@ -903,7 +919,10 @@ class DSALatentManager(FullAttentionManager):
             release_gate="enabled",
             freed_blocks=len(removed_blocks),
         )
-        if end * self.block_size > committed_end or start < self.scratch_blocks:
+        if (
+            (end - offset) * self.block_size > committed_end
+            or start < self.scratch_blocks
+        ):
             _mtp_dw_event(
                 "fail",
                 req=request_id,

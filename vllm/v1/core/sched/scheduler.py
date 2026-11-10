@@ -209,6 +209,10 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
+        self._dsa_dcp = any(
+            (getattr(group.kv_cache_spec, "dsa_dcp_size", None) or 1) > 1
+            for group in kv_cache_config.kv_cache_groups
+        )
         self._dsa_dense_request_capacity = dsa_dense_request_token_capacity(
             kv_cache_config
         )
@@ -1379,6 +1383,8 @@ class Scheduler(SchedulerInterface):
             "Only running requests can be preempted"
         )
         self.kv_cache_manager.free(request)
+        if self._dsa_dcp:
+            request.dsa_compact_allocated = False
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1443,6 +1449,12 @@ class Scheduler(SchedulerInterface):
                 outputs[client_index].append(output)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        if self._dsa_dcp:
+            scheduler_output.dsa_dcp_compact_req_ids = {
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if self.requests[req_id].dsa_compact_allocated
+            }
         errors = self.__dict__.pop("_dsa_admission_errors", None)
         if errors:
             # Bind errors to this exact step so an older async output cannot
@@ -2861,6 +2873,9 @@ class Scheduler(SchedulerInterface):
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 self.kv_cache_manager.free(request)
+                if self._dsa_dcp:
+                    # The next allocation must carry its own table format.
+                    request.dsa_compact_allocated = False
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:

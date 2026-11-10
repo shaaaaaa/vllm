@@ -115,6 +115,50 @@ def test_unrelated_admission_keeps_original_lookahead(override):
     assert kwargs["num_lookahead_tokens"] == 0
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_balance_scheduler_uses_dcp_layout_and_exact_restore_extent(compact):
+    path = ROOT.parents[3] / "vllm-ascend/vllm_ascend/patch/platform/patch_balance_schedule.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    body = next(
+        n.body for n in ast.walk(tree)
+        if isinstance(n, ast.While)
+        and any(
+            isinstance(x, ast.Assign)
+            and ast.unparse(x.targets[0]) == "effective_lookahead_tokens"
+            for x in n.body
+        )
+    )
+    first, last = (
+        next(i for i, node in enumerate(body)
+             if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == name)
+        for name in ("effective_lookahead_tokens", "new_blocks")
+    )
+    loop = ast.parse("for _ in (0,):\n    pass").body[0]
+    loop.body = body[first : last + 1]
+    allocate = Mock()
+    ns = dict(
+        self=NS(
+            _dsa_dcp=True,
+            connector=NS(is_dsa_cold_compact_load=lambda _: compact,
+                         get_dsa_cold_load_num_tokens=lambda _: 8193),
+            _reject_impossible_initial_dsa_request=lambda *_a, **_kw: False,
+            is_encoder_decoder=False,
+            kv_cache_manager=NS(allocate_slots=allocate),
+        ),
+        request=NS(num_computed_tokens=0),
+        request_id="r",
+        load_kv_async=True,
+        num_new_tokens=0,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=8192,
+        new_computed_blocks=None,
+    )
+    exec(compile(ast.Module(body=[loop], type_ignores=[]), str(path), "exec"), ns)
+    assert allocate.call_args.args[1] == 0
+    assert allocate.call_args.kwargs["num_lookahead_tokens"] == 1
+    assert allocate.call_args.kwargs["dsa_compact_external_load"] is compact
+
+
 @pytest.mark.parametrize("scratch_rows", [1, 2])
 @pytest.mark.parametrize("free", [80, 81, 88, 89, 211])
 def test_boundary_compact_bundle_cost_and_exact_capacity(scratch_rows, free):
@@ -129,6 +173,7 @@ def test_boundary_compact_bundle_cost_and_exact_capacity(scratch_rows, free):
         "_blocks_per_bundle",
         "_round_up_to_bundle",
         "_round_down_to_bundle",
+        "_dcp_compact_block_offset",
         "_compact_required_indices",
     }
     cls = ast.ClassDef(
@@ -146,6 +191,7 @@ def test_boundary_compact_bundle_cost_and_exact_capacity(scratch_rows, free):
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     manager = ns["Manager"]()
     manager.block_pool = NS(blocks_per_bundle=2)
+    manager.kv_cache_spec = NS()
     manager.block_size = 128
     manager.scratch_blocks = scratch_rows * 2048 // 128
     kwargs, _ = schedule_allocation()
