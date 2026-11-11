@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import json
 import os
+import socket
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -649,6 +650,14 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    self._log_request_transition(
+                        "preemption_trigger", preempted_req,
+                        cause="kv_allocation_failed",
+                        trigger_request_id=request.request_id,
+                        requested_tokens=num_new_tokens,
+                        lookahead_tokens=self.num_lookahead_tokens,
+                        next_preemption_count=preempted_req.num_preemptions + 1,
+                    )
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -1126,6 +1135,11 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    if request.num_preemptions:
+                        self._log_request_transition(
+                            "resume_load_started", request,
+                            external_tokens_this_admission=num_external_computed_tokens,
+                        )
                     continue
 
                 self.running.append(request)
@@ -1180,6 +1194,15 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if scheduled_resumed_reqs and scheduled_resumed_reqs[-1] is request:
+                    self._log_request_transition(
+                        "request_resumed", request,
+                        scheduled_tokens=num_new_tokens,
+                        scheduled_draft_tokens=len(
+                            scheduled_spec_decode_tokens.get(request_id, ())
+                        ),
+                        external_tokens_this_admission=num_external_computed_tokens,
+                    )
                 # Count the number of prefix cached tokens.
                 num_cached_tokens = min(num_computed_tokens, request.num_prompt_tokens)
                 if request.num_cached_tokens < 0:
@@ -1369,6 +1392,43 @@ class Scheduler(SchedulerInterface):
         )
         return scheduler_output
 
+    def _log_request_transition(self, event: str, request: Request, **fields) -> None:
+        """Rare lifecycle events, also when stats and PD_SERVING_PERF are off.
+
+        Keep this separate from per-step performance instrumentation. Read only
+        host metadata; never enumerate blocks, serialize tokens or inspect KV.
+        Ascend's recompute/async schedulers reuse this same correlation schema.
+        """
+        logger.info(
+            "[REQUEST_LIFECYCLE] %s",
+            json.dumps(
+                {
+                    "schema": 1,
+                    "event": event,
+                    "request_id": request.request_id,
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "wall_time_ns": time.time_ns(),
+                    "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+                    "preemption_count": request.num_preemptions,
+                    "status": request.status.name,
+                    "computed_tokens": request.num_computed_tokens,
+                    "prompt_tokens": request.num_prompt_tokens,
+                    "history_tokens": request.num_tokens,
+                    "output_tokens": request.num_output_tokens,
+                    "output_placeholders": request.num_output_placeholders,
+                    "external_computed_tokens": request.num_external_computed_tokens,
+                    "compact_allocated": request.dsa_compact_allocated,
+                    "checkpoint_proof_present": getattr(
+                        request, "kv_resume_checkpoint", None
+                    )
+                    is not None,
+                    **fields,
+                },
+                separators=(",", ":"),
+            ),
+        )
+
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -1378,6 +1438,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        previous_computed_tokens = request.num_computed_tokens
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1390,6 +1451,10 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        self._log_request_transition(
+            "request_preempted", request,
+            previous_computed_tokens=previous_computed_tokens,
+        )
 
     def _reject_impossible_initial_dsa_request(
         self, request: Request, *, compact_external_load: bool,
@@ -2667,6 +2732,10 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
+                self._log_request_transition(
+                    "preemption_trigger", request, cause="prefix_cache_reset",
+                    next_preemption_count=request.num_preemptions + 1,
+                )
                 self._preempt_request(request, timestamp)
                 # NOTE(zhuohan): For async scheduling, we need to discard the latest
                 # output token on the fly to avoid a redundant repetitive output token.
@@ -2907,6 +2976,10 @@ class Scheduler(SchedulerInterface):
                 )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        if request.num_preemptions:
+            self._log_request_transition(
+                "resume_load_completed", request, success=not failed_recv,
+            )
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
