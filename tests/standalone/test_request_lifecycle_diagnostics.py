@@ -56,6 +56,7 @@ def subject(monkeypatch, caplog):
     exec(compile(module, str(SOURCE), "exec"), ns)
     obj = type("SchedulerHostMethods", (), {name: ns[name] for name in names})()
     obj.vllm_config = NS(parallel_config=NS(data_parallel_rank=2))
+    obj._dsa_dcp = False
     obj.log_stats = False
     obj.waiting = NS(prepend_request=lambda value: None)
     obj.kv_cache_manager = NS(free=lambda value: None, cache_blocks=lambda *args: None)
@@ -84,8 +85,11 @@ def subject(monkeypatch, caplog):
     return obj, req, records, methods
 
 
-def test_preemption_records_previous_frontier_and_generation_at_perf_zero(subject):
+@pytest.mark.parametrize("dcp", [False, True])
+def test_preemption_records_previous_frontier_and_generation_at_perf_zero(subject, dcp):
     obj, req, records, _ = subject
+    obj._dsa_dcp = dcp
+    req.dsa_compact_allocated = True
     obj._preempt_request(req, 0.0)
     event = records()[0]
     assert event["event"] == "request_preempted" and event["status"] == "PREEMPTED"
@@ -93,6 +97,7 @@ def test_preemption_records_previous_frontier_and_generation_at_perf_zero(subjec
     assert event["previous_computed_tokens"] == 123 and event["history_tokens"] == 130
     assert event["dp_rank"] == 2 and event["wall_time_ns"] > 0
     assert req.spec_token_ids == []
+    assert event["compact_allocated"] is (not dcp)
 
 
 def test_invalid_preemption_has_no_success_log(subject):

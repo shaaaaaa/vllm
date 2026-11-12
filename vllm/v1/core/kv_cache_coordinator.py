@@ -205,7 +205,10 @@ class KVCacheCoordinator(ABC):
                 ],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=(
+                    getattr(kv_cache_group.kv_cache_spec, "dsa_dcp_size", None)
+                    or dcp_world_size
+                ),
                 pcp_world_size=pcp_world_size,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
@@ -216,9 +219,14 @@ class KVCacheCoordinator(ABC):
             dsa_scratch_rows = self.kv_cache_config.dsa_num_speculative_tokens + 1
             for manager in self.single_type_managers:
                 if isinstance(manager, DSALatentManager):
+                    scratch_block_size = (
+                        manager.kv_cache_spec.block_size
+                        if getattr(manager.kv_cache_spec, "dsa_dcp_size", None)
+                        else manager.block_size
+                    )
                     scratch_blocks = dsa_scratch_blocks_for_topk(
                         self.kv_cache_config.dsa_index_topk,
-                        manager.block_size,
+                        scratch_block_size,
                         dsa_scratch_rows,
                     )
                     manager.scratch_blocks = scratch_blocks
@@ -228,7 +236,7 @@ class KVCacheCoordinator(ABC):
                         self.kv_cache_config.dsa_index_topk,
                         self.kv_cache_config.dsa_num_speculative_tokens,
                         dsa_scratch_rows,
-                        manager.block_size,
+                        scratch_block_size,
                         manager.scratch_blocks,
                     )
 

@@ -263,6 +263,9 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Rows whose latent tables begin with the DCP resident scratch prefix.
+    dsa_dcp_compact_req_ids: set[str] | None = None
+
     # P-side requests whose final prompt hidden state should be returned to the
     # scheduler after this step.
     capture_final_hidden_req_ids: ClassVar[set[str] | None] = None

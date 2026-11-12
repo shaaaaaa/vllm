@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 
-def manager():
+def manager(dcp_size=1):
     path = (
         Path(__file__).resolve().parents[3]
         / "vllm/v1/core/single_type_kv_cache_manager.py"
@@ -24,12 +24,15 @@ def manager():
         "_blocks_per_bundle",
         "_round_up_to_bundle",
         "_round_down_to_bundle",
+        "_dcp_compact_block_offset",
+        "is_compact_external",
         "_compact_required_indices",
         "_get_num_missing_blocks",
         "get_num_blocks_to_allocate_compact_external",
         "allocate_new_computed_blocks_compact_external",
         "_allocate_compact_request_blocks",
         "allocate_new_blocks_compact_external",
+        "remove_saved_decode_window_blocks",
     }
     cls.bases = []
     cls.body = [
@@ -37,7 +40,12 @@ def manager():
     ]
     module = ast.parse("from __future__ import annotations")
     module.body.append(cls)
-    ns = dict(cdiv=lambda a, b: (a + b - 1) // b, logger=NS(info=lambda *a: None))
+    ns = dict(
+        cdiv=lambda a, b: (a + b - 1) // b,
+        logger=NS(info=lambda *a: None),
+        _decode_window_save_window_size=lambda: 0,
+        _mtp_dw_event=lambda *args, **kwargs: None,
+    )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     instance = ns[cls.name]()
     issued = []
@@ -50,7 +58,8 @@ def manager():
     instance.block_pool = NS(
         blocks_per_bundle=2, get_new_blocks=allocate, get_num_free_blocks=lambda: 1000
     )
-    instance.block_size = 128
+    instance.kv_cache_spec = NS(dsa_dcp_size=dcp_size if dcp_size > 1 else None)
+    instance.block_size = 128 * dcp_size
     instance.scratch_blocks = 32
     instance._null_block = NS(block_id=0, is_null=True)
     instance._compact_external_prefix_tokens = {}
@@ -91,3 +100,30 @@ def test_long_cold_admission_retains_sparse_scratch_and_null_middle():
     assert all(not b.is_null for b in blocks[:32])
     assert any(b.is_null for b in blocks[32:-4])
     assert not blocks[1024].is_null
+
+
+@pytest.mark.parametrize("dcp_size", [4, 8])
+def test_dcp_scratch_and_live_allocations_are_disjoint(dcp_size):
+    allocator, issued = manager(dcp_size)
+    length = 8193
+    required = allocator.get_num_blocks_to_allocate_compact_external(
+        "r", length, [], length - 1, length - 1
+    )
+    assert not allocator.is_compact_external("r")
+    allocator.allocate_new_computed_blocks_compact_external("r", [], 0, length - 1)
+    assert allocator.is_compact_external("r")
+    allocator.allocate_new_blocks_compact_external("r", length, length - 1)
+    assert len(issued) == required == 36
+    blocks = allocator.req_to_blocks["r"]
+    scratch = blocks[:32]
+    live_block_index = 32 + (length - 1) // (128 * dcp_size)
+    live_block = blocks[live_block_index]
+    assert all(not block.is_null for block in scratch)
+    assert blocks[32].is_null and not live_block.is_null
+    assert live_block not in scratch
+
+    freed = []
+    allocator.block_pool.free_blocks = freed.extend
+    assert allocator.remove_saved_decode_window_blocks("r", length - 1) == 2
+    assert blocks[:32] == scratch and blocks[live_block_index] == live_block
+    assert all(not block.is_null for block in freed)

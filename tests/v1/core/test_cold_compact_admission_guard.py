@@ -35,13 +35,16 @@ def _runtime():
         RUNNING = 1
         WAITING_FOR_STREAMING_REQ = 2
         WAITING_FOR_REMOTE_KVS = 3
+        PREEMPTED = 4
         FINISHED_ERROR = 5
         @staticmethod
         def is_finished(value): return value >= 5
     scope.update(logger=Mock(), RequestStatus=Status,
                  remove_all=lambda values, removed: [v for v in values if v not in removed])
     names = {'_reject_impossible_initial_dsa_request', '_drain_dsa_admission_errors',
-             '_update_after_schedule', 'has_finished_requests', 'finish_requests'}
+             '_update_after_schedule', 'has_finished_requests', 'finish_requests',
+             '_update_requests_with_invalid_blocks', '_update_waiting_for_remote_kv',
+             '_preempt_request'}
     cls = _class(BASE, 'Scheduler')
     cls.bases = []
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -62,6 +65,8 @@ def _scheduler(capacity=100, length=1000):
     scope = _runtime()
     obj = scope['Scheduler']()
     obj._dsa_dense_request_capacity = capacity
+    obj._dsa_dcp = False
+    obj._log_request_transition = Mock()
     request = NS(request_id='long', num_tokens=length, num_prompt_tokens=length,
         num_preemptions=0, num_computed_tokens=0, dsa_compact_allocated=False,
         status=scope['RequestStatus'].WAITING, client_index=7,
@@ -79,6 +84,68 @@ def _scheduler(capacity=100, length=1000):
         obj.finished_req_ids.add(req.request_id)
     obj._free_request = free
     return obj, request, releases, scope
+
+
+def test_dcp_compact_layout_is_bound_to_each_scheduled_step():
+    scheduler, request, _, _ = _scheduler()
+    scheduler._dsa_dcp = True
+    request.dsa_compact_allocated = True
+    request.num_output_placeholders = 0
+    request.has_encoder_inputs = request.use_structured_output = False
+    output = NS(
+        num_scheduled_tokens={"long": 1},
+        bootstrap_sample_req_ids=None,
+        has_structured_output_requests=False,
+    )
+    scheduler._update_after_schedule(output)
+    request.dsa_compact_allocated = False
+    next_output = NS(**vars(output))
+    scheduler._update_after_schedule(next_output)
+    assert output.dsa_dcp_compact_req_ids == {"long"}
+    assert next_output.dsa_dcp_compact_req_ids == set()
+
+
+@pytest.mark.parametrize("preempt", [False, True])
+def test_dcp_compact_marker_retires_with_the_failed_or_preempted_table(preempt):
+    scheduler, request, _, scope = _scheduler(length=4097)
+    status = scope["RequestStatus"]
+    scheduler._dsa_dcp = True
+    scheduler.connector = object()
+    scheduler.block_size = 128
+    scheduler.log_stats = False
+    scheduler.encoder_cache_manager = Mock()
+    request.dsa_compact_allocated = True
+    request.num_computed_tokens = request.num_external_computed_tokens = 4096
+    request.num_cached_tokens = -1
+    request.spec_token_ids = []
+    request.num_output_placeholders = 0
+    request.has_encoder_inputs = request.use_structured_output = False
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [10] * 32 + [0] * 8, list(range(100, 133)),
+    )
+    if preempt:
+        request.status = status.RUNNING
+        scheduler._preempt_request(request, 0.0)
+    else:
+        request.status = status.WAITING_FOR_REMOTE_KVS
+        affected, _, _ = scheduler._update_requests_with_invalid_blocks(
+            [request], {100}, evict_blocks=False
+        )
+        assert affected == {"long"} and request.num_computed_tokens == 0
+        assert request.dsa_compact_allocated
+        scheduler.kv_cache_manager.free.assert_not_called()
+        scheduler.failed_recving_kv_req_ids = affected
+        scheduler.finished_recving_kv_req_ids.add("long")
+        scheduler._update_waiting_for_remote_kv(request)
+    scheduler.kv_cache_manager.free.assert_called_once_with(request)
+    # A subsequent dense retry has no scratch prefix in its new block table.
+    output = NS(
+        num_scheduled_tokens={"long": 1}, bootstrap_sample_req_ids=None,
+        has_structured_output_requests=False,
+    )
+    scheduler._update_after_schedule(output)
+    assert output.dsa_dcp_compact_req_ids == set()
 
 
 @pytest.mark.parametrize('path,name', [(BASE, 'Scheduler'),
