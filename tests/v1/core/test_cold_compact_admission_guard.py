@@ -40,8 +40,14 @@ def _runtime():
         def is_finished(value): return value >= 5
     scope.update(logger=Mock(), RequestStatus=Status,
                  remove_all=lambda values, removed: [v for v in values if v not in removed])
-    names = {'_reject_impossible_initial_dsa_request', '_drain_dsa_admission_errors',
-             '_update_after_schedule', 'has_finished_requests', 'finish_requests'}
+    names = {
+        '_reject_kv_admission_error',
+        '_reject_impossible_initial_dsa_request',
+        '_drain_dsa_admission_errors',
+        '_update_after_schedule',
+        'has_finished_requests',
+        'finish_requests',
+    }
     cls = _class(BASE, 'Scheduler')
     cls.bases = []
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -115,6 +121,30 @@ def test_actual_waiting_lookup_guards_miss_but_defers_unknown_and_admits_full_hi
     else:
         assert releases == ['long'] and not scope['admitted'] and not obj.requests
         assert obj.has_finished_requests()
+
+
+def test_permanent_kv_admission_error_is_delivered_once():
+    obj, request, releases, _ = _scheduler()
+    request.kv_admission_error = 'required CPU blocks exceed capacity'
+    assert obj._reject_kv_admission_error(request)
+    assert releases == ['long'] and not obj.requests
+    assert request.status.name == 'FINISHED_ERROR'
+    output = NS(num_scheduled_tokens={})
+    obj._update_after_schedule(output)
+    outputs = defaultdict(list)
+    obj._drain_dsa_admission_errors(output, outputs)
+    result = outputs[7][0]
+    assert result.request_id == 'long' and result.finished
+    assert result.stop_reason == request.kv_admission_error
+    assert str(result.finish_reason) == 'error'
+    obj._drain_dsa_admission_errors(output, outputs)
+    assert len(outputs[7]) == 1
+
+
+def test_absent_kv_admission_error_keeps_request_waiting():
+    obj, request, releases, _ = _scheduler()
+    assert not obj._reject_kv_admission_error(request)
+    assert not releases and obj.waiting == [request]
 
 
 @pytest.mark.parametrize('change', [dict(num_preemptions=1), dict(num_computed_tokens=1),

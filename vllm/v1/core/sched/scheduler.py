@@ -784,6 +784,8 @@ class Scheduler(SchedulerInterface):
                         )
 
                         if ext_tokens is None:
+                            if self._reject_kv_admission_error(request):
+                                continue
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
@@ -1361,6 +1363,25 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _reject_kv_admission_error(self, request: Request) -> bool:
+        """Finish a permanently oversized connector request without a worker run."""
+        reason = getattr(request, "kv_admission_error", None)
+        if reason is None:
+            return False
+        request.stop_reason = reason
+        logger.warning("Rejecting KV admission for %s: %s", request.request_id, reason)
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+        pending = getattr(self, "_dsa_admission_errors", None)
+        if pending is None:
+            pending = self._dsa_admission_errors = []
+        pending.append((request.client_index, EngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=[],
+            finish_reason=request.get_finished_reason(),
+            stop_reason=reason,
+        )))
+        return True
 
     def _reject_impossible_initial_dsa_request(
         self, request: Request, *, compact_external_load: bool,
