@@ -90,11 +90,10 @@ def prepare_dp_guardian(config: Any, group: Any, store: Any) -> dict[str, Any] |
         )
     if not bool(rows[0].any()):
         return None
-    if not bool(rows[0].all()) or bool(rows[2].any()):
-        raise ValueError(
-            "Independent DP must be requested on every peer and cannot use "
-            "SINGLE_AGREEMENT"
-        )
+    if not bool(rows[0].all()):
+        raise ValueError("Independent DP must be requested on every peer")
+    if bool(rows[2].any()) != bool(rows[2].all()):
+        raise ValueError("SFA single-agreement configuration differs across DP peers")
     if not bool(rows[5].all()) or int(rows[4].min()) != int(rows[4].max()):
         raise ValueError("DP guardian leases must match and be in [2, 86400] seconds")
     if not bool(rows[1].all()):

@@ -259,10 +259,20 @@ def test_termination_precedes_diagnostic_disk_io(guardian, monkeypatch):
 
 @pytest.mark.parametrize(
     "case",
-    ["eligible", "disabled", "mixed", "unsupported_os", "lease", "single", "marker"],
+    [
+        "eligible",
+        "disabled",
+        "mixed",
+        "unsupported_os",
+        "ineligible",
+        "lease",
+        "mixed_single",
+        "marker",
+    ],
 )
+@pytest.mark.parametrize("single", [False, True])
 def test_bootstrap_common_decision_and_serializable_descriptor(
-    tmp_path, monkeypatch, case
+    tmp_path, monkeypatch, case, single
 ):
     import pickle
 
@@ -294,7 +304,7 @@ def test_bootstrap_common_decision_and_serializable_descriptor(
         _sfa_independent_options=dict(
             requested=case != "disabled",
             eligible=True,
-            single=case == "single",
+            single=single,
             lease=30,
             valid_lease=True,
         ),
@@ -325,13 +335,18 @@ def test_bootstrap_common_decision_and_serializable_descriptor(
         rows[:, 1] = rows[:, 0]
         if case == "mixed":
             rows[0, 1] = 0
+        elif case == "mixed_single":
+            rows[2, 1] = not single
+        elif case == "ineligible":
+            rows[1, 1] = 0
         elif case == "lease":
             rows[4, 1] += 1
         elif case == "marker":
             rows[3, 1] = 1
 
-    monkeypatch.setattr(dist, "all_reduce", all_reduce)
-    if case in ("mixed", "lease", "single", "marker"):
+    vote = Mock(side_effect=all_reduce)
+    monkeypatch.setattr(dist, "all_reduce", vote)
+    if case in ("mixed", "lease", "mixed_single", "marker"):
         with pytest.raises((ValueError, RuntimeError)):
             client.prepare_dp_guardian(config, "group", NS(host="host", port=1))
     else:
@@ -343,3 +358,4 @@ def test_bootstrap_common_decision_and_serializable_descriptor(
         else:
             assert result is None
     assert factory.call_count == int(case == "eligible")
+    vote.assert_called_once()
