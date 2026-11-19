@@ -843,6 +843,10 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if num_computed_tokens < getattr(request, "min_kv_prefix_tokens", 0):
+                    self._finish_kv_admission_error(request, num_computed_tokens)
+                    continue
+
                 bootstrap_full_hit = (
                     request.bootstrap_sample_pending
                     and num_computed_tokens == request.num_prompt_tokens
@@ -1490,6 +1494,19 @@ class Scheduler(SchedulerInterface):
             "a full cold-compact cache hit is required",
             request.request_id, request.num_tokens, capacity,
         )
+        self._finish_kv_admission_error(request)
+        return True
+
+    def _finish_kv_admission_error(
+        self, request: Request, available_tokens: int | None = None
+    ) -> None:
+        if available_tokens is not None:
+            logger.warning(
+                "Rejecting decoder request %s before allocation: "
+                "available_kv_tokens=%d required_kv_tokens=%d preemptions=%d",
+                request.request_id, available_tokens, request.min_kv_prefix_tokens,
+                request.num_preemptions,
+            )
         self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
         pending = getattr(self, "_dsa_admission_errors", None)
         if pending is None:
@@ -1500,7 +1517,6 @@ class Scheduler(SchedulerInterface):
             finish_reason=request.get_finished_reason(),
             stop_reason=request.stop_reason,
         )))
-        return True
 
     @staticmethod
     def _drain_dsa_admission_errors(

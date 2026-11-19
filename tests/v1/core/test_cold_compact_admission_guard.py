@@ -2,6 +2,7 @@
 """Run the actual admission/output methods without model/device bootstrap."""
 import ast
 from collections import defaultdict
+from functools import lru_cache
 import enum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -41,7 +42,8 @@ def _runtime():
         def is_finished(value): return value >= 5
     scope.update(logger=Mock(), RequestStatus=Status,
                  remove_all=lambda values, removed: [v for v in values if v not in removed])
-    names = {'_reject_impossible_initial_dsa_request', '_drain_dsa_admission_errors',
+    names = {'_reject_impossible_initial_dsa_request', '_finish_kv_admission_error',
+             '_drain_dsa_admission_errors',
              '_update_after_schedule', 'has_finished_requests', 'finish_requests',
              '_update_requests_with_invalid_blocks', '_update_waiting_for_remote_kv',
              '_preempt_request'}
@@ -70,7 +72,7 @@ def _scheduler(capacity=100, length=1000):
     request = NS(request_id='long', num_tokens=length, num_prompt_tokens=length,
         num_preemptions=0, num_computed_tokens=0, dsa_compact_allocated=False,
         status=scope['RequestStatus'].WAITING, client_index=7,
-        bootstrap_sample_pending=False, bootstrap_final_hidden=None)
+        bootstrap_sample_pending=False, bootstrap_final_hidden=None, stop_reason=None)
     request.is_finished = lambda: scope['RequestStatus'].is_finished(request.status)
     request.get_finished_reason = lambda: scope['FinishReason'].ERROR
     obj.requests = {'long': request}
@@ -148,33 +150,62 @@ def test_dcp_compact_marker_retires_with_the_failed_or_preempted_table(preempt):
     assert output.dsa_dcp_compact_req_ids == set()
 
 
-@pytest.mark.parametrize('path,name', [(BASE, 'Scheduler'),
+@lru_cache
+def _waiting_lookup(path, name, end_method):
+    """Compile the scheduler's waiting loop through the admission decision."""
+    cls = _class(path, name)
+    schedule = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'schedule')
+
+    def initializes_external_count(node):
+        return (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == 'num_external_computed_tokens'
+        )
+
+    def calls(node):
+        return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == end_method for n in ast.walk(node))
+
+    body = next(
+        n.body for n in ast.walk(schedule)
+        if isinstance(n, ast.While) and any(map(initializes_external_count, n.body))
+    )
+    first = next(i for i, n in enumerate(body) if initializes_external_count(n))
+    last = next(i for i, n in enumerate(body[first:], first) if calls(n))
+    loop = ast.parse('for request in requests: request_id = request.request_id').body[0]
+    loop.body += body[first:last + 1] + ast.parse('admitted.append(request_id)').body
+    module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+    return compile(module, str(path), 'exec')
+
+
+def _run_waiting_lookup(obj, path, name, end_method):
+    scope = dict(self=obj, requests=list(obj.waiting), admitted=[],
+        request_queue=obj.waiting,
+        step_skipped_waiting=Queue(), skipped_waiting_requests=Queue(),
+        SERVING_PERF_ENABLED=False, bootstrap_only_step=False, bootstrap_sample_req_ids=[],
+        scheduled_req_id='', num_scheduled_tokens={}, logger=Mock())
+    exec(_waiting_lookup(path, name, end_method), scope)
+    return scope
+
+
+SCHEDULERS = [
+    (BASE, 'Scheduler'),
     (ASCEND / 'recompute_scheduler.py', 'RecomputeScheduler'),
-    (ASCEND / 'scheduler_dynamic_batch.py', 'SchedulerDynamicBatch')])
+    (ASCEND / 'scheduler_dynamic_batch.py', 'SchedulerDynamicBatch'),
+]
+
+
+@pytest.mark.parametrize('path,name', SCHEDULERS)
 @pytest.mark.parametrize('lookup', [None, 0, 50, 999])
 def test_actual_waiting_lookup_guards_miss_but_defers_unknown_and_admits_full_hit(path, name, lookup):
     obj, request, releases, _ = _scheduler()
     obj.connector = NS(get_num_new_matched_tokens=lambda *args: (lookup, lookup == 999),
                        supports_dsa_compact_external_load=True)
     obj.kv_cache_manager = NS(get_computed_blocks=lambda req: (None, 0))
-    cls = _class(path, name)
-    schedule = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'schedule')
-    body = next(n.body for n in ast.walk(schedule) if isinstance(n, (ast.For, ast.While))
-                and any(isinstance(s, ast.If) and isinstance(s.test, ast.Call)
-                        and isinstance(s.test.func, ast.Attribute)
-                        and s.test.func.attr == '_reject_impossible_initial_dsa_request' for s in n.body))
-    first = next(i for i, n in enumerate(body) if isinstance(n, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == 'num_external_computed_tokens' for t in n.targets))
-    last = next(i for i, n in enumerate(body) if isinstance(n, ast.If)
-                and isinstance(n.test, ast.Call) and isinstance(n.test.func, ast.Attribute)
-                and n.test.func.attr == '_reject_impossible_initial_dsa_request')
-    loop = ast.parse('for request in requests: pass').body[0]
-    loop.body = body[first:last + 1] + ast.parse('admitted.append(request.request_id)').body
-    scope = dict(self=obj, requests=[request], admitted=[], request_queue=obj.waiting,
-        step_skipped_waiting=Queue(), skipped_waiting_requests=Queue(),
-        SERVING_PERF_ENABLED=False, bootstrap_only_step=False, bootstrap_sample_req_ids=[],
-        scheduled_req_id='', num_scheduled_tokens={}, request_id='long', logger=Mock())
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(path), 'exec'), scope)
+    scope = _run_waiting_lookup(
+        obj, path, name, '_reject_impossible_initial_dsa_request'
+    )
     if lookup is None:
         assert not releases and not scope['admitted'] and not getattr(obj, '_dsa_admission_errors', None)
     elif lookup == 999:
@@ -182,6 +213,41 @@ def test_actual_waiting_lookup_guards_miss_but_defers_unknown_and_admits_full_hi
     else:
         assert releases == ['long'] and not scope['admitted'] and not obj.requests
         assert obj.has_finished_requests()
+
+
+@pytest.mark.parametrize('path,name', SCHEDULERS + [
+    (ASCEND.parent / 'patch/platform/patch_balance_schedule.py', 'BalanceScheduler')])
+@pytest.mark.parametrize('local,external,required,admit', [
+    (0, None, 999, None), (0, 0, 999, False), (0, 998, 999, False),
+    (0, 999, 999, True), (999, 0, 999, True), (600, 399, 999, True),
+    (0, 0, 0, True), (0, 800, 800, True), (0, 799, 800, False),
+])
+def test_receiver_short_prefix_is_per_request_before_allocation(
+    path, name, local, external, required, admit
+):
+    obj, request, releases, schema = _scheduler(capacity=None)
+    request.min_kv_prefix_tokens = required
+    peer = NS(**{**vars(request), 'request_id': 'peer', 'min_kv_prefix_tokens': 0})
+    obj.waiting.append(peer)
+    obj.connector = NS(get_num_new_matched_tokens=lambda req, _: (
+        (external if req is request else 0), False))
+    obj.kv_cache_manager = NS(
+        get_computed_blocks=lambda req: (None, local if req is request else 0)
+    )
+    scope = _run_waiting_lookup(obj, path, name, '_finish_kv_admission_error')
+    assert scope['admitted'] == (['long', 'peer'] if admit else ['peer'])
+    assert releases == (['long'] if admit is False else [])
+    step = NS(num_scheduled_tokens={})
+    obj._update_after_schedule(step)
+    outputs = defaultdict(list)
+    obj._drain_dsa_admission_errors(step, outputs)
+    if admit is False:
+        [error] = outputs[request.client_index]
+        assert error.request_id == 'long'
+        assert error.finish_reason == schema['FinishReason'].ERROR
+        assert error.new_token_ids == [] and error.stop_reason is None
+    else:
+        assert not outputs
 
 
 @pytest.mark.parametrize('change', [dict(num_preemptions=1), dict(num_computed_tokens=1),
@@ -272,12 +338,19 @@ def test_real_lmcache_initial_compact_predicate_requires_full_prefix(hit):
 
 
 @pytest.mark.parametrize('queued', [False, True])
-def test_actual_enginecore_empty_step_delivers_rejection_with_async_older_batch(queued):
+@pytest.mark.parametrize('lookup_miss', [False, True])
+def test_actual_enginecore_empty_step_delivers_rejection_with_async_older_batch(
+    queued, lookup_miss
+):
     from collections import deque
     from concurrent.futures import Future
     from contextlib import nullcontext
     from typing import cast
     obj, request, _, schema = _scheduler()
+    if lookup_miss:
+        request.min_kv_prefix_tokens = request.num_prompt_tokens - 1
+        obj.connector = NS(get_num_new_matched_tokens=lambda *_: (0, False))
+        obj.kv_cache_manager = NS(get_computed_blocks=lambda _: (None, 0))
     path = ROOT / 'vllm/v1/engine/core.py'
     methods = [n for n in _class(path, 'EngineCore').body if isinstance(n, ast.FunctionDef)
                and n.name in ('step', 'step_with_batch_queue')]
@@ -288,7 +361,15 @@ def test_actual_enginecore_empty_step_delivers_rejection_with_async_older_batch(
     older = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
     obj._update_after_schedule(older)
     def schedule():
-        assert obj._reject_impossible_initial_dsa_request(request, compact_external_load=False)
+        if lookup_miss:
+            result = _run_waiting_lookup(
+                obj, BASE, 'Scheduler', '_finish_kv_admission_error'
+            )
+            assert not result['admitted']
+        else:
+            assert obj._reject_impossible_initial_dsa_request(
+                request, compact_external_load=False
+            )
         result = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
         obj._update_after_schedule(result)
         return result
