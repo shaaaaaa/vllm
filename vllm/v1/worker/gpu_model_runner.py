@@ -3365,7 +3365,8 @@ class GPUModelRunner(
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
+        with record_function_or_nullcontext("decode_wait::input_staging"):
+            self.prepare_inputs_event.synchronize()
         try:
             yield
         finally:
@@ -4346,7 +4347,8 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sampled_count_event.synchronize()
+        with record_function_or_nullcontext("decode_wait::accepted_token_counts"):
+            sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def propose_draft_token_ids(

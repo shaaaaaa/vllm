@@ -121,6 +121,8 @@ class Request:
     # Independent lifetime fences, recorded only when the request finishes.
     kv_transfer_pending_recv: bool = False
     kv_transfer_pending_send: bool = False
+    # A receiver connector can require a minimum verified prefix at admission.
+    min_kv_prefix_tokens: int = 0
 
     # Final-hidden handoff state is intentionally lazy. Ordinary requests use
     # these immutable class defaults and do not grow their instance __dict__.

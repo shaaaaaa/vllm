@@ -17,6 +17,7 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
@@ -199,7 +200,8 @@ class RejectionSampler(nn.Module):
         accepted_logit_indices.clamp_(max=final_logits.shape[0] - 1)
         accepted_tokens = sampled_token_ids.clone().flatten()
         # we replace rejected token ids with 0 to avoid gather_logprobs error
-        accepted_tokens[accepted_tokens == PLACEHOLDER_TOKEN_ID] = 0
+        with record_function_or_nullcontext("sampling::logprobs_placeholder_fill"):
+            accepted_tokens.masked_fill_(accepted_tokens == PLACEHOLDER_TOKEN_ID, 0)
 
         # Compute logprobs for accepted tokens.
         accepted_logits = final_logits[accepted_logit_indices]

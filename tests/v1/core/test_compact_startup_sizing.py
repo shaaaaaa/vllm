@@ -67,7 +67,7 @@ def case(api, *, length=1000000, precision="mixed", marked=True, threshold=0):
     return config, groups, api.dsa_shared_block_layout(latent, indexer)
 
 
-def actual_manager(bundle_width):
+def actual_manager(bundle_width, dcp_size=1):
     path = ROOT / "vllm/v1/core/single_type_kv_cache_manager.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(
@@ -79,6 +79,7 @@ def actual_manager(bundle_width):
         "_blocks_per_bundle",
         "_round_up_to_bundle",
         "_round_down_to_bundle",
+        "_dcp_compact_block_offset",
         "_compact_required_indices",
     }
     module = ast.parse("from __future__ import annotations\nclass Manager: pass")
@@ -89,25 +90,27 @@ def actual_manager(bundle_width):
     exec(compile(module, str(path), "exec"), namespace)
     manager = namespace["Manager"]()
     manager.block_pool = NS(blocks_per_bundle=bundle_width)
-    manager.block_size = 128
+    manager.kv_cache_spec = NS(dsa_dcp_size=dcp_size if dcp_size > 1 else None)
+    manager.block_size = 128 * dcp_size
     manager.scratch_blocks = 32
     return manager
 
 
 @pytest.mark.parametrize("precision", ["bf16", "uniform", "mixed"])
+@pytest.mark.parametrize("dcp_size", [1, 4, 8])
 def test_envelope_matches_actual_initial_planner_for_every_shorter_prompt(
-    api, precision
+    api, precision, dcp_size
 ):
     ns = methods(api)
     _, _, layout = case(api, precision=precision)
-    manager = actual_manager(layout.latent_blocks_per_bundle)
+    manager = actual_manager(layout.latent_blocks_per_bundle, dcp_size)
     # Verify boundary spikes, short dense policy and monotonicity independently
     # against actual manager rows, not a copy of the new compact formula.
     threshold = 6000
     required = 0
     for tokens in range(1, 20001):
         if tokens <= threshold:
-            latent_blocks = (tokens + 127) // 128
+            latent_blocks = (tokens + 128 * dcp_size - 1) // (128 * dcp_size)
         else:
             latent_blocks = len(
                 manager._compact_required_indices(
@@ -129,15 +132,22 @@ def test_envelope_matches_actual_initial_planner_for_every_shorter_prompt(
                 indexer_block_size=128,
                 scratch_tokens=4096,
                 dense_tokens=threshold,
+                latent_dcp_size=dcp_size,
             )
             == required
         )
 
 
 @pytest.mark.parametrize("length", [1000000, 1048576])
-def test_one_million_budget_is_exact_and_allocation_override_still_guarded(api, length):
+@pytest.mark.parametrize("dcp_size", [1, 4, 8])
+def test_one_million_budget_is_exact_and_allocation_override_still_guarded(
+    api, length, dcp_size
+):
     ns = methods(api)
     config, groups, layout = case(api, length=length)
+    if dcp_size > 1:
+        groups[0].kv_cache_spec.dsa_dcp_size = dcp_size
+        groups[1].kv_cache_spec.dsa_dcp_size = 1
     needed = ns["_max_memory_usage_bytes_from_groups"](config, groups)
     charge = layout.allocation_bytes_per_bundle(79, 22)
     overhead = layout.allocation_overhead_bytes(79, 22)
@@ -150,9 +160,19 @@ def test_one_million_budget_is_exact_and_allocation_override_still_guarded(api, 
         indexer_block_size=128,
         scratch_tokens=4096,
         dense_tokens=0,
+        latent_dcp_size=dcp_size,
     )
     assert result.num_blocks == required
     assert needed == (required + 1) * charge + overhead
+    latent_span = 128 * dcp_size * layout.latent_blocks_per_bundle
+    indexer_span = 128 * layout.indexer_blocks_per_bundle
+    dense_limit = ns["dsa_dense_request_token_capacity"](result)
+    assert (dense_limit + latent_span - 1) // latent_span + (
+        dense_limit + indexer_span - 1
+    ) // indexer_span <= required
+    assert (dense_limit + latent_span) // latent_span + (
+        dense_limit + indexer_span
+    ) // indexer_span > required
     ns["_check_enough_kv_cache_memory"](needed, lambda: needed, length, lambda _: 0)
     with pytest.raises(ValueError, match="larger than the available"):
         ns["_check_enough_kv_cache_memory"](

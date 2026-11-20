@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import json
 import os
+import socket
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -209,6 +210,10 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
+        self._dsa_dcp = any(
+            (getattr(group.kv_cache_spec, "dsa_dcp_size", None) or 1) > 1
+            for group in kv_cache_config.kv_cache_groups
+        )
         self._dsa_dense_request_capacity = dsa_dense_request_token_capacity(
             kv_cache_config
         )
@@ -649,6 +654,14 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    self._log_request_transition(
+                        "preemption_trigger", preempted_req,
+                        cause="kv_allocation_failed",
+                        trigger_request_id=request.request_id,
+                        requested_tokens=num_new_tokens,
+                        lookahead_tokens=self.num_lookahead_tokens,
+                        next_preemption_count=preempted_req.num_preemptions + 1,
+                    )
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -795,11 +808,23 @@ class Scheduler(SchedulerInterface):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
-                        dsa_compact_external_load = load_kv_async and bool(
-                            getattr(
-                                self.connector,
-                                "supports_dsa_compact_external_load",
-                                False,
+                        compact_load_query = (
+                            getattr(self.connector, "is_dsa_cold_compact_load", None)
+                            if load_kv_async else None
+                        )
+                        request_compact_load = (
+                            compact_load_query(request.request_id)
+                            if callable(compact_load_query) else None
+                        )
+                        dsa_compact_external_load = load_kv_async and (
+                            bool(request_compact_load)
+                            if request_compact_load is not None
+                            else bool(
+                                getattr(
+                                    self.connector,
+                                    "supports_dsa_compact_external_load",
+                                    False,
+                                )
                             )
                         )
 
@@ -819,6 +844,10 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if num_computed_tokens < getattr(request, "min_kv_prefix_tokens", 0):
+                    self._finish_kv_admission_error(request, num_computed_tokens)
+                    continue
 
                 bootstrap_full_hit = (
                     request.bootstrap_sample_pending
@@ -907,6 +936,7 @@ class Scheduler(SchedulerInterface):
                     compact_external_load=dsa_compact_external_load or (
                         bootstrap_full_hit and num_external_computed_tokens > 0
                         and num_new_local_computed_tokens == 0
+                        and (not load_kv_async or request_compact_load is None)
                     ),
                 ):
                     continue
@@ -998,6 +1028,7 @@ class Scheduler(SchedulerInterface):
 
                 compact_external_load = dsa_compact_external_load or (
                     bootstrap_full_hit
+                    and (not load_kv_async or request_compact_load is None)
                     and (
                         request.dsa_compact_allocated
                         or (
@@ -1006,6 +1037,21 @@ class Scheduler(SchedulerInterface):
                         )
                     )
                 )
+                if load_kv_async:
+                    restore_extent_query = getattr(
+                        self.connector, "get_dsa_cold_load_num_tokens", None
+                    )
+                    if callable(restore_extent_query):
+                        # Restore storage may extend beyond the reusable prefix.
+                        # Reserving it must not schedule any model computation.
+                        restore_tokens = int(restore_extent_query(request.request_id))
+                        effective_lookahead_tokens = max(
+                            effective_lookahead_tokens,
+                            restore_tokens
+                            - num_new_local_computed_tokens
+                            - num_external_computed_tokens,
+                        )
+
                 if (
                     compact_external_load
                     and load_kv_async
@@ -1099,6 +1145,11 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    if request.num_preemptions:
+                        self._log_request_transition(
+                            "resume_load_started", request,
+                            external_tokens_this_admission=num_external_computed_tokens,
+                        )
                     continue
 
                 self.running.append(request)
@@ -1153,6 +1204,15 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if scheduled_resumed_reqs and scheduled_resumed_reqs[-1] is request:
+                    self._log_request_transition(
+                        "request_resumed", request,
+                        scheduled_tokens=num_new_tokens,
+                        scheduled_draft_tokens=len(
+                            scheduled_spec_decode_tokens.get(request_id, ())
+                        ),
+                        external_tokens_this_admission=num_external_computed_tokens,
+                    )
                 # Count the number of prefix cached tokens.
                 num_cached_tokens = min(num_computed_tokens, request.num_prompt_tokens)
                 if request.num_cached_tokens < 0:
@@ -1342,6 +1402,43 @@ class Scheduler(SchedulerInterface):
         )
         return scheduler_output
 
+    def _log_request_transition(self, event: str, request: Request, **fields) -> None:
+        """Rare lifecycle events, also when stats and PD_SERVING_PERF are off.
+
+        Keep this separate from per-step performance instrumentation. Read only
+        host metadata; never enumerate blocks, serialize tokens or inspect KV.
+        Ascend's recompute/async schedulers reuse this same correlation schema.
+        """
+        logger.info(
+            "[REQUEST_LIFECYCLE] %s",
+            json.dumps(
+                {
+                    "schema": 1,
+                    "event": event,
+                    "request_id": request.request_id,
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "wall_time_ns": time.time_ns(),
+                    "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+                    "preemption_count": request.num_preemptions,
+                    "status": request.status.name,
+                    "computed_tokens": request.num_computed_tokens,
+                    "prompt_tokens": request.num_prompt_tokens,
+                    "history_tokens": request.num_tokens,
+                    "output_tokens": request.num_output_tokens,
+                    "output_placeholders": request.num_output_placeholders,
+                    "external_computed_tokens": request.num_external_computed_tokens,
+                    "compact_allocated": request.dsa_compact_allocated,
+                    "checkpoint_proof_present": getattr(
+                        request, "kv_resume_checkpoint", None
+                    )
+                    is not None,
+                    **fields,
+                },
+                separators=(",", ":"),
+            ),
+        )
+
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -1351,7 +1448,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        previous_computed_tokens = request.num_computed_tokens
         self.kv_cache_manager.free(request)
+        if self._dsa_dcp:
+            request.dsa_compact_allocated = False
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1363,6 +1463,10 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        self._log_request_transition(
+            "request_preempted", request,
+            previous_computed_tokens=previous_computed_tokens,
+        )
 
     def _reject_kv_admission_error(self, request: Request) -> bool:
         """Finish a permanently oversized connector request without a worker run."""
@@ -1371,16 +1475,7 @@ class Scheduler(SchedulerInterface):
             return False
         request.stop_reason = reason
         logger.warning("Rejecting KV admission for %s: %s", request.request_id, reason)
-        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
-        pending = getattr(self, "_dsa_admission_errors", None)
-        if pending is None:
-            pending = self._dsa_admission_errors = []
-        pending.append((request.client_index, EngineCoreOutput(
-            request_id=request.request_id,
-            new_token_ids=[],
-            finish_reason=request.get_finished_reason(),
-            stop_reason=reason,
-        )))
+        self._finish_kv_admission_error(request)
         return True
 
     def _reject_impossible_initial_dsa_request(
@@ -1411,6 +1506,19 @@ class Scheduler(SchedulerInterface):
             "a full cold-compact cache hit is required",
             request.request_id, request.num_tokens, capacity,
         )
+        self._finish_kv_admission_error(request)
+        return True
+
+    def _finish_kv_admission_error(
+        self, request: Request, available_tokens: int | None = None
+    ) -> None:
+        if available_tokens is not None:
+            logger.warning(
+                "Rejecting decoder request %s before allocation: "
+                "available_kv_tokens=%d required_kv_tokens=%d preemptions=%d",
+                request.request_id, available_tokens, request.min_kv_prefix_tokens,
+                request.num_preemptions,
+            )
         self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
         pending = getattr(self, "_dsa_admission_errors", None)
         if pending is None:
@@ -1421,7 +1529,6 @@ class Scheduler(SchedulerInterface):
             finish_reason=request.get_finished_reason(),
             stop_reason=request.stop_reason,
         )))
-        return True
 
     @staticmethod
     def _drain_dsa_admission_errors(
@@ -1435,6 +1542,12 @@ class Scheduler(SchedulerInterface):
                 outputs[client_index].append(output)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        if self._dsa_dcp:
+            scheduler_output.dsa_dcp_compact_req_ids = {
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if self.requests[req_id].dsa_compact_allocated
+            }
         errors = self.__dict__.pop("_dsa_admission_errors", None)
         if errors:
             # Bind errors to this exact step so an older async output cannot
@@ -2659,6 +2772,10 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
+                self._log_request_transition(
+                    "preemption_trigger", request, cause="prefix_cache_reset",
+                    next_preemption_count=request.num_preemptions + 1,
+                )
                 self._preempt_request(request, timestamp)
                 # NOTE(zhuohan): For async scheduling, we need to discard the latest
                 # output token on the fly to avoid a redundant repetitive output token.
@@ -2853,6 +2970,9 @@ class Scheduler(SchedulerInterface):
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 self.kv_cache_manager.free(request)
+                if self._dsa_dcp:
+                    # The next allocation must carry its own table format.
+                    request.dsa_compact_allocated = False
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
@@ -2899,6 +3019,10 @@ class Scheduler(SchedulerInterface):
                 )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        if request.num_preemptions:
+            self._log_request_transition(
+                "resume_load_completed", request, success=not failed_recv,
+            )
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
