@@ -34,7 +34,7 @@ def utilities(api, prefill):
         dsa_shared_pool_enabled=lambda: True,
         layerwise_prefill_p_node_enabled=lambda: prefill,
         dsa_kv_residency_mode=lambda: "prefill_child" if prefill else "legacy",
-        LAYERWISE_PREFILL_BANK_COUNT=2,
+        layerwise_prefill_bank_count=api.layerwise_prefill_bank_count,
         cdiv=lambda a, b: (a + b - 1) // b,
         KVCacheTensor=NS,
         KVCacheConfig=NS,
@@ -137,6 +137,31 @@ def test_decode_paired_capacity_reconciles_without_prefill_geometry(api):
     for result in results:
         assert result.num_blocks == 1 and result.dsa_paired_bank_slots == 2
         assert sum(t.size for t in result.kv_cache_tensors) == 2 * payload
+
+
+@pytest.mark.parametrize("banks", [1, 3, 8])
+@pytest.mark.parametrize("c8", [False, True])
+def test_rotation_depth_changes_admission_without_expanding_fixed_pool(
+    api,
+    monkeypatch,
+    banks,
+    c8,
+):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", str(banks))
+    ns = utilities(api, True)
+    config, groups, layout = setup_case(api, c8)
+    payload = layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle
+    budget = 65 * payload + layout.backing_alignment_bytes
+    result = ns["get_kv_cache_config_from_groups"](config, groups, budget)
+    assert result.kv_cache_tensors[0].size == 65 * payload
+    assert ns["get_max_concurrency_for_kv_cache_config"](config, result) == 64 / (
+        banks * 2
+    )
+    slots = ((banks * 2 + 3) // 4) * 4 + 1
+    assert ns["_max_memory_usage_bytes_from_groups"](config, groups) == (
+        slots * payload + layout.backing_alignment_bytes
+    )
 
 
 def test_real_child_pool_two_bank_address_proof_and_rollback(api):

@@ -74,8 +74,28 @@ class DSABlockAllocationMode(str, Enum):
     PREFILL_CHILD = "prefill_child"
 
 
+# Preserve the legacy fallback when the P-node feature is disabled.
 LAYERWISE_PREFILL_BANK_COUNT = 2
 LAYERWISE_PREFILL_BUNDLE_MULTIPLIER = 2
+
+
+def layerwise_prefill_bank_count() -> int:
+    """Return the P-node rotation depth, ignoring the setting on other nodes.
+
+    Configure VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS before startup.
+    The P-node default is four; valid values are positive integers.
+    """
+    if layerwise_prefill_bundle_multiplier() == 1:
+        return LAYERWISE_PREFILL_BANK_COUNT
+    name = "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"
+    raw = os.environ.get(name, "4")
+    try:
+        count = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
+    if count <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return count
 
 
 def layerwise_prefill_bundle_multiplier() -> int:
@@ -547,8 +567,10 @@ class PrefillLayerBundlePool:
         parent_allocator: DSASharedBundleAllocator,
         num_physical_slots: int,
         *,
-        bank_count: int = LAYERWISE_PREFILL_BANK_COUNT,
+        bank_count: int | None = None,
     ) -> None:
+        if bank_count is None:
+            bank_count = layerwise_prefill_bank_count()
         if num_physical_slots <= 0:
             raise ValueError("num_physical_slots must be positive")
         if bank_count <= 0:
@@ -749,15 +771,17 @@ def build_prefill_layer_refs(
     indexer_names: Sequence[str],
     *,
     execution_order: Sequence[str] | None = None,
-    bank_count: int = LAYERWISE_PREFILL_BANK_COUNT,
+    bank_count: int | None = None,
 ) -> Mapping[str, PrefillLayerRef]:
     """Build the immutable per-layer bank mapping for layerwise prefill.
 
     The indexer layers must be exact siblings of latent layers (sharing the
     ``.self_attn`` module prefix).  Both groups get their own ordinal counter
     so an unequal shared-indexer topology (79 LATENT / 22 INDEXER) rotates the
-    two banks independently.
+    configured banks independently.
     """
+    if bank_count is None:
+        bank_count = layerwise_prefill_bank_count()
     if bank_count <= 0:
         raise ValueError("bank_count must be positive")
     if len(set(latent_names)) != len(latent_names):
