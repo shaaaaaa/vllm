@@ -33,9 +33,12 @@ class UvicornAccessLogFilter(logging.Filter):
                        Example: ["/health", "/metrics"]
     """
 
-    def __init__(self, excluded_paths: list[str] | None = None):
+    def __init__(
+        self, excluded_paths: list[str] | None = None, successful_only: bool = False
+    ):
         super().__init__()
         self.excluded_paths = set(excluded_paths or [])
+        self.successful_only = successful_only
 
     def filter(self, record: logging.LogRecord) -> bool:
         """
@@ -58,6 +61,13 @@ class UvicornAccessLogFilter(logging.Filter):
         # See uvicorn's access logging implementation for details.
         log_args = record.args
         if isinstance(log_args, tuple) and len(log_args) >= 3:
+            if self.successful_only and (
+                len(log_args) < 5
+                or log_args[1] not in ("GET", "HEAD")
+                or not isinstance(log_args[4], int)
+                or not 200 <= log_args[4] < 300
+            ):
+                return True
             path_with_query = log_args[2]
             # Get path component without query string.
             if isinstance(path_with_query, str):
@@ -71,6 +81,8 @@ class UvicornAccessLogFilter(logging.Filter):
 def create_uvicorn_log_config(
     excluded_paths: list[str] | None = None,
     log_level: str = "info",
+    *,
+    successful_only: bool = False,
 ) -> dict:
     """
     Create a uvicorn logging configuration with access log filtering.
@@ -97,6 +109,7 @@ def create_uvicorn_log_config(
             "access_log_filter": {
                 "()": UvicornAccessLogFilter,
                 "excluded_paths": excluded_paths or [],
+                "successful_only": successful_only,
             },
         },
         "formatters": {

@@ -41,11 +41,13 @@ from vllm.v1.kv_cache_interface import (
     layerwise_prefill_p_node_enabled,
 )
 from vllm.v1.request import Request
+from vllm.v1.serving_perf import SERVING_PERF_DETAILED, SERVING_PERF_ENABLED
 
 logger = init_logger(__name__)
 
 # Throttle for the [KVSTARVE] admission-failure diagnostic (seconds).
-_last_starve_log = [0.0]
+_STARVE_INTERVAL = 1.0 if SERVING_PERF_DETAILED else 60.0
+_last_starve_log = [-float("inf")]
 
 
 def _get_dsa_pool_log_interval() -> float:
@@ -347,8 +349,12 @@ class KVCacheCoordinator(ABC):
                 for manager in self.single_type_managers
             ]
             ok = all(needed <= free for needed, free in zip(per_group, frees))
-            if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
-                # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
+            if (
+                not ok
+                and SERVING_PERF_ENABLED
+                and (time.monotonic() - _last_starve_log[0]) > _STARVE_INTERVAL
+            ):
+                # [KVSTARVE] rate-limited snapshot of which group blocked an
                 # admission, with each group's demand vs free blocks. The group(s)
                 # marked <<BLOCKED are the binding constraint for decode batch.
                 _last_starve_log[0] = time.monotonic()
@@ -380,7 +386,11 @@ class KVCacheCoordinator(ABC):
                     self.dsa_shared_allocator.free_bundle_count,
                     per_group,
                 )
-            if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
+            if (
+                not ok
+                and SERVING_PERF_ENABLED
+                and (time.monotonic() - _last_starve_log[0]) > _STARVE_INTERVAL
+            ):
                 _last_starve_log[0] = time.monotonic()
                 logger.info(
                     "[KVSTARVE] req=%s not admitted | need_bundles=%d free=%d "
@@ -402,7 +412,7 @@ class KVCacheCoordinator(ABC):
     ) -> None:
         if not self.use_dsa_shared_block_pool:
             return
-        if self._dsa_pool_log_interval <= 0:
+        if not SERVING_PERF_DETAILED or self._dsa_pool_log_interval <= 0:
             return
 
         now = time.monotonic()
@@ -573,7 +583,7 @@ class KVCacheCoordinator(ABC):
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        if dsa_compact_external_load:
+        if dsa_compact_external_load and SERVING_PERF_DETAILED:
             logger.info(
                 "[DSA_COMPACT_GROUPS_AFTER_EXTERNAL] req=%s "
                 "local_tokens=%d external_tokens=%d groups=%s",
@@ -686,7 +696,7 @@ class KVCacheCoordinator(ABC):
                     del req_blocks[-len(tail_blocks) :]
                     manager.block_pool.free_blocks(reversed(tail_blocks))
                 raise
-        if dsa_compact_external_load:
+        if dsa_compact_external_load and SERVING_PERF_DETAILED:
             logger.info(
                 "[DSA_COMPACT_GROUPS_AFTER_SLOTS] req=%s num_tokens=%d "
                 "main_model_tokens=%d groups=%s",

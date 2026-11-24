@@ -183,6 +183,7 @@ def _run_waiting_lookup(obj, path, name, end_method):
     scope = dict(self=obj, requests=list(obj.waiting), admitted=[],
         request_queue=obj.waiting,
         step_skipped_waiting=Queue(), skipped_waiting_requests=Queue(),
+        SERVING_PERF_DETAILED=False,
         SERVING_PERF_ENABLED=False, bootstrap_only_step=False, bootstrap_sample_req_ids=[],
         scheduled_req_id='', num_scheduled_tokens={}, logger=Mock())
     exec(_waiting_lookup(path, name, end_method), scope)

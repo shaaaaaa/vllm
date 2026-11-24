@@ -89,7 +89,7 @@ def test_completed_rpc_is_not_failed_by_previous_heartbeat_deadline(
     from dp_guardian_probe import client
 
     parent = client.ExecutorGuard.__new__(client.ExecutorGuard)
-    parent.operation, parent.pending = 0, {}
+    parent.operation, parent.pending, parent.pending_rpc = 0, {}, {}
     now = time.monotonic()
     operation = parent.begin(now + 0.02)
     guardian.local_message(
@@ -359,3 +359,41 @@ def test_bootstrap_common_decision_and_serializable_descriptor(
             assert result is None
     assert factory.call_count == int(case == "eligible")
     vote.assert_called_once()
+
+
+def test_guardian_failure_context_identifies_oldest_unfinished_rpc(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from dp_guardian_probe import client
+
+    parent = client.ExecutorGuard.__new__(client.ExecutorGuard)
+    parent.operation, parent.pending, parent.pending_rpc = 0, {}, {}
+    parent.config = {"lease": 30}
+    parent.last_guardian_update = time.monotonic() - 30
+    first = parent.begin(time.monotonic() + 60, "execute_dummy_batch")
+    second = parent.begin(time.monotonic() + 60, "sample_tokens")
+    assert "oldest_rpc=execute_dummy_batch" in parent.failure_context()
+    parent.end(first)
+    assert "oldest_rpc=sample_tokens" in parent.failure_context()
+    parent.end(second)
+    assert "pending_rpcs=0 oldest_rpc=none" in parent.failure_context()
+
+
+def test_pending_rpc_reports_oldest_active_call_without_finishing_it(monkeypatch, caplog):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from dp_guardian_probe import client
+
+    parent = client.ExecutorGuard.__new__(client.ExecutorGuard)
+    parent.config = {"rank": 2}
+    parent.pending_rpc = {3: ("execute_model", 1.0), 4: ("sample_tokens", 2.0)}
+    parent._last_rpc_notice = float("-inf")
+    parent.phase = client.Phase.BOOT
+    parent._report_pending_rpc(20)
+    parent.phase = client.Phase.ACTIVE
+    for now in (10, 11, 20, 70, 71):
+        parent._report_pending_rpc(now)
+    assert len(caplog.records) == 2
+    assert all("dp=2 operation=3 method=execute_model" in r.message for r in caplog.records)
+    assert list(parent.pending_rpc) == [3, 4]
+    parent.pending_rpc = None
+    parent._report_pending_rpc(200)
+    assert len(caplog.records) == 2

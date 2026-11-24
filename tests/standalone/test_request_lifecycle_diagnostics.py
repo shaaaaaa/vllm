@@ -25,7 +25,7 @@ class Status(IntEnum):
 
 @pytest.fixture
 def subject(monkeypatch, caplog):
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
     log = logging.getLogger("test.lifecycle")
     caplog.set_level(logging.INFO, logger=log.name)
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -44,7 +44,8 @@ def subject(monkeypatch, caplog):
         time=time,
         logger=log,
         RequestStatus=Status,
-        SERVING_PERF_ENABLED=False,
+        SERVING_PERF_ENABLED=True,
+        SERVING_PERF_DETAILED=False,
     )
     module = ast.parse("from __future__ import annotations")
     names = (
@@ -86,7 +87,7 @@ def subject(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("dcp", [False, True])
-def test_preemption_records_previous_frontier_and_generation_at_perf_zero(subject, dcp):
+def test_preemption_records_previous_frontier_and_generation_in_production(subject, dcp):
     obj, req, records, _ = subject
     obj._dsa_dcp = dcp
     req.dsa_compact_allocated = True
@@ -98,6 +99,14 @@ def test_preemption_records_previous_frontier_and_generation_at_perf_zero(subjec
     assert event["dp_rank"] == 2 and event["wall_time_ns"] > 0
     assert req.spec_token_ids == []
     assert event["compact_allocated"] is (not dcp)
+
+
+def test_quiet_preemption_preserves_state_without_logging(subject, monkeypatch):
+    obj, req, records, _ = subject
+    monkeypatch.setitem(obj._log_request_transition.__globals__, "SERVING_PERF_ENABLED", False)
+    obj._preempt_request(req, 0.0)
+    assert req.status == Status.PREEMPTED and req.num_preemptions == 1
+    assert records() == []
 
 
 def test_invalid_preemption_has_no_success_log(subject):

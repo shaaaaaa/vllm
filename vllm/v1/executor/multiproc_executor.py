@@ -59,6 +59,7 @@ from vllm.utils.system_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -319,8 +320,9 @@ class MultiprocExecutor(Executor):
         guardian = getattr(self, "dp_guardian", None)
         if guardian is not None:
             logger.error(
-                "[SFA independent DP] epoch failed: %s",
+                "[SFA independent DP] epoch failed: %s%s",
                 guardian.fatal or guardian.reason,
+                " " + guardian.failure_context() if SERVING_PERF_ENABLED else "",
             )
         try:
             self.shutdown()
@@ -460,7 +462,11 @@ class MultiprocExecutor(Executor):
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
         guardian = self.dp_guardian
-        operation = guardian.begin(deadline) if guardian is not None else None
+        operation = (
+            guardian.begin(deadline, send_method if isinstance(send_method, str) else "callable")
+            if guardian is not None
+            else None
+        )
         try:
             self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
         except BaseException:

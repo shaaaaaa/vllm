@@ -73,6 +73,7 @@ def schedule_allocation(length=81665, **overrides):
         num_new_tokens=0,
         new_computed_blocks=None,
         num_encoder_tokens=0,
+        SERVING_PERF_DETAILED=False,
         SERVING_PERF_ENABLED=False,
     )
     ns.update(overrides)
@@ -218,7 +219,7 @@ def test_boundary_compact_bundle_cost_and_exact_capacity(scratch_rows, free):
     module.body.append(method)
     import time
 
-    ns = dict(time=time, _last_starve_log=[time.monotonic()], logger=Mock())
+    ns = dict(time=time, _last_starve_log=[time.monotonic()], logger=Mock(), SERVING_PERF_ENABLED=False)
     exec(compile(module, str(path), "exec"), ns)
     coordinator = NS(
         get_num_blocks_to_allocate_per_group=lambda *args: [len(latent), index_blocks],
