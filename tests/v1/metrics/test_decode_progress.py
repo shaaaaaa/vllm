@@ -98,31 +98,55 @@ def test_pressure_is_best_effort(monkeypatch):
     assert decode_progress._host_pressure() == "unavailable"
 
 
-@pytest.mark.parametrize("mode", [None, "0", "1", "detail"])
-def test_default_logger_registration_per_engine(monkeypatch, mode):
+@pytest.mark.parametrize("aggregate", [False, True])
+@pytest.mark.parametrize("progress_enabled", [False, True])
+def test_native_throughput_with_optional_progress(
+    monkeypatch, aggregate, progress_enabled
+):
     from vllm.v1.metrics import loggers
+    from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
-    monkeypatch.setattr(loggers, "SERVING_PERF_CONFIGURED", mode is not None)
-    monkeypatch.setattr(loggers, "SERVING_PERF_ENABLED", mode in ("1", "detail"))
-    monkeypatch.setattr(loggers, "SERVING_PERF_DETAILED", mode == "detail")
+    monkeypatch.setattr(loggers, "SERVING_PERF_ENABLED", progress_enabled)
     monkeypatch.setattr(loggers.PrometheusStatLogger, "__init__", lambda self, *a: None)
+    monkeypatch.setattr(loggers.PrometheusStatLogger, "record", lambda *a, **kw: None)
+    clock = [0.0]
+    lines = []
+    monkeypatch.setattr(loggers, "time", NS(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(
+        loggers.logger, "info", lambda fmt, *args: lines.append(fmt % args)
+    )
     config = NS(
         model_config=NS(runner_type="generate"),
         kv_transfer_config=None,
-        observability_config=NS(cudagraph_metrics=False),
+        observability_config=NS(cudagraph_metrics=False, enable_mfu_metrics=False),
     )
-    manager = loggers.StatLoggerManager(config, [0, 3], aggregate_engine_logging=True)
+    manager = loggers.StatLoggerManager(
+        config, [0, 3], aggregate_engine_logging=aggregate
+    )
     actual = manager.stat_loggers
     assert isinstance(actual[-1], loggers.PrometheusStatLogger)
-    assert len(actual) == {None: 2, "0": 1, "1": 2, "detail": 3}[mode]
-    if mode is None:
+    assert len(actual) == (3 if progress_enabled else 2)
+    if aggregate:
         assert isinstance(actual[0], loggers.AggregatedLoggingStatLogger)
-    if mode in ("1", "detail"):
+    else:
+        assert isinstance(
+            actual[0].per_engine_stat_loggers[3], loggers.LoggingStatLogger
+        )
+    if progress_enabled:
         assert [
-            s.progress.engine_index for s in actual[0].per_engine_stat_loggers.values()
+            s.progress.engine_index for s in actual[1].per_engine_stat_loggers.values()
         ] == [0, 3]
-    if mode == "detail":
-        assert isinstance(actual[1], loggers.AggregatedLoggingStatLogger)
+
+    stats = IterationStats()
+    stats.prompt_token_stats.computed = 12
+    stats.num_generation_tokens = 6
+    clock[0] = 2.0
+    manager.record(SchedulerStats(num_running_reqs=1), stats, engine_idx=3)
+    manager.log()
+    prefix = "2 Engines Aggregated" if aggregate else "Engine 003"
+    assert len(lines) == 1
+    assert lines[0].startswith(f"{prefix}: Avg prompt throughput: 6.0 tokens/s")
+    assert "Avg generation throughput: 3.0 tokens/s" in lines[0]
 
 
 def test_prefill_first_tokens_do_not_report_mixed_decode_or_recovery(monitor):
@@ -138,19 +162,16 @@ def test_prefill_first_tokens_do_not_report_mixed_decode_or_recovery(monitor):
     assert "state=progress reason=processing_prompt" in lines[-1]
 
 
-@pytest.mark.parametrize("level", ["1", "detail"])
 @pytest.mark.parametrize(
     ("runner_type", "prefill_node"), [("generate", "true"), ("pooling", "false")]
 )
 def test_decode_monitor_only_on_decode_workloads(
-    monkeypatch, level, runner_type, prefill_node
+    monkeypatch, runner_type, prefill_node
 ):
     from vllm.v1.metrics import loggers
 
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", prefill_node)
-    monkeypatch.setattr(loggers, "SERVING_PERF_CONFIGURED", True)
     monkeypatch.setattr(loggers, "SERVING_PERF_ENABLED", True)
-    monkeypatch.setattr(loggers, "SERVING_PERF_DETAILED", level == "detail")
     monkeypatch.setattr(loggers.PrometheusStatLogger, "__init__", lambda self, *a: None)
     monkeypatch.setattr(
         loggers.AggregatedLoggingStatLogger, "__init__", lambda self, **k: None
@@ -162,5 +183,7 @@ def test_decode_monitor_only_on_decode_workloads(
     actual = loggers.StatLoggerManager(
         config, [0, 1], aggregate_engine_logging=True
     ).stat_loggers
-    expected = [loggers.AggregatedLoggingStatLogger] if level == "detail" else []
-    assert list(map(type, actual)) == [*expected, loggers.PrometheusStatLogger]
+    assert list(map(type, actual)) == [
+        loggers.AggregatedLoggingStatLogger,
+        loggers.PrometheusStatLogger,
+    ]

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup gate and propagation contract for PD serving diagnostics."""
 
+import os
 import runpy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +52,25 @@ def test_old_perf_variable_does_not_enable_timing(monkeypatch):
     assert namespace["SERVING_PERF_ENABLED"] is False
 
 
+@pytest.mark.parametrize("mode", ["0", "1"])
+def test_pd_mode_preserves_server_access_log_defaults(mode):
+    # The server reads the environment at import time in a fresh process.
+    script = """
+from argparse import Namespace
+from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
+
+args = Namespace(log_config_file=None, disable_access_log_for_endpoints=None, uvicorn_log_level="info")
+assert get_uvicorn_log_config(args) is None
+args.disable_access_log_for_endpoints = "/health"
+assert get_uvicorn_log_config(args)["filters"]["access_log_filter"]["excluded_paths"] == ["/health"]
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "PD_SERVING_PERF": mode},
+        check=True,
+    )
+
+
 @pytest.mark.parametrize(
     "mode,native,expected",
     [
@@ -61,8 +83,6 @@ def test_old_perf_variable_does_not_enable_timing(monkeypatch):
     ],
 )
 def test_native_log_default_precedes_library_init(monkeypatch, mode, native, expected):
-    import os
-
     for key, value in (("PD_SERVING_PERF", mode), ("MC_LOG_LEVEL", native)):
         if value is None:
             monkeypatch.delenv(key, raising=False)
