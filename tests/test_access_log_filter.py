@@ -195,6 +195,25 @@ class TestUvicornAccessLogFilter:
             )
             assert filter.filter(record) is False
 
+    def test_success_only_preserves_probe_failure_and_other_methods(self):
+        probe_filter = UvicornAccessLogFilter(["/metrics"], successful_only=True)
+        for method, path, code, visible in (
+            ("GET", "/metrics?source=lb", 200, False),
+            ("GET", "/metrics", 503, True),
+            ("POST", "/metrics", 200, True),
+            ("GET", "/v1/models", 200, True),
+        ):
+            record = logging.LogRecord(
+                "uvicorn.access",
+                logging.INFO,
+                "",
+                0,
+                "",
+                ("client", method, path, "1.1", code),
+                None,
+            )
+            assert probe_filter.filter(record) is visible
+
 
 class TestCreateUvicornLogConfig:
     """Test cases for create_uvicorn_log_config function."""

@@ -89,7 +89,7 @@ def test_completed_rpc_is_not_failed_by_previous_heartbeat_deadline(
     from dp_guardian_probe import client
 
     parent = client.ExecutorGuard.__new__(client.ExecutorGuard)
-    parent.operation, parent.pending = 0, {}
+    parent.operation, parent.pending, parent.pending_rpc = 0, {}, {}
     now = time.monotonic()
     operation = parent.begin(now + 0.02)
     guardian.local_message(
@@ -359,3 +359,20 @@ def test_bootstrap_common_decision_and_serializable_descriptor(
             assert result is None
     assert factory.call_count == int(case == "eligible")
     vote.assert_called_once()
+
+
+def test_guardian_failure_context_identifies_oldest_unfinished_rpc(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    from dp_guardian_probe import client
+
+    parent = client.ExecutorGuard.__new__(client.ExecutorGuard)
+    parent.operation, parent.pending, parent.pending_rpc = 0, {}, {}
+    parent.config = {"lease": 30}
+    parent.last_guardian_update = time.monotonic() - 30
+    first = parent.begin(time.monotonic() + 60, "execute_dummy_batch")
+    second = parent.begin(time.monotonic() + 60, "sample_tokens")
+    assert "oldest_rpc=execute_dummy_batch" in parent.failure_context()
+    parent.end(first)
+    assert "oldest_rpc=sample_tokens" in parent.failure_context()
+    parent.end(second)
+    assert "pending_rpcs=0 oldest_rpc=none" in parent.failure_context()

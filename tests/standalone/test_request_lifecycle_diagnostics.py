@@ -25,7 +25,7 @@ class Status(IntEnum):
 
 @pytest.fixture
 def subject(monkeypatch, caplog):
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
     log = logging.getLogger("test.lifecycle")
     caplog.set_level(logging.INFO, logger=log.name)
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -44,7 +44,8 @@ def subject(monkeypatch, caplog):
         time=time,
         logger=log,
         RequestStatus=Status,
-        SERVING_PERF_ENABLED=False,
+        SERVING_PERF_ENABLED=True,
+        SERVING_PERF_DETAILED=False,
     )
     module = ast.parse("from __future__ import annotations")
     names = (

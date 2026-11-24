@@ -134,8 +134,10 @@ def start_dp_guardian(bootstrap: dict[str, Any]) -> "ExecutorGuard":
     """Launch before memory profiling; exchange addresses only during startup."""
     import torch.distributed as dist
 
+    from vllm.v1.serving_perf import SERVING_PERF_ENABLED
+
     config = dict(bootstrap, parent_pid=os.getpid(), local_key=os.urandom(32).hex())
-    guard = ExecutorGuard(config)
+    guard = ExecutorGuard(config, track_rpc=SERVING_PERF_ENABLED)
     try:
         store = dist.TCPStore(
             *bootstrap["store"],
@@ -275,13 +277,17 @@ class WorkerGuard:
 class ExecutorGuard:
     """Parent-owned supervisor with fixed-rate, bounded control traffic."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], *, track_rpc: bool = False):
         self.config = config
         self.key, self.epoch = bytes.fromhex(config["local_key"]), config["epoch"]
         self.phase, self.reason = Phase.BOOT, ""
         self.connected = False
         self.commands: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
         self.pending: dict[int, float] = {}
+        self.pending_rpc: dict[int, tuple[str, float]] | None = (
+            {} if track_rpc else None
+        )
+        self.last_guardian_update: float | None = None
         self.sequence = 0
         self.operation = 0
         self.condition = threading.Condition()
@@ -432,14 +438,35 @@ class ExecutorGuard:
             )
         return True
 
-    def begin(self, deadline: float) -> int:
+    def begin(self, deadline: float, method: str = "dp_coordination") -> int:
         """Track the existing RPC deadline without sending a control message."""
         self.operation += 1
         self.pending[self.operation] = deadline
+        if self.pending_rpc is not None:
+            self.pending_rpc[self.operation] = (method, time.monotonic())
         return self.operation
 
     def end(self, operation: int) -> None:
         self.pending.pop(operation, None)
+        if self.pending_rpc is not None:
+            self.pending_rpc.pop(operation, None)
+
+    def failure_context(self) -> str:
+        """Describe outstanding work without touching futures or making another RPC."""
+        now = time.monotonic()
+        pending = self.pending_rpc.copy() if self.pending_rpc else {}
+        method, started = min(
+            pending.values(), key=lambda item: item[1], default=("none", now)
+        )
+        age = (
+            None
+            if self.last_guardian_update is None
+            else round(now - self.last_guardian_update, 2)
+        )
+        return (
+            f"lease_s={self.config['lease']} last_guardian_update_age_s={age} "
+            f"pending_rpcs={len(pending)} oldest_rpc={method} oldest_rpc_age_s={now - started:.2f}"
+        )
 
     def fail(self, reason: str) -> None:
         if not self.fatal:
@@ -506,6 +533,7 @@ class ExecutorGuard:
                         ):
                             continue
                         last_sequence, seen = seq, time.monotonic()
+                        self.last_guardian_update = seen
                         with self.condition:
                             previous = self.phase
                             self.phase = Phase(message["phase"])

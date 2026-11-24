@@ -4,6 +4,13 @@
 import importlib.util
 import os
 
+# Mooncake initializes its native logger before Python log filters can see it.
+# Honor an operator-supplied native level, including on independent workers.
+if "PD_SERVING_PERF" in os.environ and os.environ[
+    "PD_SERVING_PERF"
+].strip().lower() not in ("detail", "device"):
+    os.environ.setdefault("MC_LOG_LEVEL", "WARNING")
+
 
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().

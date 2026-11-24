@@ -37,7 +37,7 @@ def code(monkeypatch):
         enum=enum,
         time=time,
         dataclass=dataclass,
-        SERVING_PERF_ENABLED=False,
+        SERVING_PERF_DETAILED=False,
         StructuredOutputRequest=SimpleNamespace(from_sampling_params=lambda _: None),
         ConstantList=tuple,
         length_from_prompt_token_ids_or_embeds=lambda tokens, embeds: len(tokens),

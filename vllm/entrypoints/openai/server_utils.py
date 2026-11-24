@@ -31,6 +31,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.serving_perf import SERVING_PERF_CONFIGURED, SERVING_PERF_DETAILED
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
 
@@ -135,7 +136,8 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
     1. If log_config_file is specified, use it
     2. If disable_access_log_for_endpoints is specified, create a config with
        the access log filter
-    3. Otherwise, return None (use uvicorn defaults)
+    3. In explicit quiet/production PD mode, filter healthy monitoring requests.
+    4. Otherwise use the uvicorn defaults.
     """
     # First, try to load from file if specified
     log_config = load_log_config(args.log_config_file)
@@ -157,6 +159,14 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
             log_level=args.uvicorn_log_level,
         )
 
+    if SERVING_PERF_CONFIGURED and not SERVING_PERF_DETAILED:
+        from vllm.logging_utils import create_uvicorn_log_config
+
+        return create_uvicorn_log_config(
+            excluded_paths=["/health", "/metrics"],
+            log_level=args.uvicorn_log_level,
+            successful_only=True,
+        )
     return None
 
 

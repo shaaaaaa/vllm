@@ -19,6 +19,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
+from vllm.v1.kv_cache_interface import layerwise_prefill_p_node_enabled
+from vllm.v1.metrics.decode_progress import DecodeProgress
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
@@ -27,6 +29,11 @@ from vllm.v1.metrics.stats import (
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
+)
+from vllm.v1.serving_perf import (
+    SERVING_PERF_CONFIGURED,
+    SERVING_PERF_DETAILED,
+    SERVING_PERF_ENABLED,
 )
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
@@ -90,6 +97,28 @@ class AggregateStatLoggerBase(StatLoggerBase):
 
     @abstractmethod
     def __init__(self, vllm_config: VllmConfig, engine_indexes: list[int]): ...
+
+
+class DecodeProgressLogger(StatLoggerBase):
+    """Report anomalous progress separately for every engine, including in aggregate logging mode."""
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
+        self.progress = DecodeProgress(engine_index)
+
+    def record(
+        self, scheduler_stats, iteration_stats, mm_cache_stats=None, engine_idx=0
+    ):
+        self.progress.record(scheduler_stats, iteration_stats)
+
+    def log(self):
+        self.progress.log()
+
+    def log_engine_initialized(self):
+        logger.info(
+            "[PD_LOGGING] dp=%d mode=%s",
+            self.progress.engine_index,
+            envs.PD_SERVING_PERF,
+        )
 
 
 class LoggingStatLogger(StatLoggerBase):
@@ -1341,12 +1370,18 @@ class StatLoggerManager:
                     "disabling stats logging to avoid incomplete stats."
                 )
             else:
-                default_logger_factory = (
-                    AggregatedLoggingStatLogger
-                    if aggregate_engine_logging
-                    else LoggingStatLogger
-                )
-                stat_logger_factories.append(default_logger_factory)
+                if (
+                    SERVING_PERF_ENABLED
+                    and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
+                    and not layerwise_prefill_p_node_enabled()
+                ):
+                    stat_logger_factories.append(DecodeProgressLogger)
+                if SERVING_PERF_DETAILED or not SERVING_PERF_CONFIGURED:
+                    stat_logger_factories.append(
+                        AggregatedLoggingStatLogger
+                        if aggregate_engine_logging
+                        else LoggingStatLogger
+                    )
         custom_prometheus_logger: bool = False
         for stat_logger_factory in stat_logger_factories:
             if isinstance(stat_logger_factory, type) and issubclass(

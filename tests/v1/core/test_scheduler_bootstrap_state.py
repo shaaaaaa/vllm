@@ -44,6 +44,7 @@ def scheduler(request):
         "time": time,
         "logger": Mock(),
         "SERVING_PERF_ENABLED": True,
+        "SERVING_PERF_DETAILED": True,
     }
     for filename, class_name in (
         ("scheduler.py", "Scheduler"),
@@ -89,7 +90,7 @@ def scheduler(request):
     instance = scheduler_cls(
         vllm_config=config,
         kv_cache_config=SimpleNamespace(
-            has_mamba_layers=False, needs_kv_cache_zeroing=False
+            has_mamba_layers=False, needs_kv_cache_zeroing=False, kv_cache_groups=[]
         ),
         structured_output_manager=Mock(),
         block_size=16,

@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
+from itertools import islice
 from logging import DEBUG
 from typing import Any, TypeVar, cast
 
@@ -36,7 +37,6 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -72,6 +72,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.serving_perf import SERVING_PERF_DETAILED, SERVING_PERF_ENABLED
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
@@ -662,8 +663,8 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
-    @staticmethod
     def _log_engine_step_timing(
+        self,
         scheduler_output: SchedulerOutput,
         *,
         schedule_ms: float,
@@ -678,14 +679,15 @@ class EngineCore:
     ) -> None:
         if not SERVING_PERF_ENABLED:
             return
-        bootstrap_requests = sorted(
+        bootstrap_requests = (
             getattr(scheduler_output, "bootstrap_sample_req_ids", None) or ()
         )
         observed_ms = schedule_ms + dispatch_to_result_ms + update_ms
-        if not bootstrap_requests and observed_ms < _SLOW_ENGINE_STEP_MS:
+        if observed_ms < _SLOW_ENGINE_STEP_MS and not (
+            SERVING_PERF_DETAILED and bootstrap_requests
+        ):
             return
 
-        iteration_details = compute_iteration_details(scheduler_output)
         phases = {
             "schedule": schedule_ms,
             "executor_roundtrip": dispatch_to_result_ms,
@@ -693,6 +695,17 @@ class EngineCore:
             "scheduler_update": update_ms,
         }
         dominant_phase = max(phases, key=phases.__getitem__)
+        if not SERVING_PERF_DETAILED:
+            now = time.monotonic()
+            reports = self.__dict__.setdefault("_slow_step_reported_at", {})
+            if now - reports.get(dominant_phase, -float("inf")) < 60:
+                return
+            reports[dominant_phase] = now
+
+        def request_sample(ids):
+            return sorted(ids) if SERVING_PERF_DETAILED else list(islice(ids, 8))
+
+        iteration_details = compute_iteration_details(scheduler_output)
         logger.info(
             "[ENGINE_STEP_TIMING] bootstrap_requests=%s observed_ms=%.3f "
             "scheduled_requests=%s finished_requests=%s "
@@ -701,11 +714,11 @@ class EngineCore:
             "future_wait_ms=%.3f sample_call_ms=%.3f update_ms=%.3f "
             "result_ready_before_wait=%s batch_queue_depth=%d "
             "context_reqs=%d context_tokens=%d generation_reqs=%d "
-            "generation_tokens=%d",
-            bootstrap_requests,
+            "generation_tokens=%d scheduled_count=%d finished_count=%d",
+            request_sample(bootstrap_requests),
             observed_ms,
-            sorted(scheduler_output.num_scheduled_tokens),
-            sorted(scheduler_output.finished_req_ids),
+            request_sample(scheduler_output.num_scheduled_tokens),
+            request_sample(scheduler_output.finished_req_ids),
             dominant_phase,
             schedule_ms,
             execute_submit_ms,
@@ -720,13 +733,15 @@ class EngineCore:
             iteration_details.num_ctx_tokens,
             iteration_details.num_generation_requests,
             iteration_details.num_generation_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+            len(scheduler_output.finished_req_ids),
         )
 
     @staticmethod
     def _stamp_bootstrap_executor_dispatch(
         scheduler_output: SchedulerOutput,
     ) -> tuple[list[str], dict[str, float | None]] | None:
-        if not SERVING_PERF_ENABLED:
+        if not SERVING_PERF_DETAILED:
             return
         payloads = getattr(scheduler_output, "bootstrap_final_hiddens", None)
         if not payloads:
@@ -748,7 +763,7 @@ class EngineCore:
     def _log_bootstrap_executor_dispatch(
         trace: tuple[list[str], dict[str, float | None]] | None,
     ) -> None:
-        if not SERVING_PERF_ENABLED:
+        if not SERVING_PERF_DETAILED:
             return
         if trace is None:
             return
@@ -1453,7 +1468,7 @@ class EngineCoreProc(EngineCore):
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             payload = req.bootstrap_final_hidden
-            if payload is not None and SERVING_PERF_ENABLED:
+            if payload is not None and SERVING_PERF_DETAILED:
                 dequeued_unix_ns = time.time_ns()
                 enqueued_unix_ns = payload.get("decoder_input_enqueued_unix_ns")
                 engine_received_unix_ns = payload.get("decoder_engine_received_unix_ns")
@@ -1647,7 +1662,7 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         preprocess_started = (
-                            time.perf_counter() if SERVING_PERF_ENABLED else 0.0
+                            time.perf_counter() if SERVING_PERF_DETAILED else 0.0
                         )
                         try:
                             request = self.preprocess_add_request(req)
@@ -1656,7 +1671,7 @@ class EngineCoreProc(EngineCore):
                             continue
                         prepared_req = request[0]
                         payload = prepared_req.bootstrap_final_hidden
-                        if payload is not None and SERVING_PERF_ENABLED:
+                        if payload is not None and SERVING_PERF_DETAILED:
                             enqueued_unix_ns = time.time_ns()
                             engine_received_unix_ns = payload.get(
                                 "decoder_engine_received_unix_ns"
@@ -1672,7 +1687,7 @@ class EngineCoreProc(EngineCore):
                                 (
                                     (
                                         time.perf_counter()
-                                        if SERVING_PERF_ENABLED
+                                        if SERVING_PERF_DETAILED
                                         else 0.0
                                     )
                                     - preprocess_started

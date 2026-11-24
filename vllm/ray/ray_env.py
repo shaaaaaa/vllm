@@ -43,6 +43,7 @@ DEFAULT_ENV_VAR_PREFIXES: set[str] = {
 }
 
 DEFAULT_EXTRA_ENV_VARS: set[str] = {
+    "MC_LOG_LEVEL",
     "PYTHONHASHSEED",
 }
 

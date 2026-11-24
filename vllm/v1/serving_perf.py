@@ -11,10 +11,7 @@ operational errors are independent of this switch.
 
 import os
 
-SERVING_PERF_ENABLED = os.environ.get("PD_SERVING_PERF", "0").strip().lower() not in (
-    "",
-    "0",
-    "false",
-    "no",
-    "off",
-)
+SERVING_PERF_CONFIGURED = "PD_SERVING_PERF" in os.environ
+SERVING_PERF_MODE = os.environ.get("PD_SERVING_PERF", "0").strip().lower()
+SERVING_PERF_ENABLED = SERVING_PERF_MODE not in ("", "0", "false", "no", "off")
+SERVING_PERF_DETAILED = SERVING_PERF_MODE in ("detail", "device")
