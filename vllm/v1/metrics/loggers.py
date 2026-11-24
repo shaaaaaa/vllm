@@ -30,11 +30,7 @@ from vllm.v1.metrics.stats import (
     PromptTokenStats,
     SchedulerStats,
 )
-from vllm.v1.serving_perf import (
-    SERVING_PERF_CONFIGURED,
-    SERVING_PERF_DETAILED,
-    SERVING_PERF_ENABLED,
-)
+from vllm.v1.serving_perf import SERVING_PERF_ENABLED
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
@@ -1370,18 +1366,18 @@ class StatLoggerManager:
                     "disabling stats logging to avoid incomplete stats."
                 )
             else:
+                stat_logger_factories.append(
+                    AggregatedLoggingStatLogger
+                    if aggregate_engine_logging
+                    else LoggingStatLogger
+                )
                 if (
                     SERVING_PERF_ENABLED
-                    and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
+                    and getattr(vllm_config.model_config, "runner_type", None)
+                    != "pooling"
                     and not layerwise_prefill_p_node_enabled()
                 ):
                     stat_logger_factories.append(DecodeProgressLogger)
-                if SERVING_PERF_DETAILED or not SERVING_PERF_CONFIGURED:
-                    stat_logger_factories.append(
-                        AggregatedLoggingStatLogger
-                        if aggregate_engine_logging
-                        else LoggingStatLogger
-                    )
         custom_prometheus_logger: bool = False
         for stat_logger_factory in stat_logger_factories:
             if isinstance(stat_logger_factory, type) and issubclass(
