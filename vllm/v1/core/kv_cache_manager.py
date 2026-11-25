@@ -423,41 +423,23 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        if not self.coordinator.has_enough_free_blocks(
-            request_id=request.request_id,
-            num_tokens=num_tokens_need_slot,
-            new_computed_blocks=new_computed_block_list,
-            num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
-            num_tokens_main_model=num_tokens_main_model,
-            dsa_compact_external_load=dsa_compact_external_load,
-        ):
-            # Cannot allocate new blocks (with per-group block pools, every
-            # group's demand must fit its own pool).
-            return None
-
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-                dsa_compact_external_load=dsa_compact_external_load,
-            )
-
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-            dsa_compact_external_load,
-        )
+        demand_args = (request.request_id, num_tokens_need_slot, new_computed_block_list,
+                       num_encoder_tokens, num_local_computed_tokens + num_external_computed_tokens,
+                       num_tokens_main_model, dsa_compact_external_load)
+        args = (request.request_id, new_computed_block_list, num_local_computed_tokens,
+                num_external_computed_tokens, num_tokens_need_slot, num_tokens_main_model,
+                num_encoder_tokens, dsa_compact_external_load)
+        pool = getattr(self.coordinator, "dcp_request_pool", None)
+        if pool is None:
+            if not self.coordinator.has_enough_free_blocks(*demand_args):
+                return None
+            new_blocks = self._allocate_slot_blocks(*args)
+        else:
+            demand = self.coordinator.get_num_blocks_to_allocate_per_group(*demand_args)
+            weight = max(request.num_prompt_tokens, num_tokens_main_model) * max(1, num_new_tokens)
+            new_blocks = pool.allocate_request(self, request, demand, weight, args)
+            if new_blocks is None:
+                return None
         if dsa_compact_external_load:
             request.dsa_compact_allocated = True
 
@@ -479,6 +461,33 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def _allocate_slot_blocks(
+        self, request_id, new_computed_block_list, num_local_computed_tokens,
+        num_external_computed_tokens, num_tokens_need_slot, num_tokens_main_model,
+        num_encoder_tokens, dsa_compact_external_load,
+    ):
+        if (
+            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+            or num_external_computed_tokens > 0
+        ):
+            # Append the new computed blocks to the request blocks until now to
+            # avoid the case where the new blocks cannot be allocated.
+            self.coordinator.allocate_new_computed_blocks(
+                request_id=request_id,
+                new_computed_blocks=new_computed_block_list,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                dsa_compact_external_load=dsa_compact_external_load,
+            )
+
+        return self.coordinator.allocate_new_blocks(
+            request_id,
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            num_encoder_tokens,
+            dsa_compact_external_load,
+        )
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -488,6 +497,8 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        if getattr(request, "dcp_indexer_placement", None) is not None:
+            del request.dcp_indexer_placement
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

@@ -955,6 +955,18 @@ def dsa_dense_request_token_capacity(kv_cache_config: KVCacheConfig) -> int | No
     return low
 
 
+def _dcp_owner_capacity(parents, world, common, pages, pages_per_parent):
+    """Equal-length requests on the busiest owner, including whole G0 parents."""
+    low, high = 0, parents * world * pages_per_parent // pages
+    while low < high:
+        n = (low + high + 1) // 2
+        if n * common + cdiv(cdiv(n, world) * pages, pages_per_parent) <= parents:
+            low = n
+        else:
+            high = n - 1
+    return low
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1022,6 +1034,17 @@ def get_max_concurrency_for_kv_cache_config(
             indexer_blocks_per_bundle=indexer_blocks_per_bundle,
         )
         capacity = kv_cache_config.num_blocks
+        if getattr(indexer_group.kv_cache_spec, "dcp_request_sharding", False):
+            pages = cdiv(vllm_config.model_config.max_model_len, indexer_group.kv_cache_spec.block_size)
+            scratch = getattr(latent_group.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0)
+            if scratch:
+                bundles_per_req = _dsa_compact_startup_bundles(
+                    vllm_config.model_config.max_model_len, layout, latent_block_size=latent_group.kv_cache_spec.block_size,
+                    indexer_block_size=indexer_group.kv_cache_spec.block_size, scratch_tokens=scratch,
+                    dense_tokens=latent_group.kv_cache_spec.dsa_compact_startup_dense_tokens, latent_dcp_size=latent_dcp_size,
+                )
+            return float(_dcp_owner_capacity(capacity, latent_dcp_size, bundles_per_req - cdiv(pages, indexer_blocks_per_bundle),
+                                             pages, indexer_blocks_per_bundle))
         if mode == "prefill_child":
             capacity *= len(latent_group.layer_names)
         return capacity / bundles_per_req
@@ -1578,6 +1601,14 @@ def get_kv_cache_config_from_groups(
             sparse_decode_capacity = (
                 num_bundles // sparse_decode_bundles if sparse_decode_bundles else 0
             )
+            request_sharded = getattr(indexer_group.kv_cache_spec, "dcp_request_sharding", False)
+            if request_sharded:
+                world = latent_group.kv_cache_spec.dsa_dcp_size
+                owner_pages = cdiv(indexer_ctx_blocks, indexer_blocks_per_bundle)
+                full_context_capacity = _dcp_owner_capacity(num_bundles, world, full_context_bundles - owner_pages,
+                                                            indexer_ctx_blocks, indexer_blocks_per_bundle)
+                sparse_decode_capacity = _dcp_owner_capacity(num_bundles, world, sparse_decode_bundles - owner_pages,
+                                                             indexer_ctx_blocks, indexer_blocks_per_bundle)
             logger.info(
                 "DSA shared pool budget: gpu_memory_utilization=%s "
                 "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
@@ -1628,6 +1659,9 @@ def get_kv_cache_config_from_groups(
                 if required_bundles_per_max_request
                 else 0
             )
+            if request_sharded:
+                required_bundles_per_max_request = full_context_bundles
+                admissible_max_requests = full_context_capacity
             logger.info(
                 "DSA capacity summary: mode=%s latent_layers=%d "
                 "indexer_layers=%d configured_max_len=%d "

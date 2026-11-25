@@ -159,6 +159,8 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # Terminal worker votes on a particular request-owned cache allocation/load.
+    dcp_received: set[tuple[str, int, int]] | None = None
 
     def is_empty(self):
         return (
@@ -209,6 +211,7 @@ class KVConnectorOutput:
         return cls(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            dcp_received=_combine_non_none(set.union, [o.dcp_received for o in outputs]),
             kv_connector_stats=kv_connector_stats,
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,

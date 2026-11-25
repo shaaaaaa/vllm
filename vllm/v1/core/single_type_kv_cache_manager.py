@@ -163,6 +163,12 @@ class SingleTypeKVCacheManager(ABC):
         )
         return num_new_blocks + num_evictable_blocks
 
+    def _allocate_request_pages(self, request_id, count):
+        allocate = getattr(type(self.block_pool), "get_request_blocks", None)
+        if allocate is not None:
+            return allocate(self.block_pool, request_id, count)
+        return self.block_pool.get_new_blocks(count)
+
     def allocate_new_computed_blocks(
         self,
         request_id: str,
@@ -229,8 +235,8 @@ class SingleTypeKVCacheManager(ABC):
 
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
-            allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+            allocated_blocks = self._allocate_request_pages(
+                request_id, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) is FullAttentionSpec:
@@ -259,7 +265,7 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self._allocate_request_pages(request_id, num_new_blocks)
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) is FullAttentionSpec:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
@@ -676,7 +682,7 @@ class DSALatentManager(FullAttentionManager):
                 scratch_blocks,
                 self._round_up_to_bundle(cdiv(prefix_tokens, self.block_size)),
             )
-        allocated_blocks = self.block_pool.get_new_blocks(scratch_blocks)
+        allocated_blocks = self._allocate_request_pages(request_id, scratch_blocks)
         assert len(allocated_blocks) == scratch_blocks
 
         logical_blocks = max(
@@ -743,7 +749,7 @@ class DSALatentManager(FullAttentionManager):
         if not missing_indices:
             return []
 
-        new_blocks = self.block_pool.get_new_blocks(len(missing_indices))
+        new_blocks = self._allocate_request_pages(request_id, len(missing_indices))
         assert len(new_blocks) == len(missing_indices)
         for idx, block in zip(missing_indices, new_blocks):
             req_blocks[idx] = block

@@ -99,6 +99,7 @@ class KVCacheCoordinator(ABC):
             and len(kv_cache_config.kv_cache_groups) == 2
             and len(group_page_sizes) > 1
         )
+        self.dcp_request_pool = None
         self.use_per_group_block_pools = (
             dsa_two_groups_enabled()
             and not self.use_dsa_shared_block_pool
@@ -139,7 +140,19 @@ class KVCacheCoordinator(ABC):
             self.dsa_shared_indexer_layer_count = len(indexer_group.layer_names)
             parent_allocator = DSASharedBundleAllocator(parent_layout)
             self.dsa_shared_parent_allocator = parent_allocator
-            if self.layerwise_prefill_p_node:
+            pool_class = DSASharedLogicalBlockPool
+            if getattr(indexer_group.kv_cache_spec, "dcp_request_sharding", False):
+                from vllm.v1.core.dcp_indexer_pool import DcpLogicalPool, DcpRequestPool
+
+                if (self.layerwise_prefill_p_node or dcp_world_size < 2
+                        or getattr(latent_group.kv_cache_spec, "dsa_dcp_size", None) != dcp_world_size
+                        or getattr(indexer_group.kv_cache_spec, "dsa_dcp_size", None) != 1
+                        or kv_cache_config.kv_cache_groups[0] is not latent_group):
+                    raise ValueError("Request-owned indexer requires decoder DCP groups [latent, indexer]")
+                self.dcp_request_pool = DcpRequestPool(parent_allocator, dcp_world_size)
+                self.dsa_shared_allocator = self.dcp_request_pool
+                pool_class = DcpLogicalPool
+            elif self.layerwise_prefill_p_node:
                 self.dsa_shared_allocator = PrefillLayerBundlePool(
                     parent_allocator,
                     self.dsa_shared_num_layer_pairs,
@@ -157,12 +170,14 @@ class KVCacheCoordinator(ABC):
                     else DSASharedBlockOwner.INDEXER
                 )
                 self.block_pools.append(
-                    DSASharedLogicalBlockPool(self.dsa_shared_allocator, owner)
+                    pool_class(self.dsa_shared_allocator, owner)
                 )
             logger.info(
                 "DSA shared KV bundle pool: mode=%s bundles=%d, "
                 "latent=%d blocks/bundle, indexer=%d blocks/bundle.",
-                "prefill_child" if self.layerwise_prefill_p_node else "full_parent",
+                "request_sharded" if self.dcp_request_pool is not None else (
+                    "prefill_child" if self.layerwise_prefill_p_node else "full_parent"
+                ),
                 layout.capacity_bundles,
                 layout.latent_blocks_per_bundle,
                 layout.indexer_blocks_per_bundle,
@@ -343,6 +358,9 @@ class KVCacheCoordinator(ABC):
             num_tokens_main_model,
             dsa_compact_external_load,
         )
+        pool = getattr(self, "dcp_request_pool", None)
+        if pool is not None:
+            return pool.choose(request_id, *per_group) is not None
         if self.use_per_group_block_pools:
             frees = [
                 manager.block_pool.get_num_free_blocks()
@@ -422,6 +440,23 @@ class KVCacheCoordinator(ABC):
 
         allocator = self.dsa_shared_allocator
         layout = allocator.layout
+        if allocator is getattr(self, "dcp_request_pool", None):
+            occupied = [rank.owner_bundle_counts()[DSASharedBlockOwner.INDEXER] for rank in allocator.ranks]
+            live = [n * layout.indexer_blocks_per_bundle - holes for n, holes in zip(occupied, allocator.holes)]
+            spec = self.kv_cache_config.kv_cache_groups[1].kv_cache_spec
+            layers = self.dsa_shared_indexer_layer_count
+            c8 = getattr(spec, "indexer_scale_layer_count", None)
+            c8 = (layers if layout.indexer_scale_page_size_bytes else 0) if c8 is None else c8
+            rows = spec.block_size * spec.num_kv_heads
+            elements = (layers - c8) * spec.dtype.itemsize
+            if c8:
+                elements += c8 * spec.c8_k_cache_dtype.itemsize
+            keys = rows * spec.head_size * elements
+            scales = rows * c8 * spec.c8_k_scale_cache_dtype.itemsize if c8 else 0
+            logger.info("[DSA_POOL] free_parents=%s indexer_parents=%s live_indexer_pages=%s "
+                        "key_bytes_per_page=%d scale_bytes_per_page=%d",
+                        [rank.free_bundle_count for rank in allocator.ranks], occupied, live, keys, scales)
+            return
         capacity = layout.capacity_bundles
         free = allocator.free_bundle_count
         used = capacity - free
@@ -759,6 +794,8 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.free(request_id)
+        if getattr(self, "dcp_request_pool", None) is not None:
+            self.dcp_request_pool.forget(request_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """

@@ -613,6 +613,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
+            defer_growth = False
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -627,9 +628,13 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    candidates = self._kv_preemption_candidates(request, req_index)
+                    if not candidates:
+                        defer_growth = True
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            candidates,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
@@ -652,7 +657,7 @@ class Scheduler(SchedulerInterface):
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = self._pop_kv_victim(candidates)
 
                     self._log_request_transition(
                         "preemption_trigger", preempted_req,
@@ -668,6 +673,9 @@ class Scheduler(SchedulerInterface):
                         # No more request to preempt. Cannot schedule this request.
                         break
 
+            if defer_growth:
+                req_index += 1
+                continue
             if new_blocks is None:
                 # Cannot schedule this request.
                 break
@@ -1379,6 +1387,9 @@ class Scheduler(SchedulerInterface):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        dcp_pool = getattr(self.kv_cache_manager.coordinator, "dcp_request_pool", None)
+        if dcp_pool is not None:
+            dcp_pool.prepare_output(scheduler_output)
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(
                 scheduler_output
@@ -1440,6 +1451,23 @@ class Scheduler(SchedulerInterface):
                 separators=(",", ":"),
             ),
         )
+
+    def _pop_kv_victim(self, candidates):
+        if candidates[-1] is self.running[-1]:
+            return self.running.pop()
+        victim = candidates[-1]
+        self.running.remove(victim)
+        return victim
+
+    def _kv_preemption_candidates(self, request, req_index):
+        pool = getattr(self.kv_cache_manager.coordinator, "dcp_request_pool", None)
+        if pool is None:
+            return self.running
+        if self.policy == SchedulingPolicy.PRIORITY:
+            candidates = [r for r in self.running if (r.priority, r.arrival_time) >= (request.priority, request.arrival_time)]
+        else:
+            candidates = self.running[req_index:]
+        return pool.victims(request.request_id, candidates)
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

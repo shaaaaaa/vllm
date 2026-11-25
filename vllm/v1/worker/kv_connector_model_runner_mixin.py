@@ -132,6 +132,8 @@ class KVConnectorModelRunnerMixin:
                 output.finished_sending, output.finished_recving = (
                     kv_connector.get_finished(scheduler_output.finished_req_ids)
                 )
+                if output.finished_recving and hasattr(kv_connector, "take_dcp_received"):
+                    output.dcp_received = kv_connector.take_dcp_received()
                 output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
                 get_completed_decode_window_saves = getattr(
                     kv_connector, "get_completed_decode_window_saves", None

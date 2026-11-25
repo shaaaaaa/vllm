@@ -55,6 +55,7 @@ class KVOutputAggregator:
         # Complete transfer tracker. Used to track finished requests
         # [req_id -> n_remaining_workers]
         self._recv_remaining_count = dict[str, int]()
+        self._dcp_receive_ranks: dict[tuple[str, int, int], set[int]] = {}
         self._send_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
 
@@ -91,7 +92,8 @@ class KVOutputAggregator:
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
         completed_decode_window_saves: dict[str, int] = {}
-        for model_runner_output in outputs:
+        dcp_received = None
+        for rank, model_runner_output in enumerate(outputs):
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
@@ -112,9 +114,21 @@ class KVOutputAggregator:
             update_finished_set(
                 kv_output.finished_sending, self._send_remaining_count, finished_sending
             )
-            update_finished_set(
-                kv_output.finished_recving, self._recv_remaining_count, finished_recving
-            )
+            received = kv_output.finished_recving
+            if kv_output.dcp_received:
+                received = set(received or ())
+                for attempt in kv_output.dcp_received:
+                    req = attempt[0]
+                    received.discard(req)
+                    ranks = self._dcp_receive_ranks.setdefault(attempt, set())
+                    ranks.add(rank)
+                    if len(ranks) == self._expected_finished_count:
+                        del self._dcp_receive_ranks[attempt]
+                        finished_recving.add(req)
+                        if dcp_received is None:
+                            dcp_received = set()
+                        dcp_received.add(attempt)
+            update_finished_set(received, self._recv_remaining_count, finished_recving)
 
             # Aggregate kv_connector_stats from all workers.
             if aggregated_kv_connector_stats is None:
@@ -169,6 +183,7 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            dcp_received=dcp_received,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             kv_cache_events=combined_kv_cache_events or None,
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,

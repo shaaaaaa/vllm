@@ -258,6 +258,9 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Request-owned indexer table deltas (owner, allocation epoch, G0 by rank).
+    dcp_indexer_placements: ClassVar[dict[str, tuple[int, int, tuple]] | None] = None
+
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
