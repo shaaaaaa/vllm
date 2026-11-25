@@ -164,6 +164,36 @@ def test_rotation_depth_changes_admission_without_expanding_fixed_pool(
     )
 
 
+def test_four_bank_refill_skips_occupied_slots(api, monkeypatch):
+    layout = api.dsa_shared_block_layout(
+        *specs(False), capacity_bundles=64, prefill_child=True
+    )
+    parent = api.DSASharedBundleAllocator(layout)
+    pool = api.PrefillLayerBundlePool(parent, 64, bank_count=4)
+    latent, indexer = api.DSASharedBlockOwner.LATENT, api.DSASharedBlockOwner.INDEXER
+    held = pool.allocate(latent, pool.free_bundle_count)
+    holes = (held[0], held[127], held[129], held[-1])
+    pool.free(latent, reversed(holes))
+
+    child_id = Mock(wraps=pool.child_bundle_id)
+    monkeypatch.setattr(pool, "child_bundle_id", child_id)
+    assert pool.allocate_banks(indexer, 1) == tuple((child,) for child in holes)
+    assert child_id.call_count <= len(holes)
+    pool.free(indexer, holes)
+    pool.free(latent, (child for child in held if child not in holes))
+    assert parent.free_bundle_count == layout.capacity_bundles
+
+
+def test_reopened_lower_parent_keeps_allocation_order(api):
+    _, _, layout = setup_case(api, True)
+    pool = api.PrefillLayerBundlePool(api.DSASharedBundleAllocator(layout), 4)
+    owner = api.DSASharedBlockOwner.LATENT
+    held = pool.allocate(owner, 7)
+    pool.free(owner, held[:4])
+    # Parent 2 still has one hole. Growing by two reopens parent 1.
+    assert pool.allocate(owner, 2) == held[:2]
+
+
 def test_real_child_pool_two_bank_address_proof_and_rollback(api):
     _, _, layout = setup_case(api, True)
     parent = api.DSASharedBundleAllocator(layout)
