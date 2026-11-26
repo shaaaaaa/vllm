@@ -351,8 +351,11 @@ class DcpLogicalPool:
             for r, h in zip(self.allocator.ranks, self.allocator.holes, strict=True)
         )
 
-    def get_usage(self):
-        return 1.0 - self.allocator.free_bundle_count / self.layout.capacity_bundles
+    def get_usage(self) -> float:
+        """Fraction of physical bundles occupied across this decoder's DCP ranks."""
+        ranks = self.allocator.ranks
+        used = sum(rank.allocated_bundle_count for rank in ranks)
+        return used / (len(ranks) * self.layout.capacity_bundles)
 
     def take_events(self):
         return []

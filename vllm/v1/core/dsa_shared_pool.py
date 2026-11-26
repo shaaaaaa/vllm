@@ -446,6 +446,10 @@ class DSASharedBundleAllocator:
         self._free_ranges: list[tuple[int, int]] = [(1, layout.capacity_bundles)]
 
     @property
+    def allocated_bundle_count(self) -> int:
+        return len(self._owners)
+
+    @property
     def free_bundle_count(self) -> int:
         return sum(end - start + 1 for start, end in self._free_ranges)
 

@@ -238,13 +238,10 @@ class KVCacheManager:
 
     @property
     def usage(self) -> float:
-        """Get the KV cache usage.
-
-        Returns:
-            The KV cache usage (between 0.0 and 1.0). With per-group block
-            pools, the most-occupied pool (it is the scheduling constraint).
-        """
-        return max(pool.get_usage() for pool in self.coordinator.block_pools)
+        """Shared KV pool usage or the highest usage among independent pools."""
+        if self.coordinator.use_per_group_block_pools:
+            return max(pool.get_usage() for pool in self.coordinator.block_pools)
+        return self.block_pool.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -436,7 +433,11 @@ class KVCacheManager:
             new_blocks = self._allocate_slot_blocks(*args)
         else:
             demand = self.coordinator.get_num_blocks_to_allocate_per_group(*demand_args)
-            weight = max(request.num_prompt_tokens, num_tokens_main_model) * max(1, num_new_tokens)
+            # Estimate indexer query-key pairs. Charge the full prompt during
+            # partial prefill and one prospective query row during async restore.
+            weight = max(request.num_prompt_tokens, num_tokens_main_model) * max(
+                1, num_new_tokens
+            )
             new_blocks = pool.allocate_request(self, request, demand, weight, args)
             if new_blocks is None:
                 return None

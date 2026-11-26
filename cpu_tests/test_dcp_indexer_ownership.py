@@ -93,6 +93,27 @@ def test_physical_storage_and_wire_deltas(monkeypatch, paired):
     assert not pool.groups and not pool.placements
 
 
+def test_usage_aggregates_rank_bundles_while_admission_checks_each_rank(monkeypatch):
+    from vllm.v1.core.dcp_indexer_pool import INDEXER, LATENT
+
+    cache = manager(monkeypatch, 2, world=4)
+    pool = cache.coordinator.dcp_request_pool
+    assert cache.usage == 0
+    pool.bind("a", 0, 1)
+    indexer = pool.allocate("a", INDEXER, 2)  # Two pages share one owner bundle.
+    assert cache.usage == 1 / 8
+    latent = pool.allocate("a", LATENT, 1)  # One physical bundle on every rank.
+    assert cache.usage == 5 / 8
+    assert pool.choose("b", 1, 0) is None  # Rank 0 has no free bundle for G0.
+
+    pool.release(INDEXER, indexer[:1])
+    assert cache.usage == 5 / 8
+    pool.release(INDEXER, indexer[1:])
+    assert cache.usage == 4 / 8
+    pool.release(LATENT, latent)
+    assert cache.usage == 0
+
+
 def test_independent_parent_numbers_and_shared_subpages(monkeypatch):
     cache = manager(monkeypatch, 2, world=2)
     from vllm.v1.core.dcp_indexer_pool import INDEXER, LATENT
