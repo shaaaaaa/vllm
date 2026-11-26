@@ -237,3 +237,24 @@ def test_layout_preserves_legacy_positional_dimensions(api):
         147456, 32768, 3, 512, 64, 128, bundle_multiplier=2
     )
     assert prefill.latent_blocks_per_bundle == 4
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_sharded_prefill_capacity_matches_four_bank_allocation(api, monkeypatch, world):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", "4")
+    ns = utilities(api, True)
+    config, groups, layout = setup_case(api, True)
+    config.model_config.max_model_len = 16385
+    groups[0].kv_cache_spec.dsa_dcp_size = world
+    groups[1].kv_cache_spec.dsa_dcp_size = 1
+    cdiv = ns["cdiv"]
+    latent = cdiv(cdiv(16385, 128 * world), layout.latent_blocks_per_bundle)
+    indexer = cdiv(cdiv(16385, 128), layout.indexer_blocks_per_bundle)
+    children = 4 * (latent + indexer)
+    parents = cdiv(children, len(groups[0].layer_names))
+    payload = layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle
+    budget = (4 * parents + 1) * payload + layout.backing_alignment_bytes
+    assert ns["_max_memory_usage_bytes_from_groups"](config, groups) == budget
+    result = ns["get_kv_cache_config_from_groups"](config, groups, budget)
+    assert ns["get_max_concurrency_for_kv_cache_config"](config, result) == 4 * result.num_blocks / children

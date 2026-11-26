@@ -34,15 +34,18 @@ def manager(dcp_size=1):
         "allocate_new_blocks_compact_external",
         "remove_saved_decode_window_blocks",
     }
+    base = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SingleTypeKVCacheManager")
     cls.bases = []
     cls.body = [
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
     ]
+    cls.body.append(next(n for n in base.body if getattr(n, "name", None) == "_allocate_request_pages"))
     module = ast.parse("from __future__ import annotations")
     module.body.append(cls)
     ns = dict(
         cdiv=lambda a, b: (a + b - 1) // b,
         logger=NS(info=lambda *a: None),
+        SERVING_PERF_DETAILED=False,
         _decode_window_save_window_size=lambda: 0,
         _mtp_dw_event=lambda *args, **kwargs: None,
     )

@@ -1566,11 +1566,10 @@ def get_kv_cache_config_from_groups(
                 )
             max_model_len = vllm_config.model_config.max_model_len
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            latent_ctx_blocks = cdiv(
-                max_model_len,
-                latent_group.kv_cache_spec.block_size
-                * (getattr(latent_group.kv_cache_spec, "dsa_dcp_size", None) or 1),
+            latent_span = latent_group.kv_cache_spec.block_size * (
+                getattr(latent_group.kv_cache_spec, "dsa_dcp_size", None) or 1
             )
+            latent_ctx_blocks = cdiv(max_model_len, latent_span)
             indexer_ctx_blocks = cdiv(
                 max_model_len, indexer_group.kv_cache_spec.block_size
             )
@@ -1644,7 +1643,7 @@ def get_kv_cache_config_from_groups(
             required_bundles_per_max_request = dsa_required_bundles(
                 residency_mode,
                 max_model_len,
-                latent_block_size=latent_group.kv_cache_spec.block_size,
+                latent_block_size=(latent_span if residency_mode == "prefill_child" else latent_group.kv_cache_spec.block_size),
                 indexer_block_size=indexer_group.kv_cache_spec.block_size,
                 latent_blocks_per_bundle=latent_blocks_per_bundle,
                 indexer_blocks_per_bundle=indexer_blocks_per_bundle,
@@ -2273,7 +2272,7 @@ def _max_memory_usage_bytes_from_groups(
                 bundles = dsa_required_bundles(
                     mode,
                     vllm_config.model_config.max_model_len,
-                    latent_block_size=latent_group.kv_cache_spec.block_size,
+                    latent_block_size=latent_group.kv_cache_spec.block_size * (latent_dcp_size or 1),
                     indexer_block_size=indexer_group.kv_cache_spec.block_size,
                     latent_blocks_per_bundle=latent_blocks_per_bundle,
                     indexer_blocks_per_bundle=indexer_blocks_per_bundle,
